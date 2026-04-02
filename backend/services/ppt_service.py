@@ -32,7 +32,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 
 # --------------------------------------------------------------------------
 # Config  (import from your existing config module)
@@ -123,6 +123,118 @@ def _safe_icon(value, default="▸"):
 def _mix(c1, c2, t):
     t = max(0.0, min(1.0, float(t)))
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def _topic_seed(topic: str) -> int:
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(str(topic))) % 9973
+
+
+def _title_size(text: str, base: int = 30) -> int:
+    n = len(str(text or "").strip())
+    if n <= 42:
+        return base
+    if n <= 65:
+        return max(26, base - 2)
+    if n <= 90:
+        return max(23, base - 5)
+    return max(20, base - 8)
+
+
+def _subtitle_size(text: str, base: int = 13) -> int:
+    n = len(str(text or "").strip())
+    if n <= 60:
+        return base
+    if n <= 95:
+        return max(11, base - 1)
+    return max(10, base - 2)
+
+
+def _opening_slide_spec(topic: str, tone: str, variant: int) -> dict:
+    styles = [
+        {"pattern_name": "opening_compact", "surface": "light", "header_variant": "split", "card_variant": "banded", "footer_variant": "line", "badge_shape": "rect", "accent_rotation": "auto"},
+        {"pattern_name": "opening_editorial", "surface": "light", "header_variant": "banded", "card_variant": "outline", "footer_variant": "line", "badge_shape": "oval", "accent_rotation": "static"},
+        {"pattern_name": "opening_executive", "surface": "light", "header_variant": "solid", "card_variant": "soft", "footer_variant": "solid", "badge_shape": "rect", "accent_rotation": "auto"},
+    ]
+
+    if variant == 0:
+        return {
+            "title": topic,
+            "subtitle": f"{tone} Presentation Overview",
+            "layout": "big_stat",
+            "icon": "★",
+            "stat": "2026",
+            "stat_label": "Strategic Outlook",
+            "stat_source": "Current industry snapshot",
+            "content": [
+                f"**Agenda**: this deck explains the core foundations, architecture choices, and implementation priorities for {topic}.",
+                "**What to decide**: we focus on practical trade-offs, measurable outcomes, and execution sequencing.",
+                "**Business value**: each section links design choices to cost, speed, resilience, and long-term scalability.",
+                "**Evidence**: examples and benchmarks are included to support stakeholder discussions and planning.",
+                "**Expected outcome**: a decision-ready roadmap aligned to your audience and delivery context.",
+            ],
+            "style": styles[variant],
+        }
+    if variant == 1:
+        return {
+            "title": topic,
+            "subtitle": "Session Introduction",
+            "layout": "two_column",
+            "icon": "▸",
+            "left_title": "What We Will Cover",
+            "right_title": "Why It Matters",
+            "left_points": [
+                "**Context**: current state, constraints, and key drivers shaping this topic.",
+                "**Design options**: practical patterns with strengths, limits, and usage guidance.",
+                "**Execution**: implementation steps, ownership model, and milestone sequencing.",
+                "**Measurement**: KPI framework to track impact and iterate confidently.",
+            ],
+            "right_points": [
+                "**Clarity**: aligns teams on vocabulary, scope, and architectural intent.",
+                "**Speed**: reduces trial-and-error by using proven references and decisions.",
+                "**Risk control**: anticipates reliability, security, and scaling bottlenecks early.",
+                "**Outcome focus**: connects technical decisions to business performance metrics.",
+            ],
+            "content": [],
+            "style": styles[variant],
+        }
+    return {
+        "title": topic,
+        "subtitle": "Quick Start Overview",
+        "layout": "bullets",
+        "icon": "✓",
+        "content": [
+            f"**Purpose**: establish a clear, shared understanding of {topic} and its most important design decisions.",
+            "**Scope**: cover core building blocks, practical adoption paths, and governance essentials.",
+            "**Evidence-led**: use real benchmarks and examples to guide implementation choices.",
+            "**Execution-ready**: translate insights into prioritized actions with accountability and timeline.",
+            "**Audience-ready**: balance strategic context and technical depth for mixed stakeholders.",
+        ],
+        "style": styles[variant],
+    }
+
+
+def _closing_slide_spec(topic: str, variant: int) -> dict:
+    styles = [
+        {"pattern_name": "closing_gratitude", "surface": "light", "header_variant": "banded", "card_variant": "soft", "footer_variant": "line", "badge_shape": "rect", "accent_rotation": "static"},
+        {"pattern_name": "closing_discussion", "surface": "light", "header_variant": "split", "card_variant": "outline", "footer_variant": "line", "badge_shape": "oval", "accent_rotation": "auto"},
+        {"pattern_name": "closing_next", "surface": "light", "header_variant": "solid", "card_variant": "banded", "footer_variant": "solid", "badge_shape": "rect", "accent_rotation": "static"},
+    ]
+    titles = ["Thank You", "Thank You & Q&A", "Thank You"]
+    subtitles = ["Questions & Discussion", "Open Discussion", "Final Questions"]
+    return {
+        "title": titles[variant],
+        "subtitle": subtitles[variant],
+        "layout": "bullets",
+        "icon": "✓",
+        "content": [
+            f"**Thank you** for your time and engagement on {topic}.",
+            "**Questions welcome**: we can dive deeper into architecture choices, implementation risks, or rollout priorities.",
+            "**Action alignment**: confirm owner, timeline, and KPI for the first execution milestone.",
+            "**Follow-up**: document decisions and circulate the agreed next-step plan across stakeholders.",
+            "**Collaboration**: share feedback so we can refine scope and improve implementation outcomes.",
+        ],
+        "style": styles[variant],
+    }
 
 
 def _parse_color(value, fallback):
@@ -220,13 +332,15 @@ def _oval(slide, x, y, w, h, fill):
 
 def _tb(slide, text, x, y, w, h, size,
         bold=False, italic=False, color=None,
-        face="Calibri", align=PP_ALIGN.LEFT):
+        face="Calibri", align=PP_ALIGN.LEFT, shrink_to_fit=False):
     """Single-paragraph textbox with optional **bold** marker support."""
     text = str(text) if not isinstance(text, str) else text
     bx = slide.shapes.add_textbox(_IN(x), _IN(y), _IN(w), _IN(h))
     tf = bx.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.TOP
+    if shrink_to_fit:
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     p = tf.paragraphs[0]
     p.alignment = align
     parts = text.split("**")
@@ -354,11 +468,15 @@ def _header(slide, title, subtitle, num, theme, style=None):
 
     # Title — width leaves room for logo badge AND number badge
     title_w = BADGE_X - 1.10 - 0.45
-    _tb(slide, title, 0.45, 0.18, title_w, 0.76, 30,
-        bold=True, color=theme["text_light"], face=theme["header_font"])
+    t_size = _title_size(title, base=30)
+    _tb(slide, title, 0.45, 0.18, title_w, 0.76, t_size,
+        bold=True, color=theme["text_light"], face=theme["header_font"], shrink_to_fit=True)
     if subtitle:
-        _tb(slide, subtitle, 0.45, 0.96, title_w, 0.38, 13,
-            italic=True, color=theme["secondary"], face=theme["body_font"])
+        s_size = _subtitle_size(subtitle, base=13)
+        # Keep subtitle readable over blue header variants.
+        sub_color = _mix(theme["text_light"], theme["secondary"], 0.35)
+        _tb(slide, subtitle, 0.45, 0.96, title_w, 0.38, s_size,
+            italic=True, color=sub_color, face=theme["body_font"], shrink_to_fit=True)
 
     # Slide number badge
     bx = BADGE_X - 0.78
@@ -741,7 +859,7 @@ def _render_table(slide, spec, num, theme, logo_path):
         cx = ix + cidx * (col_w + gap)
         _rect(slide, cx, iy, col_w, header_h, stheme["primary"], line=stheme["secondary"], lw=0.8)
         _tb(slide, c, cx + 0.06, iy + 0.08, col_w - 0.12, header_h - 0.12, 12,
-            bold=True, color=stheme["text_light"], face=stheme["header_font"], align=PP_ALIGN.CENTER)
+            bold=True, color=stheme["text_light"], face=stheme["header_font"], align=PP_ALIGN.CENTER, shrink_to_fit=True)
 
     # Body rows
     for ridx, row in enumerate(row_data):
@@ -751,7 +869,7 @@ def _render_table(slide, spec, num, theme, logo_path):
             cx = ix + cidx * (col_w + gap)
             _rect(slide, cx, ry, col_w, row_h, fill, line=_mix(stheme["primary"], stheme["card_bg"], 0.65), lw=0.5)
             _tb(slide, cell, cx + 0.06, ry + 0.06, col_w - 0.12, row_h - 0.10, 11,
-                color=stheme["text_dark"], face=stheme["body_font"], align=PP_ALIGN.LEFT)
+                color=stheme["text_dark"], face=stheme["body_font"], align=PP_ALIGN.LEFT, shrink_to_fit=True)
 
     _add_logo(slide, logo_path, stheme)
 
@@ -1254,85 +1372,85 @@ Each slide.style must include:
             # Also change one variant so it looks visibly different.
             cur["header_variant"] = "banded" if prev.get("header_variant") != "banded" else "split"
 
-    # Ensure opening title slide exists.
-    if clean_slides:
-        first_title = str(clean_slides[0].get("title", "")).strip().lower()
-        if topic.strip().lower() not in first_title and "title" not in first_title:
-            clean_slides.insert(0, {
-                "title": topic,
-                "subtitle": f"{tone} presentation overview",
-                "layout": "big_stat",
-                "icon": "★",
-                "stat": "2026",
-                "stat_label": "Strategic Focus",
-                "stat_source": "Prepared for presentation",
-                "content": [
-                    f"**Agenda**: this presentation explains core opportunities, measurable outcomes, risks, and implementation steps for {topic}.",
-                    "**Approach**: each section combines real examples, practical benchmarks, and clear decisions leaders can act on immediately.",
-                    "**Outcome**: by the end, you will have a concrete roadmap to prioritize pilots, track ROI, and scale responsibly.",
-                    "**Audience fit**: recommendations are structured for business, product, operations, and technology stakeholders.",
-                    "**Decision support**: data points and comparisons are included to accelerate confident executive alignment.",
-                ],
-                "style": {
-                    "pattern_name": "opening_title",
-                    "surface": "light",
-                    "header_variant": "split",
-                    "card_variant": "banded",
-                    "footer_variant": "line",
-                    "badge_shape": "rect",
-                    "accent_rotation": "static",
-                },
-            })
+    # Topic-aware structure nudges: encourage non-repetitive middle sections.
+    layouts_present = {str(s.get("layout", "")) for s in clean_slides}
+    topic_l = topic.lower()
+    preferred = []
+    if any(k in topic_l for k in ("architecture", "framework", "cloud", "system", "infrastructure")):
+        preferred = ["table", "timeline"]
+    elif any(k in topic_l for k in ("strategy", "market", "business", "growth", "roi")):
+        preferred = ["big_stat", "case_study"]
+    elif any(k in topic_l for k in ("ai", "ml", "model", "data")):
+        preferred = ["timeline", "icon_grid"]
     else:
-        clean_slides = [{
-            "title": topic,
-            "subtitle": f"{tone} presentation",
-            "layout": "bullets",
-            "icon": "▸",
-            "content": [
-                f"**Overview**: this deck introduces the key business context and practical implementation path for {topic}.",
-                "**Value**: recommendations are focused on measurable outcomes and execution feasibility.",
-                "**Roadmap**: each slide contributes to a decision-ready plan for stakeholders.",
-                "**Data basis**: examples and figures are included where relevant to support choices.",
-                "**Next steps**: close with immediate actions to launch or improve adoption.",
-            ],
-            "style": {
-                "pattern_name": "opening_fallback",
-                "surface": "light",
-                "header_variant": "solid",
-                "card_variant": "outline",
-                "footer_variant": "line",
-                "badge_shape": "oval",
-                "accent_rotation": "static",
-            },
-        }]
+        preferred = ["table", "big_stat"]
 
-    # Ensure final slide is Thank You / Q&A.
+    def _first_bullets_idx():
+        for j, sl in enumerate(clean_slides):
+            if sl.get("layout") == "bullets":
+                return j
+        return None
+
+    for pref in preferred:
+        if pref in layouts_present:
+            continue
+        idx = _first_bullets_idx()
+        if idx is None:
+            break
+        src = clean_slides[idx]
+        points = src.get("content", [])
+        if pref == "timeline":
+            steps = []
+            for k, p in enumerate(points[:4], start=1):
+                steps.append({"label": f"Phase {k}", "detail": str(p)})
+            src["layout"] = "timeline"
+            src["steps"] = steps if steps else [
+                {"label": "Phase 1", "detail": f"Initial plan for {topic}."},
+                {"label": "Phase 2", "detail": "Pilot and validation."},
+                {"label": "Phase 3", "detail": "Scale and optimize."},
+                {"label": "Phase 4", "detail": "Govern and continuously improve."},
+            ]
+            src["content"] = []
+        elif pref == "table":
+            src["layout"] = "table"
+            src["table_columns"] = ["Area", "Current", "Target"]
+            rows = []
+            for p in points[:5]:
+                rows.append(["Workstream", str(p)[:60], "Measured improvement"])
+            src["table_rows"] = rows if rows else [
+                ["Architecture", f"Baseline for {topic}", "Scalable blueprint"],
+                ["Operations", "Manual processes", "Automated controls"],
+                ["Security", "Reactive checks", "Policy-driven governance"],
+                ["Metrics", "Ad-hoc reporting", "KPI dashboard"],
+            ]
+            src["content"] = []
+        elif pref == "big_stat":
+            src["layout"] = "big_stat"
+            src["stat"] = src.get("stat", "42%")
+            src["stat_label"] = src.get("stat_label", "Target Improvement")
+            src["stat_source"] = src.get("stat_source", "Industry benchmark")
+        elif pref == "case_study":
+            src["layout"] = "case_study"
+            src["company"] = src.get("company", "Reference Enterprise")
+            src["result"] = src.get("result", f"Demonstrated practical gains for {topic}")
+            src["metrics"] = src.get("metrics", [
+                {"label": "Efficiency", "value": 40},
+                {"label": "Quality", "value": 35},
+                {"label": "Adoption", "value": 30},
+            ])
+        layouts_present.add(pref)
+
+    seed = _topic_seed(topic)
+    variant = seed % 3
+
+    # Add a topic-aware opening cover slide every time.
+    clean_slides.insert(0, _opening_slide_spec(topic, tone, variant))
+
+    # Add topic-aware closing thank-you slide unless already present.
     if clean_slides:
         last_title = str(clean_slides[-1].get("title", "")).strip().lower()
         if not any(k in last_title for k in ("thank", "q&a", "questions", "qa")):
-            clean_slides.append({
-                "title": "Thank You",
-                "subtitle": "Questions & Discussion",
-                "layout": "bullets",
-                "icon": "✓",
-                "content": [
-                    f"**Thank you** for your time and attention on {topic}.",
-                    "**Q&A**: we welcome questions, feedback, and priority alignment discussion.",
-                    "**Next action**: confirm owner, timeline, and measurable KPI for the first milestone.",
-                    "**Follow-up**: share decisions and execution plan with stakeholders within one business cycle.",
-                    "**Contact**: include your team or presenter contact details in delivery notes.",
-                ],
-                "style": {
-                    "pattern_name": "closing_thank_you",
-                    "surface": "light",
-                    "header_variant": "banded",
-                    "card_variant": "soft",
-                    "footer_variant": "line",
-                    "badge_shape": "rect",
-                    "accent_rotation": "static",
-                },
-            })
+            clean_slides.append(_closing_slide_spec(topic, variant))
 
     data["slides"] = clean_slides
 
