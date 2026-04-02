@@ -124,6 +124,31 @@ if st.button("🚀 Generate PPT"):
                                     with cols[idx % 2]:
                                         st.write(f"**{gi.get('title', '')}**: {gi.get('detail', '')}")
 
+                            elif layout == "table":
+                                cols = slide.get("table_columns", [])
+                                rows = slide.get("table_rows", [])
+                                if cols and rows:
+                                    try:
+                                        import pandas as pd
+                                        normalized_rows = []
+                                        for r in rows:
+                                            if not isinstance(r, list):
+                                                continue
+                                            rr = [str(x) for x in r[:len(cols)]]
+                                            while len(rr) < len(cols):
+                                                rr.append("")
+                                            normalized_rows.append(rr)
+                                        if normalized_rows:
+                                            st.dataframe(pd.DataFrame(normalized_rows, columns=cols), width="stretch")
+                                    except Exception:
+                                        # Fallback without pandas
+                                        st.write(" | ".join([f"**{c}**" for c in cols]))
+                                        for r in rows:
+                                            if isinstance(r, list):
+                                                st.write(" | ".join([str(x) for x in r[:len(cols)]]))
+                                for point in slide.get("content", []):
+                                    st.write(f"• {point}")
+
                             else:
                                 # Fallback: show content bullets if available
                                 for point in slide.get("content", []):

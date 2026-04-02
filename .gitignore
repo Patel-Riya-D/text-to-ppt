@@ -14,3 +14,9 @@ __pycache__/
 
 # Large files (optional)
 *.log
+
+generated/
+
+.codex
+
+ppt.py
