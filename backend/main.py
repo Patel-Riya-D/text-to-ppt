@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
+import asyncio
 from fastapi import File, UploadFile, Form
 
 # Services
@@ -48,10 +49,29 @@ async def generate_ppt(
             with open(logo_path, "wb") as f:
                 f.write(await logo.read())
 
-        # Generate content
-        slide_data = generate_slide_content(topic, num_slides, tone)
+        # Generate content (bounded timeout so request doesn't hang forever)
+        try:
+            slide_data = await asyncio.wait_for(
+                asyncio.to_thread(generate_slide_content, topic, num_slides, tone),
+                timeout=150,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Slide generation timed out after 150 seconds. Try fewer slides or retry.",
+            )
 
-        file_path = create_ppt(slide_data, topic, logo_path, tone=tone)
+        # Build PPT (also bounded)
+        try:
+            file_path = await asyncio.wait_for(
+                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="PPT rendering timed out after 90 seconds. Please retry.",
+            )
 
         # Create PPT with logo
         from fastapi.responses import JSONResponse

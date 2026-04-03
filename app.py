@@ -66,7 +66,8 @@ if st.button("🚀 Generate PPT"):
                         "num_slides": num_slides,
                         "tone": tone
                     },
-                    files=files
+                    files=files,
+                    timeout=(10, 180),
                 )
 
                 if response.status_code != 200:
@@ -167,5 +168,9 @@ if st.button("🚀 Generate PPT"):
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     )
 
+            except requests.exceptions.Timeout:
+                st.error("Generation timed out. Try reducing slides (e.g., 3-5) and retry.")
+            except requests.exceptions.ConnectionError:
+                st.error("Cannot connect to backend. Ensure FastAPI server is running on http://127.0.0.1:8000.")
             except Exception as e:
                 st.error(f"Error: {e}")

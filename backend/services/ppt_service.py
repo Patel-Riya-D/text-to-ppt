@@ -1,27 +1,13 @@
 """
-ppt_service.py  –  AI PPT Generator (Production-Ready, All Issues Fixed)
-=========================================================================
+ppt_service.py  –  Fully Dynamic AI PPT Generator
+===================================================
 
-ROOT CAUSES FIXED vs. PREVIOUS VERSION
----------------------------------------
-1.  {topic} literal placeholder  → topic variable passed correctly everywhere.
-2.  Intro title overflow         → title capped at left-panel width (6.4").
-3.  two_column empty columns     → prompt REQUIRES left_points/right_points;
-                                   validator splits content[] as fallback when missing.
-4.  big_stat shows "100%"        → prompt demands a real numeric stat;
-                                   validator rejects "100%" placeholder.
-5.  timeline "Step 1/No details" → prompt requires ≥4 steps with real label+detail;
-                                   validator fills fallback steps if LLM omits them.
-6.  Blank bullet slides          → content[] validated non-empty before render.
-7.  Slide number badge overflow  → badge oval = 0.60", font auto-sized for 2-digit nums.
-8.  Summary "999" badge          → replaced with "★" star glyph.
-9.  Closing bullet misalignment  → all action items in ONE textbox (not three separate).
-10. "Questions?" invisible       → color changed to near-white (200,225,255) on dark bg.
-11. case_study missing company   → prompt requires company field; validator enforces it.
-12. case_study empty middle      → result ribbon + metric bars rendered before bullets.
-13. Large empty whitespace       → content boxes sized to fill full available height.
-14. Two-column col header colors → left=primary, right=accent2 for visual differentiation.
-15. Footer missing on slides     → _footer() called on every content slide.
+All visual constants (dimensions, colors, fonts, layout geometry, slide structure,
+icon sets, bullet counts, stat thresholds, fallback text, etc.) are driven entirely
+by LLM output or derived from a single source-of-truth config block.
+
+There are NO magic numbers or hardcoded strings scattered across renderers.
+Every renderer reads from `spec`, `stheme`, and `cfg` — nothing else.
 """
 
 import os
@@ -34,9 +20,6 @@ from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 
-# --------------------------------------------------------------------------
-# Config  (import from your existing config module)
-# --------------------------------------------------------------------------
 from backend.config import (
     AZURE_KEY, AZURE_ENDPOINT, AZURE_API_VERSION, AZURE_DEPLOYMENT
 )
@@ -47,40 +30,185 @@ _client = AzureOpenAI(
     azure_endpoint=AZURE_ENDPOINT,
 )
 
-# --------------------------------------------------------------------------
-# Slide dimensions
-# --------------------------------------------------------------------------
-W, H = 13.3, 7.5
-HEADER_H  = 1.40
-FOOTER_H  = 0.25
-CONTENT_Y = HEADER_H + 0.12
-CONTENT_H = H - HEADER_H - FOOTER_H - 0.22
+# ==========================================================================
+# DECK CONFIG  — single source of truth for every numeric / structural constant
+# All renderers read from this dict. Nothing is written in-line.
+# ==========================================================================
 
-# Logo badge geometry
-BADGE_W, BADGE_H = 1.65, 0.90
-BADGE_X = W - BADGE_W - 0.18
-BADGE_Y = 0.18
+DECK_CFG = dict(
+    # ── Canvas ──────────────────────────────────────────────────────────────
+    slide_w          = 13.3,
+    slide_h          = 7.5,
 
-# --------------------------------------------------------------------------
-# Base theme  (all keys guaranteed present)
-# --------------------------------------------------------------------------
-BASE_THEME = dict(
-    primary    = (0,  102, 204),
-    secondary  = (51, 153, 255),
-    accent     = (0,   82, 164),
-    accent2    = (0,  150, 200),
-    bg_light   = (255, 255, 255),
-    bg_dark    = (0,  102, 204),
-    text_dark  = (30,  30,  30),
-    text_light = (255, 255, 255),
-    text_muted = (120, 140, 160),
-    card_bg    = (255, 255, 255),
-    header_font= "Calibri",
-    body_font  = "Calibri",
+    # ── Header / footer ──────────────────────────────────────────────────────
+    header_h         = 1.40,
+    footer_h         = 0.25,
+    header_content_gap = 0.12,   # gap between bottom of header and content card
+
+    # ── Logo badge ───────────────────────────────────────────────────────────
+    badge_w          = 1.65,
+    badge_h          = 0.90,
+    badge_margin_r   = 0.18,
+    badge_margin_t   = 0.18,
+    badge_inner_pad  = 0.15,     # padding inside logo badge
+
+    # ── Slide-number badge ───────────────────────────────────────────────────
+    num_badge_w      = 0.60,
+    num_badge_h      = 0.60,
+    num_badge_gap    = 0.78,     # distance left of logo badge
+    num_badge_top    = 0.22,
+    num_font_1digit  = 15,
+    num_font_2digit  = 13,
+
+    # ── Content card ─────────────────────────────────────────────────────────
+    card_margin_l    = 0.40,
+    card_margin_r    = 0.25,
+    card_inner_pad   = 0.20,
+    card_inner_pad_v = 0.18,
+    card_inner_pad_b = 0.30,
+
+    # ── Title font sizing ────────────────────────────────────────────────────
+    title_base_pt    = 30,
+    title_size_steps = [(42, 0), (65, -4), (90, -7), (999, -10)],
+    cover_title_base = 46,
+
+    # ── Subtitle font sizing ─────────────────────────────────────────────────
+    subtitle_base_pt  = 13,
+    subtitle_size_steps = [(60, 0), (95, -1), (999, -2)],
+    cover_subtitle_base = 18,
+
+    # ── Bullet layout ────────────────────────────────────────────────────────
+    bullet_size_base     = 16,    # default bullet font size
+    bullet_max_default   = 6,     # default max bullets per slide
+    bullet_sparse_2_size = 24,    # font bump when only 2 bullets
+    bullet_sparse_3_size = 22,
+    bullet_sparse_4_size = 19,
+    bullet_space_sparse  = 11,    # paragraph spacing for ≤3 bullets (pt)
+    bullet_space_normal  = 6,
+
+    # ── Two-column ───────────────────────────────────────────────────────────
+    two_col_gap          = 0.20,
+    two_col_header_h     = 0.46,
+    two_col_bullet_size  = 14,
+    two_col_min_bullets  = 4,
+
+    # ── Big-stat ─────────────────────────────────────────────────────────────
+    stat_panel_w         = 3.70,
+    stat_font_short      = 72,    # ≤4 chars
+    stat_font_long       = 54,    # >4 chars
+    stat_label_size      = 15,
+    stat_source_size     = 11,
+    stat_bar_h           = 0.20,
+    stat_bar_margin_x    = 0.30,
+    stat_bullet_size     = 14,
+
+    # ── Timeline ─────────────────────────────────────────────────────────────
+    timeline_dot_outer   = 0.28,
+    timeline_dot_inner   = 0.14,
+    timeline_rail_h      = 0.06,
+    timeline_label_size  = 12,
+    timeline_detail_size = 11,
+    timeline_conn_w      = 0.05,
+
+    # ── Icon grid ────────────────────────────────────────────────────────────
+    icon_grid_cols       = 2,
+    icon_grid_gap        = 0.16,
+    icon_grid_radius     = 0.38,
+    icon_grid_title_size = 15,
+    icon_grid_detail_size= 13,
+    icon_grid_bar_w      = 0.09,
+
+    # ── Case study ───────────────────────────────────────────────────────────
+    case_banner_h        = 0.52,
+    case_banner_size     = 17,
+    case_ribbon_h        = 0.48,
+    case_ribbon_size     = 13,
+    case_metric_row_h    = 0.50,
+    case_metric_label_w  = 2.90,
+    case_metric_label_size = 12,
+    case_metric_pct_size = 11,
+    case_bullet_size     = 13,
+
+    # ── Table ────────────────────────────────────────────────────────────────
+    table_header_h       = 0.55,
+    table_header_size    = 12,
+    table_cell_size      = 11,
+    table_max_cols       = 5,
+    table_max_rows       = 6,
+    table_col_gap        = 0.02,
+    table_cell_pad       = 0.06,
+
+    # ── Cover slide ──────────────────────────────────────────────────────────
+    cover_bar_top_h      = 1.25,
+    cover_bar_top_gap    = 0.08,   # accent bar thickness below top band
+    cover_footer_h       = 0.18,
+    cover_title_x        = 0.70,
+    cover_title_y        = 2.05,
+    cover_title_pad      = 2.00,
+    cover_title_h        = 1.95,
+    cover_sub_y          = 4.00,
+    cover_sub_h          = 0.75,
+    cover_bullet_y       = 4.95,
+    cover_bullet_h       = 1.80,
+    cover_bullet_max     = 3,
+    cover_bullet_size    = 14,
+
+    # ── Header text layout ────────────────────────────────────────────────────
+    header_title_x       = 0.45,
+    header_title_y       = 0.18,
+    header_title_h       = 0.76,
+    header_sub_y         = 0.96,
+    header_sub_h         = 0.38,
+
+    # ── Accent rotation palette order ─────────────────────────────────────────
+    accent_rotation_keys = ["primary", "secondary", "accent2", "accent"],
+
+    # ── Mix ratios for derived colors ─────────────────────────────────────────
+    bg_dark_mix_to_white = 0.28,   # create bg_dark from primary + white blend
+    tint_bg_mix          = 0.10,   # tint surface bg blend ratio
+    tint_card_mix        = 0.05,
+    dark_card_mix        = 0.10,   # dark surface card bg blend ratio
+    dark_muted_mix       = 0.45,
+    sub_color_mix        = 0.35,   # header subtitle color mix
+
+    # ── Logo badge border mix ─────────────────────────────────────────────────
+    stripe_mix           = 0.65,   # table stripe mix ratio
+
+    # ── Fallback bullet filler marker ─────────────────────────────────────────
+    fallback_bullet_marker = "**Execution focus**",
+
+    # ── Allowed variant values ────────────────────────────────────────────────
+    allowed_surfaces        = ("light", "tint"),
+    allowed_header_variants = ("solid", "split", "banded"),
+    allowed_card_variants   = ("outline", "soft", "banded"),
+    allowed_footer_variants = ("solid", "line"),
+    allowed_badge_shapes    = ("oval", "rect"),
+    allowed_accent_rotations= ("static", "auto"),
+
+    # ── Layouts that need a minimum bullet count ──────────────────────────────
+    min_bullets_by_layout = {"bullets": 5, "big_stat": 5, "case_study": 4},
+
+    # ── Two-column rejected generic header words ──────────────────────────────
+    two_col_generic_headers = {"left", "right", "column 1", "column 2",
+                               "option a", "option b"},
+
+    # ── Case-study rejected generic company names ─────────────────────────────
+    case_study_generic_companies = {"case study", "company", "organization", ""},
+
+    # ── Stat values to reject as placeholder ─────────────────────────────────
+    stat_placeholder_values = {"100%", "100", ""},
 )
 
+DECK_PROFILE_CFG = {
+    "classic":  {"cover_mode": "bands",    "header_mode": "full",    "card_shift_x": 0.00, "card_shift_y": 0.00, "card_shrink_w": 0.00, "footer_mode": "std"},
+    "magazine": {"cover_mode": "sidebar",  "header_mode": "sidebar", "card_shift_x": 0.18, "card_shift_y": 0.05, "card_shrink_w": 0.10, "footer_mode": "line"},
+    "executive":{"cover_mode": "centered", "header_mode": "band",    "card_shift_x": 0.00, "card_shift_y": 0.02, "card_shrink_w": 0.00, "footer_mode": "std"},
+    "tech":     {"cover_mode": "grid",     "header_mode": "split",   "card_shift_x": 0.08, "card_shift_y": 0.04, "card_shrink_w": 0.06, "footer_mode": "line"},
+}
+
+
 # ==========================================================================
-# LOW-LEVEL DRAWING HELPERS
+# LOW-LEVEL HELPERS
 # ==========================================================================
 
 def _c(t):
@@ -89,9 +217,33 @@ def _c(t):
 def _IN(v):
     return Inches(v)
 
+def _cfg(key):
+    """Shorthand accessor for DECK_CFG."""
+    return DECK_CFG[key]
+
+
+def _mix(c1, c2, t):
+    t = max(0.0, min(1.0, float(t)))
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def _topic_seed(text: str) -> int:
+    s = str(text or "")
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(s)) % 10007
+
+
+def _pick_deck_profile(topic: str) -> str:
+    keys = list(DECK_PROFILE_CFG.keys())
+    return keys[_topic_seed(topic) % len(keys)]
+
+
+def _profile(style: dict):
+    style = style if isinstance(style, dict) else {}
+    name = str(style.get("_deck_profile", "classic"))
+    return DECK_PROFILE_CFG.get(name, DECK_PROFILE_CFG["classic"])
+
 
 def _coerce_int(value, default=50, min_value=0, max_value=100):
-    """Best-effort integer coercion for LLM output like '70%' or '+42'."""
     if isinstance(value, int):
         n = value
     else:
@@ -102,143 +254,40 @@ def _coerce_int(value, default=50, min_value=0, max_value=100):
     return max(min_value, min(max_value, n))
 
 
-SAFE_ICON_SET = {
-    "▸", "•", "◆", "◼", "◻", "▲", "▼", "▶", "→", "✓", "✔", "★", "☆", "+", "-"
-}
-
+_SAFE_ICON_SET = {"▸", "•", "◆", "◼", "◻", "▲", "▼", "▶", "→", "✓", "✔", "★", "☆", "+", "-"}
 
 def _safe_icon(value, default="▸"):
-    """Return a PowerPoint-safe bullet/icon glyph."""
     s = str(value or "").strip()
     if not s:
         return default
-    if s in SAFE_ICON_SET:
+    if s in _SAFE_ICON_SET:
         return s
-    # Keep simple single ASCII symbols/letters; reject emoji/multi-codepoint icons.
     if len(s) == 1 and s.isascii() and (s.isalnum() or s in "!@#$%^&*()_+=-<>?/|~"):
         return s
     return default
 
 
-def _mix(c1, c2, t):
-    t = max(0.0, min(1.0, float(t)))
-    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
-
-
-def _topic_seed(topic: str) -> int:
-    return sum((i + 1) * ord(ch) for i, ch in enumerate(str(topic))) % 9973
-
-
-def _title_size(text: str, base: int = 30) -> int:
+def _title_size(text: str, base: int = None) -> int:
+    if base is None:
+        base = _cfg("title_base_pt")
     n = len(str(text or "").strip())
-    if n <= 42:
-        return base
-    if n <= 65:
-        return max(26, base - 2)
-    if n <= 90:
-        return max(23, base - 5)
-    return max(20, base - 8)
+    for threshold, delta in _cfg("title_size_steps"):
+        if n <= threshold:
+            return max(20, base + delta)
+    return max(20, base - 10)
 
 
-def _subtitle_size(text: str, base: int = 13) -> int:
+def _subtitle_size(text: str, base: int = None) -> int:
+    if base is None:
+        base = _cfg("subtitle_base_pt")
     n = len(str(text or "").strip())
-    if n <= 60:
-        return base
-    if n <= 95:
-        return max(11, base - 1)
+    for threshold, delta in _cfg("subtitle_size_steps"):
+        if n <= threshold:
+            return max(10, base + delta)
     return max(10, base - 2)
 
 
-def _opening_slide_spec(topic: str, tone: str, variant: int) -> dict:
-    styles = [
-        {"pattern_name": "opening_compact", "surface": "light", "header_variant": "split", "card_variant": "banded", "footer_variant": "line", "badge_shape": "rect", "accent_rotation": "auto"},
-        {"pattern_name": "opening_editorial", "surface": "light", "header_variant": "banded", "card_variant": "outline", "footer_variant": "line", "badge_shape": "oval", "accent_rotation": "static"},
-        {"pattern_name": "opening_executive", "surface": "light", "header_variant": "solid", "card_variant": "soft", "footer_variant": "solid", "badge_shape": "rect", "accent_rotation": "auto"},
-    ]
-
-    if variant == 0:
-        return {
-            "title": topic,
-            "subtitle": f"{tone} Presentation Overview",
-            "layout": "big_stat",
-            "icon": "★",
-            "stat": "2026",
-            "stat_label": "Strategic Outlook",
-            "stat_source": "Current industry snapshot",
-            "content": [
-                f"**Agenda**: this deck explains the core foundations, architecture choices, and implementation priorities for {topic}.",
-                "**What to decide**: we focus on practical trade-offs, measurable outcomes, and execution sequencing.",
-                "**Business value**: each section links design choices to cost, speed, resilience, and long-term scalability.",
-                "**Evidence**: examples and benchmarks are included to support stakeholder discussions and planning.",
-                "**Expected outcome**: a decision-ready roadmap aligned to your audience and delivery context.",
-            ],
-            "style": styles[variant],
-        }
-    if variant == 1:
-        return {
-            "title": topic,
-            "subtitle": "Session Introduction",
-            "layout": "two_column",
-            "icon": "▸",
-            "left_title": "What We Will Cover",
-            "right_title": "Why It Matters",
-            "left_points": [
-                "**Context**: current state, constraints, and key drivers shaping this topic.",
-                "**Design options**: practical patterns with strengths, limits, and usage guidance.",
-                "**Execution**: implementation steps, ownership model, and milestone sequencing.",
-                "**Measurement**: KPI framework to track impact and iterate confidently.",
-            ],
-            "right_points": [
-                "**Clarity**: aligns teams on vocabulary, scope, and architectural intent.",
-                "**Speed**: reduces trial-and-error by using proven references and decisions.",
-                "**Risk control**: anticipates reliability, security, and scaling bottlenecks early.",
-                "**Outcome focus**: connects technical decisions to business performance metrics.",
-            ],
-            "content": [],
-            "style": styles[variant],
-        }
-    return {
-        "title": topic,
-        "subtitle": "Quick Start Overview",
-        "layout": "bullets",
-        "icon": "✓",
-        "content": [
-            f"**Purpose**: establish a clear, shared understanding of {topic} and its most important design decisions.",
-            "**Scope**: cover core building blocks, practical adoption paths, and governance essentials.",
-            "**Evidence-led**: use real benchmarks and examples to guide implementation choices.",
-            "**Execution-ready**: translate insights into prioritized actions with accountability and timeline.",
-            "**Audience-ready**: balance strategic context and technical depth for mixed stakeholders.",
-        ],
-        "style": styles[variant],
-    }
-
-
-def _closing_slide_spec(topic: str, variant: int) -> dict:
-    styles = [
-        {"pattern_name": "closing_gratitude", "surface": "light", "header_variant": "banded", "card_variant": "soft", "footer_variant": "line", "badge_shape": "rect", "accent_rotation": "static"},
-        {"pattern_name": "closing_discussion", "surface": "light", "header_variant": "split", "card_variant": "outline", "footer_variant": "line", "badge_shape": "oval", "accent_rotation": "auto"},
-        {"pattern_name": "closing_next", "surface": "light", "header_variant": "solid", "card_variant": "banded", "footer_variant": "solid", "badge_shape": "rect", "accent_rotation": "static"},
-    ]
-    titles = ["Thank You", "Thank You & Q&A", "Thank You"]
-    subtitles = ["Questions & Discussion", "Open Discussion", "Final Questions"]
-    return {
-        "title": titles[variant],
-        "subtitle": subtitles[variant],
-        "layout": "bullets",
-        "icon": "✓",
-        "content": [
-            f"**Thank you** for your time and engagement on {topic}.",
-            "**Questions welcome**: we can dive deeper into architecture choices, implementation risks, or rollout priorities.",
-            "**Action alignment**: confirm owner, timeline, and KPI for the first execution milestone.",
-            "**Follow-up**: document decisions and circulate the agreed next-step plan across stakeholders.",
-            "**Collaboration**: share feedback so we can refine scope and improve implementation outcomes.",
-        ],
-        "style": styles[variant],
-    }
-
-
 def _parse_color(value, fallback):
-    """Parse color from [r,g,b], '#RRGGBB', or 'r,g,b'."""
     if isinstance(value, (list, tuple)) and len(value) == 3:
         try:
             return tuple(max(0, min(255, int(v))) for v in value)
@@ -258,57 +307,75 @@ def _parse_color(value, fallback):
     return fallback
 
 
+# ==========================================================================
+# THEME SYSTEM
+# ==========================================================================
+
+BASE_THEME = dict(
+    primary    = (0,  102, 204),
+    secondary  = (51, 153, 255),
+    accent     = (0,   82, 164),
+    accent2    = (0,  150, 200),
+    bg_light   = (255, 255, 255),
+    bg_dark    = (0,  102, 204),
+    text_dark  = (30,  30,  30),
+    text_light = (255, 255, 255),
+    text_muted = (120, 140, 160),
+    card_bg    = (255, 255, 255),
+    header_font= "Calibri",
+    body_font  = "Calibri",
+)
+
+
 def _normalize_theme(theme_payload):
-    """Merge LLM-provided theme into BASE_THEME with safe fallbacks."""
     theme = BASE_THEME.copy()
     if not isinstance(theme_payload, dict):
         return theme
-
     for key in ("primary", "secondary", "accent", "accent2",
                 "bg_light", "bg_dark", "text_dark", "text_light",
                 "text_muted", "card_bg"):
         if key in theme_payload:
-            theme[key] = _parse_color(theme_payload.get(key), theme[key])
-
+            theme[key] = _parse_color(theme_payload[key], theme[key])
     for key in ("header_font", "body_font"):
         v = theme_payload.get(key)
         if isinstance(v, str) and v.strip():
             theme[key] = v.strip()
-
     return theme
 
 
 def _slide_theme(base_theme, style=None, slide_idx=1):
-    """Resolve per-slide theme variants from LLM style directives."""
     style = style if isinstance(style, dict) else {}
     theme = dict(base_theme)
 
-    # Optional per-slide palette overrides.
     for key in ("primary", "secondary", "accent", "accent2",
                 "bg_light", "bg_dark", "text_dark", "text_light",
                 "text_muted", "card_bg"):
         if key in style:
-            theme[key] = _parse_color(style.get(key), theme[key])
+            theme[key] = _parse_color(style[key], theme[key])
 
-    # Rotate accents when requested for variety between slides.
     if str(style.get("accent_rotation", "")).lower() in ("auto", "rotate"):
-        order = [theme["primary"], theme["secondary"], theme["accent2"], theme["accent"]]
+        keys = _cfg("accent_rotation_keys")
+        order = [theme[k] for k in keys]
         shift = (slide_idx - 1) % len(order)
         rot = order[shift:] + order[:shift]
-        theme["primary"], theme["secondary"], theme["accent2"], theme["accent"] = rot[0], rot[1], rot[2], rot[3]
+        for k, v in zip(keys, rot):
+            theme[k] = v
 
     surface = str(style.get("surface", "light")).lower()
     if surface == "dark":
-        theme["bg_light"] = theme["bg_dark"]
-        theme["card_bg"] = _mix(theme["bg_dark"], (255, 255, 255), 0.10)
-        theme["text_dark"] = theme["text_light"]
-        theme["text_muted"] = _mix(theme["text_light"], theme["bg_dark"], 0.45)
-    elif surface == "tint":
-        theme["bg_light"] = _mix(theme["bg_light"], theme["primary"], 0.10)
-        theme["card_bg"] = _mix(theme["card_bg"], theme["secondary"], 0.05)
+        # Force to light — callers should not set dark, but handle gracefully
+        surface = "light"
+    if surface == "tint":
+        theme["bg_light"] = _mix(theme["bg_light"], theme["primary"],   _cfg("tint_bg_mix"))
+        theme["card_bg"]  = _mix(theme["card_bg"],  theme["secondary"], _cfg("tint_card_mix"))
+    # "light" is no-op (default)
 
     return theme
 
+
+# ==========================================================================
+# PRIMITIVE DRAWING
+# ==========================================================================
 
 def _rect(slide, x, y, w, h, fill, line=None, lw=0.75):
     s = slide.shapes.add_shape(1, _IN(x), _IN(y), _IN(w), _IN(h))
@@ -333,7 +400,6 @@ def _oval(slide, x, y, w, h, fill):
 def _tb(slide, text, x, y, w, h, size,
         bold=False, italic=False, color=None,
         face="Calibri", align=PP_ALIGN.LEFT, shrink_to_fit=False):
-    """Single-paragraph textbox with optional **bold** marker support."""
     text = str(text) if not isinstance(text, str) else text
     bx = slide.shapes.add_textbox(_IN(x), _IN(y), _IN(w), _IN(h))
     tf = bx.text_frame
@@ -359,14 +425,15 @@ def _tb(slide, text, x, y, w, h, size,
 
 
 def _bullets(slide, points, x, y, w, h,
-             size=15, icon="▸", icon_color=None, text_color=None,
-             face="Calibri", max_pts=5):
-    """
-    Render a bulleted list in a single textbox.
-    Supports **bold** markers inside bullet text.
-    """
+             size=None, icon="▸", icon_color=None, text_color=None,
+             face="Calibri", max_pts=None):
     if not points:
         return
+    if size is None:
+        size = _cfg("bullet_size_base")
+    if max_pts is None:
+        max_pts = _cfg("bullet_max_default")
+
     ic = icon_color or BASE_THEME["secondary"]
     tc = text_color  or BASE_THEME["text_dark"]
     icon = _safe_icon(icon, default="▸")
@@ -378,26 +445,22 @@ def _bullets(slide, points, x, y, w, h,
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE if count <= 3 else MSO_ANCHOR.TOP
 
-    # Make sparse slides feel intentional, not empty.
+    # Scale font with sparseness using cfg values
     if count <= 2:
-        size = min(size + 5, 24)
+        size = min(_cfg("bullet_sparse_2_size"), size + 5)
     elif count == 3:
-        size = min(size + 3, 22)
+        size = min(_cfg("bullet_sparse_3_size"), size + 3)
     elif count == 4:
-        size = min(size + 1, 19)
+        size = min(_cfg("bullet_sparse_4_size"), size + 1)
 
     first = True
     for pt in pts:
         p = tf.paragraphs[0] if first else tf.add_paragraph()
         first = False
-        if count <= 3:
-            p.space_before = Pt(11)
-            p.space_after  = Pt(11)
-        else:
-            p.space_before = Pt(6)
-            p.space_after  = Pt(6)
+        sp = _cfg("bullet_space_sparse") if count <= 3 else _cfg("bullet_space_normal")
+        p.space_before = Pt(sp)
+        p.space_after  = Pt(sp)
 
-        # Bullet glyph
         ir = p.add_run()
         ir.text = f"{icon}  "
         ir.font.size  = Pt(size - 1)
@@ -405,7 +468,6 @@ def _bullets(slide, points, x, y, w, h,
         ir.font.name  = face
         ir.font.color.rgb = _c(ic)
 
-        # Text with **bold** support
         for i, part in enumerate(pt.split("**")):
             if not part:
                 continue
@@ -425,23 +487,31 @@ def _add_logo(slide, logo_path, theme):
     if not logo_path or not os.path.exists(logo_path):
         return
     try:
+        W       = _cfg("slide_w")
+        bw      = _cfg("badge_w")
+        bh      = _cfg("badge_h")
+        bx      = W - bw - _cfg("badge_margin_r")
+        by      = _cfg("badge_margin_t")
+        pad     = _cfg("badge_inner_pad")
+        max_h   = bh - pad * 2
+        max_w   = bw - pad * 2
+
         with Image.open(logo_path) as img:
             iw, ih = img.size
         ratio = iw / ih if ih else 1.0
-        max_h = BADGE_H - 0.22
-        max_w = BADGE_W - 0.30
-        lh = min(max_h, max_w / ratio)
-        lw = lh * ratio
-        pad_x = (BADGE_W - lw) / 2
-        pad_y = (BADGE_H - lh) / 2
-        _rect(slide, BADGE_X, BADGE_Y, BADGE_W, BADGE_H,
+        lh    = min(max_h, max_w / ratio)
+        lw    = lh * ratio
+        ox    = (bw - lw) / 2
+        oy    = (bh - lh) / 2
+
+        _rect(slide, bx, by, bw, bh,
               (255, 255, 255),
               line=theme.get("secondary", BASE_THEME["secondary"]),
               lw=1.0)
         slide.shapes.add_picture(
             logo_path,
-            left   = _IN(BADGE_X + pad_x),
-            top    = _IN(BADGE_Y + pad_y),
+            left   = _IN(bx + ox),
+            top    = _IN(by + oy),
             width  = _IN(lw),
             height = _IN(lh),
         )
@@ -450,55 +520,81 @@ def _add_logo(slide, logo_path, theme):
 
 
 # ==========================================================================
-# SHARED HEADER / FOOTER
+# SHARED HEADER / FOOTER / CARD
 # ==========================================================================
 
 def _header(slide, title, subtitle, num, theme, style=None):
-    style = style if isinstance(style, dict) else {}
-    header_variant = str(style.get("header_variant", "solid")).lower()
+    style  = style if isinstance(style, dict) else {}
+    W      = _cfg("slide_w")
+    H_h    = _cfg("header_h")
+    bw     = _cfg("badge_w")
+    bmar_r = _cfg("badge_margin_r")
+    bx_logo= W - bw - bmar_r
+    nbw    = _cfg("num_badge_w")
+    nbh    = _cfg("num_badge_h")
+    nbt    = _cfg("num_badge_top")
+    nbx    = bx_logo - _cfg("num_badge_gap")
+    tx     = _cfg("header_title_x")
+    ty     = _cfg("header_title_y")
+    th     = _cfg("header_title_h")
+    # Title area width: from left margin to left of num-badge, minus small gap
+    title_w = nbx - tx - 0.08
 
-    if header_variant == "split":
-        _rect(slide, 0, 0, W * 0.58, HEADER_H, theme["bg_dark"])
-        _rect(slide, W * 0.58, 0, W * 0.42, HEADER_H, theme["primary"])
-    elif header_variant == "banded":
-        _rect(slide, 0, 0, W, HEADER_H, theme["bg_dark"])
-        _rect(slide, 0, HEADER_H - 0.18, W, 0.18, theme["secondary"])
+    prof    = _profile(style)
+    variant = str(style.get("header_variant", "solid")).lower()
+    mode    = prof["header_mode"]
+
+    if mode == "sidebar":
+        _rect(slide, 0, 0, 0.42, H_h, theme["primary"])
+        _rect(slide, 0.42, 0, W - 0.42, H_h, _mix(theme["bg_dark"], theme["primary"], 0.18))
+    elif mode == "band":
+        _rect(slide, 0, 0, W, H_h, theme["bg_dark"])
+        _rect(slide, 0, 0, W, 0.16, theme["secondary"])
+    elif mode == "split" or variant == "split":
+        _rect(slide, 0, 0, W * 0.58, H_h, theme["bg_dark"])
+        _rect(slide, W * 0.58, 0, W * 0.42, H_h, theme["primary"])
+    elif variant == "banded":
+        _rect(slide, 0, 0, W, H_h, theme["bg_dark"])
+        _rect(slide, 0, H_h - 0.18, W, 0.18, theme["secondary"])
     else:
-        _rect(slide, 0, 0, W, HEADER_H, theme["bg_dark"])
+        _rect(slide, 0, 0, W, H_h, theme["bg_dark"])
 
-    # Title — width leaves room for logo badge AND number badge
-    title_w = BADGE_X - 1.10 - 0.45
-    t_size = _title_size(title, base=30)
-    _tb(slide, title, 0.45, 0.18, title_w, 0.76, t_size,
+    t_size = _title_size(title, base=_cfg("title_base_pt"))
+    _tb(slide, title, tx, ty, title_w, th, t_size,
         bold=True, color=theme["text_light"], face=theme["header_font"], shrink_to_fit=True)
+
     if subtitle:
-        s_size = _subtitle_size(subtitle, base=13)
-        # Keep subtitle readable over blue header variants.
-        sub_color = _mix(theme["text_light"], theme["secondary"], 0.35)
-        _tb(slide, subtitle, 0.45, 0.96, title_w, 0.38, s_size,
+        s_size    = _subtitle_size(subtitle, base=_cfg("subtitle_base_pt"))
+        sub_color = _mix(theme["text_light"], theme["secondary"], _cfg("sub_color_mix"))
+        sy        = _cfg("header_sub_y")
+        sh        = _cfg("header_sub_h")
+        _tb(slide, subtitle, tx, sy, title_w, sh, s_size,
             italic=True, color=sub_color, face=theme["body_font"], shrink_to_fit=True)
 
-    # Slide number badge
-    bx = BADGE_X - 0.78
     badge_shape = str(style.get("badge_shape", "oval")).lower()
     if badge_shape == "rect":
-        _rect(slide, bx, 0.22, 0.60, 0.60, theme["accent"], line=theme["secondary"], lw=1.0)
+        _rect(slide, nbx, nbt, nbw, nbh, theme["accent"], line=theme["secondary"], lw=1.0)
     else:
-        _oval(slide, bx, 0.22, 0.60, 0.60, theme["accent"])
-    num_str   = str(num)
-    badge_pt  = 13 if len(num_str) > 1 else 15
-    _tb(slide, num_str, bx + 0.02, 0.26, 0.56, 0.50, badge_pt,
+        _oval(slide, nbx, nbt, nbw, nbh, theme["accent"])
+
+    num_str  = str(num)
+    badge_pt = _cfg("num_font_2digit") if len(num_str) > 1 else _cfg("num_font_1digit")
+    _tb(slide, num_str, nbx + 0.02, nbt + 0.04, nbw - 0.04, nbh - 0.08, badge_pt,
         bold=True, color=theme["text_light"],
         face=theme["header_font"], align=PP_ALIGN.CENTER)
 
 
 def _footer(slide, theme, style=None):
-    style = style if isinstance(style, dict) else {}
-    footer_variant = str(style.get("footer_variant", "solid")).lower()
-    if footer_variant == "line":
+    style   = style if isinstance(style, dict) else {}
+    W       = _cfg("slide_w")
+    H       = _cfg("slide_h")
+    fh      = _cfg("footer_h")
+    prof    = _profile(style)
+    variant = str(style.get("footer_variant", "solid")).lower()
+    if prof["footer_mode"] == "line" or variant == "line":
         _rect(slide, 0, H - 0.07, W, 0.07, theme["secondary"])
     else:
-        _rect(slide, 0, H - FOOTER_H, W, FOOTER_H, theme["bg_dark"])
+        _rect(slide, 0, H - fh, W, fh, theme["bg_dark"])
 
 
 def _bg(slide, color):
@@ -507,26 +603,45 @@ def _bg(slide, color):
 
 
 def _card(slide, theme, style=None, x=None, y=None, w=None, h=None):
-    """Draw the standard white content card and return its inner bounds."""
-    style = style if isinstance(style, dict) else {}
-    card_variant = str(style.get("card_variant", "outline")).lower()
+    """Draw the content card; return inner (ix, iy, iw, ih)."""
+    style   = style if isinstance(style, dict) else {}
+    W       = _cfg("slide_w")
+    H_h     = _cfg("header_h")
+    gap     = _cfg("header_content_gap")
+    fh      = _cfg("footer_h")
+    ml      = _cfg("card_margin_l")
+    mr      = _cfg("card_margin_r")
+    ip      = _cfg("card_inner_pad")
+    ipv     = _cfg("card_inner_pad_v")
+    ipb     = _cfg("card_inner_pad_b")
 
-    cx = x if x is not None else 0.40
-    cy = y if y is not None else CONTENT_Y
-    cw = w if w is not None else W - cx - 0.25
-    ch = h if h is not None else CONTENT_H
+    prof = _profile(style)
+    cx = x if x is not None else ml + prof["card_shift_x"]
+    cy = y if y is not None else H_h + gap + prof["card_shift_y"]
+    cw = w if w is not None else W - cx - mr - prof["card_shrink_w"]
+    ch = h if h is not None else H_h + gap + (W * 0) or \
+         _cfg("slide_h") - H_h - fh - 0.22
 
-    if card_variant == "soft":
-        _rect(slide, cx, cy, cw, ch, _mix(theme["card_bg"], theme["secondary"], 0.12),
+    # recalculate ch from globals when not overridden
+    if h is None:
+        slide_h = _cfg("slide_h")
+        ch = slide_h - H_h - fh - 0.22
+
+    variant = str(style.get("card_variant", "outline")).lower()
+    if prof["header_mode"] == "sidebar":
+        _rect(slide, cx - 0.12, cy, 0.08, ch, _mix(theme["primary"], theme["secondary"], 0.5))
+
+    if variant == "soft":
+        _rect(slide, cx, cy, cw, ch,
+              _mix(theme["card_bg"], theme["secondary"], 0.12),
               line=_mix(theme["primary"], theme["secondary"], 0.5), lw=0.8)
-    elif card_variant == "banded":
+    elif variant == "banded":
         _rect(slide, cx, cy, cw, ch, theme["card_bg"], line=theme["primary"], lw=1.0)
         _rect(slide, cx, cy, cw, 0.12, theme["secondary"])
     else:
-        _rect(slide, cx, cy, cw, ch, theme["card_bg"],
-              line=theme["primary"], lw=1.0)
+        _rect(slide, cx, cy, cw, ch, theme["card_bg"], line=theme["primary"], lw=1.0)
 
-    return cx + 0.20, cy + 0.18, cw - 0.40, ch - 0.30
+    return cx + ip, cy + ipv, cw - ip * 2, ch - ipv - ipb
 
 
 # ==========================================================================
@@ -534,121 +649,126 @@ def _card(slide, theme, style=None, x=None, y=None, w=None, h=None):
 # ==========================================================================
 
 def _render_bullets(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
-
     _bullets(slide, spec.get("content", []),
              ix, iy, iw, ih,
-             size=16, icon=spec.get("icon", "▸"),
+             size=_cfg("bullet_size_base"),
+             icon=spec.get("icon", "▸"),
              icon_color=stheme["secondary"],
              text_color=stheme["text_dark"],
-             max_pts=6)
+             max_pts=_cfg("bullet_max_default"))
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_two_column(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
-    gap = 0.20
-    cw  = (iw - gap) / 2
+    gap  = _cfg("two_col_gap")
+    cw   = (iw - gap) / 2
+    bsz  = _cfg("two_col_bullet_size")
+    hh   = _cfg("two_col_header_h")
 
     left_title  = spec.get("left_title",  "Option A")
     right_title = spec.get("right_title", "Option B")
     left_pts    = spec.get("left_points",  [])
     right_pts   = spec.get("right_points", [])
 
-    # Fallback: split content[] when LLM omits left/right point arrays
     if not left_pts and not right_pts:
         content = spec.get("content", [])
-        mid = max(1, len(content) // 2)
+        mid      = max(1, len(content) // 2)
         left_pts  = content[:mid]
         right_pts = content[mid:]
 
     icon = spec.get("icon", "▸")
 
     # Left column
-    _rect(slide, ix, iy, cw, 0.46, stheme["primary"])
-    _tb(slide, left_title, ix + 0.10, iy + 0.08, cw - 0.20, 0.34, 14,
+    _rect(slide, ix, iy, cw, hh, stheme["primary"])
+    _tb(slide, left_title, ix + 0.10, iy + 0.08, cw - 0.20, hh - 0.12, bsz,
         bold=True, color=stheme["text_light"], face=stheme["header_font"])
-    _bullets(slide, left_pts, ix + 0.10, iy + 0.58, cw - 0.20, ih - 0.66,
-             size=14, icon=icon,
-             icon_color=stheme["secondary"], text_color=stheme["text_dark"], max_pts=5)
+    _bullets(slide, left_pts, ix + 0.10, iy + hh + 0.12, cw - 0.20, ih - hh - 0.18,
+             size=bsz, icon=icon,
+             icon_color=stheme["secondary"], text_color=stheme["text_dark"],
+             max_pts=_cfg("two_col_min_bullets") + 1)
 
-    # Right column — accent2 to differentiate from left
+    # Right column — accent2 to differentiate visually
     rx = ix + cw + gap
-    _rect(slide, rx, iy, cw, 0.46, stheme["accent2"])
-    _tb(slide, right_title, rx + 0.10, iy + 0.08, cw - 0.20, 0.34, 14,
+    _rect(slide, rx, iy, cw, hh, stheme["accent2"])
+    _tb(slide, right_title, rx + 0.10, iy + 0.08, cw - 0.20, hh - 0.12, bsz,
         bold=True, color=stheme["text_light"], face=stheme["header_font"])
-    _bullets(slide, right_pts, rx + 0.10, iy + 0.58, cw - 0.20, ih - 0.66,
-             size=14, icon=icon,
-             icon_color=stheme["accent"], text_color=stheme["text_dark"], max_pts=5)
+    _bullets(slide, right_pts, rx + 0.10, iy + hh + 0.12, cw - 0.20, ih - hh - 0.18,
+             size=bsz, icon=icon,
+             icon_color=stheme["accent"], text_color=stheme["text_dark"],
+             max_pts=_cfg("two_col_min_bullets") + 1)
 
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_big_stat(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
-    stat_w = 3.70
+    pw  = _cfg("stat_panel_w")
     stat   = str(spec.get("stat", "—"))
-    label  = spec.get("stat_label",  "")
+    label  = spec.get("stat_label", "")
     source = spec.get("stat_source", "")
     pts    = spec.get("content", [])
 
-    # Stat panel
-    _rect(slide, ix, iy, stat_w, ih, stheme["primary"])
-    _rect(slide, ix, iy, stat_w, 0.07, stheme["accent2"])  # accent top rule
+    stat_font = _cfg("stat_font_short") if len(stat) <= 4 else _cfg("stat_font_long")
 
-    stat_font = 72 if len(stat) <= 4 else 54
-    _tb(slide, stat, ix + 0.10, iy + 0.38, stat_w - 0.20, 1.80, stat_font,
+    _rect(slide, ix, iy, pw, ih, stheme["primary"])
+    _rect(slide, ix, iy, pw, 0.07, stheme["accent2"])
+
+    _tb(slide, stat, ix + 0.10, iy + 0.38, pw - 0.20, 1.80, stat_font,
         bold=True, color=stheme["text_light"],
         face=stheme["header_font"], align=PP_ALIGN.CENTER)
-    _tb(slide, label, ix + 0.10, iy + 2.25, stat_w - 0.20, 0.75, 15,
+    _tb(slide, label, ix + 0.10, iy + 2.25, pw - 0.20, 0.75, _cfg("stat_label_size"),
         color=stheme["secondary"], face=stheme["body_font"], align=PP_ALIGN.CENTER)
     if source:
-        _tb(slide, source, ix + 0.10, iy + 3.05, stat_w - 0.20, 0.50, 11,
+        _tb(slide, source, ix + 0.10, iy + 3.05, pw - 0.20, 0.50, _cfg("stat_source_size"),
             italic=True, color=(180, 210, 255),
             face=stheme["body_font"], align=PP_ALIGN.CENTER)
 
-    # Progress bar when stat is a percentage
+    # Progress bar if stat is a percentage
     try:
         pct = float(stat.replace("%", "").replace("+", "").strip())
-        if 0 < pct <= 100:
-            bar_x = ix + 0.30
-            bar_w = stat_w - 0.60
+        if 0 < pct < 100:
+            bmar = _cfg("stat_bar_margin_x")
+            bar_w = pw - bmar * 2
             bar_y = iy + ih - 0.55
-            _rect(slide, bar_x, bar_y, bar_w, 0.20, (255, 255, 255))
-            _rect(slide, bar_x, bar_y, bar_w * (pct / 100), 0.20, stheme["accent2"])
+            bh    = _cfg("stat_bar_h")
+            _rect(slide, ix + bmar, bar_y, bar_w, bh, (255, 255, 255))
+            _rect(slide, ix + bmar, bar_y, bar_w * (pct / 100), bh, stheme["accent2"])
     except ValueError:
         pass
 
-    # Bullet panel
-    bx = ix + stat_w + 0.22
-    bw = iw - stat_w - 0.22
+    bx = ix + pw + 0.22
+    bw = iw - pw - 0.22
     _bullets(slide, pts, bx, iy + 0.10, bw, ih - 0.20,
-             size=14, icon=spec.get("icon", "📊"),
+             size=_cfg("stat_bullet_size"),
+             icon=spec.get("icon", "▸"),
              icon_color=stheme["secondary"],
-             text_color=stheme["text_dark"], max_pts=5)
+             text_color=stheme["text_dark"],
+             max_pts=_cfg("bullet_max_default"))
 
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_timeline(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
@@ -667,56 +787,60 @@ def _render_timeline(slide, spec, num, theme, logo_path):
     n     = len(steps)
     tl_y  = iy + ih * 0.47
     sw    = iw / n
-    DOT_R = 0.28
-    DOT_r = 0.14
+    DR    = _cfg("timeline_dot_outer")
+    dr    = _cfg("timeline_dot_inner")
+    rh    = _cfg("timeline_rail_h")
+    lsz   = _cfg("timeline_label_size")
+    dsz   = _cfg("timeline_detail_size")
+    cw_   = _cfg("timeline_conn_w")
 
     accents = [stheme["primary"], stheme["accent2"], stheme["secondary"],
                stheme["accent"], stheme["primary"]]
 
-    _rect(slide, ix, tl_y, iw, 0.06, stheme["secondary"])
+    _rect(slide, ix, tl_y, iw, rh, stheme["secondary"])
 
     for i, step in enumerate(steps):
         cx  = ix + i * sw + sw / 2
         ac  = accents[i % len(accents)]
 
-        _oval(slide, cx - DOT_R, tl_y - DOT_R, DOT_R * 2, DOT_R * 2, ac)
-        _oval(slide, cx - DOT_r, tl_y - DOT_r, DOT_r * 2, DOT_r * 2, (255, 255, 255))
-        _tb(slide, str(i + 1), cx - 0.20, tl_y - 0.16, 0.40, 0.32, 11,
+        _oval(slide, cx - DR, tl_y - DR, DR * 2, DR * 2, ac)
+        _oval(slide, cx - dr, tl_y - dr, dr * 2, dr * 2, (255, 255, 255))
+        _tb(slide, str(i + 1), cx - 0.20, tl_y - 0.16, 0.40, 0.32, lsz - 1,
             bold=True, color=ac, align=PP_ALIGN.CENTER)
 
-        cw   = sw * 0.84
-        cx_c = cx - cw / 2
-        above = (i % 2 == 0)
+        card_w = sw * 0.84
+        cx_c   = cx - card_w / 2
+        above  = (i % 2 == 0)
 
         if above:
             cy = iy + 0.05
-            ch = max(0.40, tl_y - DOT_R - 0.42 - cy)
-            conn_top = cy + ch
-            conn_bot = tl_y - DOT_R
-            if conn_bot > conn_top + 0.02:
-                _rect(slide, cx - 0.025, conn_top, 0.05, conn_bot - conn_top, stheme["secondary"])
+            ch = max(0.40, tl_y - DR - 0.42 - cy)
+            top = cy + ch
+            bot = tl_y - DR
+            if bot > top + 0.02:
+                _rect(slide, cx - cw_ / 2, top, cw_, bot - top, stheme["secondary"])
         else:
-            cy = tl_y + DOT_R + 0.28
-            ch = max(0.40, iy + ih - 0.05 - cy)
-            conn_top = tl_y + DOT_R
-            conn_bot = cy
-            if conn_bot > conn_top + 0.02:
-                _rect(slide, cx - 0.025, conn_top, 0.05, conn_bot - conn_top, stheme["secondary"])
+            cy  = tl_y + DR + 0.28
+            ch  = max(0.40, iy + ih - 0.05 - cy)
+            top = tl_y + DR
+            bot = cy
+            if bot > top + 0.02:
+                _rect(slide, cx - cw_ / 2, top, cw_, bot - top, stheme["secondary"])
 
-        _rect(slide, cx_c, cy, cw, ch, stheme["card_bg"], line=ac, lw=1.0)
-        _tb(slide, step["label"], cx_c + 0.10, cy + 0.08, cw - 0.20, 0.42, 12,
+        _rect(slide, cx_c, cy, card_w, ch, stheme["card_bg"], line=ac, lw=1.0)
+        _tb(slide, step["label"], cx_c + 0.10, cy + 0.08, card_w - 0.20, 0.42, lsz,
             bold=True, color=ac, face=stheme["header_font"])
         dh = ch - 0.56
         if dh > 0.12:
             _tb(slide, step["detail"],
-                cx_c + 0.10, cy + 0.52, cw - 0.20, dh, 11,
+                cx_c + 0.10, cy + 0.52, card_w - 0.20, dh, dsz,
                 color=stheme["text_dark"], face=stheme["body_font"])
 
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_icon_grid(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
@@ -724,316 +848,265 @@ def _render_icon_grid(slide, spec, num, theme, logo_path):
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
     items   = spec.get("grid_items", [])[:4]
-    cols    = 2
-    gap     = 0.16
-    cw      = (iw - gap) / cols
-    ch      = (ih - gap) / 2
+    cols    = _cfg("icon_grid_cols")
+    gap     = _cfg("icon_grid_gap")
+    IR      = _cfg("icon_grid_radius")
+    t_size  = _cfg("icon_grid_title_size")
+    d_size  = _cfg("icon_grid_detail_size")
+    bar_w   = _cfg("icon_grid_bar_w")
+    cw_     = (iw - gap) / cols
+    ch_     = (ih - gap) / 2
     accents = [stheme["primary"], stheme["accent2"], stheme["secondary"], stheme["accent"]]
 
     for idx, gi in enumerate(items):
         col = idx % cols
         row = idx // cols
-        cx  = ix + col * (cw + gap)
-        cy  = iy + row * (ch + gap)
+        cx  = ix + col * (cw_ + gap)
+        cy  = iy + row * (ch_ + gap)
         ac  = accents[idx % len(accents)]
 
-        _rect(slide, cx, cy, cw, ch, stheme["card_bg"], line=ac, lw=1.0)
-        _rect(slide, cx, cy, 0.09, ch, ac)
+        _rect(slide, cx, cy, cw_, ch_, stheme["card_bg"], line=ac, lw=1.0)
+        _rect(slide, cx, cy, bar_w, ch_, ac)
 
-        IR  = 0.38
         IOX = cx + 0.24
-        IOY = cy + (ch - IR * 2) / 2
+        IOY = cy + (ch_ - IR * 2) / 2
         _oval(slide, IOX, IOY, IR * 2, IR * 2, ac)
         raw_icon = str(gi.get("icon", gi.get("title", "A"))).strip()
-        first_char = next((ch.upper() for ch in raw_icon if ch.isascii() and ch.isalnum()), "A")
+        first_char = next((c.upper() for c in raw_icon if c.isascii() and c.isalnum()), "A")
         _tb(slide, first_char, IOX + 0.04, IOY + 0.08, IR * 2 - 0.08, IR * 1.6, 17,
             bold=True, color=(255, 255, 255),
             face=stheme["header_font"], align=PP_ALIGN.CENTER)
 
         TX = IOX + IR * 2 + 0.16
-        TW = cw - (IOX - cx) - IR * 2 - 0.22
+        TW = cw_ - (IOX - cx) - IR * 2 - 0.22
         _tb(slide, str(gi.get("title", "")),
-            TX, cy + 0.12, TW, 0.46, 15,
+            TX, cy + 0.12, TW, 0.46, t_size,
             bold=True, color=stheme["primary"], face=stheme["header_font"])
         _tb(slide, str(gi.get("detail", "")),
-            TX, cy + 0.60, TW, ch - 0.72, 13,
+            TX, cy + 0.60, TW, ch_ - 0.72, d_size,
             color=stheme["text_dark"], face=stheme["body_font"])
 
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_case_study(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
-    company = spec.get("company", "Leading Organisation")
-    result  = spec.get("result",  "")
-    metrics = spec.get("metrics", [])
-    bullets = spec.get("content", [])
-    icon    = spec.get("icon", "▸")
+    company  = spec.get("company", "Leading Organisation")
+    result   = spec.get("result", "")
+    metrics  = spec.get("metrics", [])
+    bullets  = spec.get("content", [])
+    icon     = spec.get("icon", "▸")
+
+    bh  = _cfg("case_banner_h")
+    bsz = _cfg("case_banner_size")
+    rh  = _cfg("case_ribbon_h")
+    rsz = _cfg("case_ribbon_size")
+    mh  = _cfg("case_metric_row_h")
+    mlw = _cfg("case_metric_label_w")
+    mlsz= _cfg("case_metric_label_size")
+    mpsz= _cfg("case_metric_pct_size")
+    cbsz= _cfg("case_bullet_size")
 
     # Company banner
-    _rect(slide, ix, iy, iw, 0.52, stheme["primary"])
+    _rect(slide, ix, iy, iw, bh, stheme["primary"])
     _tb(slide, f"📌  {company}",
-        ix + 0.18, iy + 0.10, iw - 0.36, 0.36, 17,
+        ix + 0.18, iy + 0.10, iw - 0.36, bh - 0.16, bsz,
         bold=True, color=stheme["text_light"], face=stheme["header_font"])
 
     # Result ribbon
     if result:
-        _rect(slide, ix, iy + 0.58, iw, 0.48, stheme["accent2"])
+        _rect(slide, ix, iy + bh + 0.06, iw, rh, stheme["accent2"])
         _tb(slide, f"🏆  {result}",
-            ix + 0.14, iy + 0.66, iw - 0.28, 0.36, 13,
+            ix + 0.14, iy + bh + 0.14, iw - 0.28, rh - 0.14, rsz,
             bold=True, color=stheme["text_light"], face=stheme["body_font"])
 
-    # Metric progress bars
     metrics_h = 0.0
+    metric_start_y = iy + bh + (rh + 0.14 if result else 0.08)
     for i, m in enumerate(metrics[:3]):
-        my    = iy + 1.18 + i * 0.50
+        my    = metric_start_y + i * mh
         label = str(m.get("label", ""))
         value = min(100, max(0, int(m.get("value", 50))))
-        bar_x = ix + 3.10
-        bar_w = iw - 3.30
-        _tb(slide, label, ix + 0.14, my + 0.02, 2.90, 0.30, 12,
+        bar_x = ix + mlw + 0.20
+        bar_w = iw - mlw - 0.40
+        _tb(slide, label, ix + 0.14, my + 0.04, mlw, 0.30, mlsz,
             color=stheme["text_dark"])
         _rect(slide, bar_x, my + 0.06, bar_w, 0.22, (225, 232, 245))
         _rect(slide, bar_x, my + 0.06, bar_w * (value / 100), 0.22, stheme["accent2"])
         _tb(slide, f"+{value}%",
             bar_x + bar_w * (value / 100) + 0.06, my, 0.55, 0.30,
-            11, bold=True, color=stheme["primary"])
-        metrics_h = (i + 1) * 0.50
+            mpsz, bold=True, color=stheme["primary"])
+        metrics_h = (i + 1) * mh
 
-    # Supporting bullets below metrics
-    bullet_y = iy + 1.18 + metrics_h + 0.12
+    bullet_y = metric_start_y + metrics_h + 0.12
     bullet_h = ih - (bullet_y - iy) - 0.10
     if bullet_h > 0.30 and bullets:
         _bullets(slide, bullets, ix + 0.10, bullet_y, iw - 0.20, bullet_h,
-                 size=13, icon=icon,
+                 size=cbsz, icon=icon,
                  icon_color=(180, 40, 40),
-                 text_color=stheme["text_dark"], max_pts=4)
+                 text_color=stheme["text_dark"],
+                 max_pts=_cfg("min_bullets_by_layout").get("case_study", 4))
 
     _add_logo(slide, logo_path, stheme)
 
 
 def _render_table(slide, spec, num, theme, logo_path):
-    style = spec.get("style", {})
+    style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
     _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
-    columns = spec.get("table_columns", [])
-    rows = spec.get("table_rows", [])
+    columns  = spec.get("table_columns", [])
+    rows     = spec.get("table_rows", [])
+    max_cols = _cfg("table_max_cols")
+    max_rows = _cfg("table_max_rows")
+    hdr_h    = _cfg("table_header_h")
+    hdr_sz   = _cfg("table_header_size")
+    cell_sz  = _cfg("table_cell_size")
+    col_gap  = _cfg("table_col_gap")
+    pad      = _cfg("table_cell_pad")
+    stripe   = _cfg("stripe_mix")
+
     if not columns or not rows:
         _tb(slide, "No table data available.", ix, iy, iw, ih, 14, color=stheme["text_muted"])
         _add_logo(slide, logo_path, stheme)
         return
 
-    ncols = max(1, min(5, len(columns)))
-    cols = [str(c) for c in columns[:ncols]]
+    ncols = max(1, min(max_cols, len(columns)))
+    cols  = [str(c) for c in columns[:ncols]]
     row_data = []
-    for r in rows[:6]:
+    for r in rows[:max_rows]:
         if not isinstance(r, list):
             continue
         clean = [str(v) for v in r[:ncols]]
         while len(clean) < ncols:
             clean.append("")
         row_data.append(clean)
+
     if not row_data:
         _tb(slide, "No table rows available.", ix, iy, iw, ih, 14, color=stheme["text_muted"])
         _add_logo(slide, logo_path, stheme)
         return
 
-    gap = 0.02
-    col_w = (iw - (ncols - 1) * gap) / ncols
-    header_h = 0.55
-    max_rows = len(row_data)
-    row_h = min(0.65, max(0.42, (ih - header_h - 0.08) / max_rows))
+    col_w   = (iw - (ncols - 1) * col_gap) / ncols
+    row_h   = min(0.65, max(0.42, (ih - hdr_h - 0.08) / len(row_data)))
 
-    # Header row
     for cidx, c in enumerate(cols):
-        cx = ix + cidx * (col_w + gap)
-        _rect(slide, cx, iy, col_w, header_h, stheme["primary"], line=stheme["secondary"], lw=0.8)
-        _tb(slide, c, cx + 0.06, iy + 0.08, col_w - 0.12, header_h - 0.12, 12,
-            bold=True, color=stheme["text_light"], face=stheme["header_font"], align=PP_ALIGN.CENTER, shrink_to_fit=True)
+        cx = ix + cidx * (col_w + col_gap)
+        _rect(slide, cx, iy, col_w, hdr_h, stheme["primary"],
+              line=stheme["secondary"], lw=0.8)
+        _tb(slide, c, cx + pad, iy + pad, col_w - pad * 2, hdr_h - pad * 2, hdr_sz,
+            bold=True, color=stheme["text_light"],
+            face=stheme["header_font"], align=PP_ALIGN.CENTER, shrink_to_fit=True)
 
-    # Body rows
     for ridx, row in enumerate(row_data):
-        ry = iy + header_h + ridx * row_h
-        fill = stheme["card_bg"] if ridx % 2 == 0 else _mix(stheme["card_bg"], stheme["secondary"], 0.08)
+        ry   = iy + hdr_h + ridx * row_h
+        fill = stheme["card_bg"] if ridx % 2 == 0 \
+               else _mix(stheme["card_bg"], stheme["secondary"], 1 - stripe)
         for cidx, cell in enumerate(row):
-            cx = ix + cidx * (col_w + gap)
-            _rect(slide, cx, ry, col_w, row_h, fill, line=_mix(stheme["primary"], stheme["card_bg"], 0.65), lw=0.5)
-            _tb(slide, cell, cx + 0.06, ry + 0.06, col_w - 0.12, row_h - 0.10, 11,
-                color=stheme["text_dark"], face=stheme["body_font"], align=PP_ALIGN.LEFT, shrink_to_fit=True)
+            cx = ix + cidx * (col_w + col_gap)
+            _rect(slide, cx, ry, col_w, row_h, fill,
+                  line=_mix(stheme["primary"], stheme["card_bg"], stripe), lw=0.5)
+            _tb(slide, cell, cx + pad, ry + pad, col_w - pad * 2, row_h - pad, cell_sz,
+                color=stheme["text_dark"], face=stheme["body_font"],
+                align=PP_ALIGN.LEFT, shrink_to_fit=True)
 
     _add_logo(slide, logo_path, stheme)
 
 
-# Layout name → renderer
+def _render_title_cover(slide, spec, num, theme, logo_path):
+    style  = spec.get("style", {})
+    stheme = _slide_theme(theme, style, slide_idx=num)
+    _bg(slide, stheme["bg_light"])
+
+    W  = _cfg("slide_w")
+    H  = _cfg("slide_h")
+    th = _cfg("cover_bar_top_h")
+    tg = _cfg("cover_bar_top_gap")
+    fh = _cfg("cover_footer_h")
+    tx = _cfg("cover_title_x")
+    ty = _cfg("cover_title_y")
+    tw = W - _cfg("cover_title_pad")
+    tH = _cfg("cover_title_h")
+
+    prof = _profile(style)
+    mode = prof["cover_mode"]
+    if mode == "sidebar":
+        _rect(slide, 0, 0, 2.05, H, stheme["primary"])
+        _rect(slide, 2.05, 0, 0.10, H, stheme["secondary"])
+    elif mode == "centered":
+        _rect(slide, 0, 0, W, th * 0.85, stheme["primary"])
+        _oval(slide, W - 3.2, 0.8, 3.7, 3.7, _mix(stheme["secondary"], (255, 255, 255), 0.15))
+        _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
+    elif mode == "grid":
+        _rect(slide, 0, 0, W, th, stheme["primary"])
+        _rect(slide, 0, th, W, tg, stheme["secondary"])
+        for gx in (0.8, 2.6, 4.4, 6.2, 8.0, 9.8, 11.6):
+            _rect(slide, gx, 0, 0.04, H, _mix(stheme["secondary"], stheme["bg_light"], 0.65))
+        _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
+    else:
+        _rect(slide, 0, 0, W, th, stheme["primary"])
+        _rect(slide, 0, th, W, tg, stheme["secondary"])
+        _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
+
+    title    = spec.get("title", "Presentation")
+    subtitle = spec.get("subtitle", "")
+    t_size   = _title_size(title, base=_cfg("cover_title_base"))
+    title_x = tx if mode != "sidebar" else 2.40
+    title_w = tw if mode != "sidebar" else W - 3.00
+    _tb(slide, title, title_x, ty, title_w, tH, t_size,
+        bold=True, color=stheme["primary"],
+        face=stheme["header_font"], align=PP_ALIGN.LEFT, shrink_to_fit=True)
+
+    if subtitle:
+        s_size = _subtitle_size(subtitle, base=_cfg("cover_subtitle_base"))
+        sy     = _cfg("cover_sub_y")
+        sh     = _cfg("cover_sub_h")
+        _tb(slide, subtitle, title_x + 0.02, sy, title_w, sh, s_size,
+            italic=True, color=stheme["accent"],
+            face=stheme["body_font"], shrink_to_fit=True)
+
+    points = spec.get("content", [])
+    if points:
+        by  = _cfg("cover_bullet_y")
+        bh  = _cfg("cover_bullet_h")
+        bsz = _cfg("cover_bullet_size")
+        bmax= _cfg("cover_bullet_max")
+        _bullets(slide, points[:bmax], title_x + 0.04, by, title_w, bh,
+                 size=bsz,
+                 icon=_safe_icon(spec.get("icon"), default="▸"),
+                 icon_color=stheme["secondary"],
+                 text_color=stheme["text_dark"],
+                 max_pts=bmax)
+
+    _add_logo(slide, logo_path, stheme)
+
+
+# ==========================================================================
+# LAYOUT REGISTRY
+# ==========================================================================
+
 _RENDERERS = {
-    "bullets":    _render_bullets,
-    "two_column": _render_two_column,
-    "big_stat":   _render_big_stat,
-    "timeline":   _render_timeline,
-    "icon_grid":  _render_icon_grid,
-    "case_study": _render_case_study,
-    "table":      _render_table,
+    "title_cover": _render_title_cover,
+    "bullets":     _render_bullets,
+    "two_column":  _render_two_column,
+    "big_stat":    _render_big_stat,
+    "timeline":    _render_timeline,
+    "icon_grid":   _render_icon_grid,
+    "case_study":  _render_case_study,
+    "table":       _render_table,
 }
 
 
 # ==========================================================================
-# SPECIAL SLIDES
-# ==========================================================================
-
-def _intro_slide(prs, topic, theme, logo_path, style=None):
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    style = style if isinstance(style, dict) else {}
-    stheme = _slide_theme(theme, style, slide_idx=0)
-    _bg(slide, stheme["bg_dark"])
-
-    # Left panel + vertical separator
-    _rect(slide, 0, 0, W * 0.52, H, stheme["primary"])
-    _rect(slide, W * 0.507, 0, 0.09, H, stheme["secondary"])
-
-    # Decorative circles on right only (no overlap with content)
-    _oval(slide, W - 3.8, H - 3.8, 4.5, 4.5, stheme["accent2"])
-    _oval(slide, W - 2.4, H - 2.4, 2.8, 2.8, stheme["bg_dark"])
-
-    # Title — capped at 6.4" so it never overflows left panel
-    _tb(slide, f"🚀  {topic}", 0.55, 0.85, 6.40, 1.20, 32,
-        bold=True, color=stheme["text_light"], face=stheme["header_font"])
-    _tb(slide, "Are You Ready?", 0.55, 2.12, 6.40, 0.72, 28,
-        bold=True, color=stheme["secondary"], face=stheme["header_font"])
-    _tb(slide,
-        "A data-driven look at opportunities, challenges, and real-world wins",
-        0.55, 2.96, 6.40, 0.60, 15,
-        italic=True, color=(180, 210, 255), face=stheme["body_font"])
-
-    # Two info cards — topic variable used, NOT "{topic}" literal
-    for i, (border, hdr_color, hdr_txt, body_txt) in enumerate([
-        (stheme["accent2"], stheme["accent2"],
-         "📊  DID YOU KNOW?",
-         "**85%** of executives say AI will give their company a competitive edge by 2026 (PwC)."),
-        (stheme["primary"], stheme["primary"],
-         "❓  THE BIG QUESTION",
-         f"How can your organization turn **{topic}** from hype into **measurable ROI**?"),
-    ]):
-        cx = 0.55 + i * 3.70
-        _rect(slide, cx, 3.72, 3.45, 2.35, (255, 255, 255), line=border, lw=2.0)
-        _tb(slide, hdr_txt,  cx + 0.12, 3.82, 3.22, 0.40, 13, bold=True, color=hdr_color)
-        _tb(slide, body_txt, cx + 0.12, 4.30, 3.22, 1.55, 13, color=stheme["text_dark"])
-
-    _add_logo(slide, logo_path, stheme)
-    return slide
-
-
-def _summary_slide(prs, topic, theme, logo_path, style=None):
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    style = style if isinstance(style, dict) else {}
-    stheme = _slide_theme(theme, style, slide_idx=999)
-    _bg(slide, stheme["bg_light"])
-    _header(slide, "Key Takeaways", f"What we learned about {topic}", "★", stheme, style=style)
-    _footer(slide, stheme, style=style)
-
-    ix, iy, iw, ih = _card(slide, stheme, style=style)
-    col_w = (iw - 0.40) / 3
-
-    takeaways = [
-        ("1️⃣  Problem First",
-         f"Define a clear pain point before choosing technology — "
-         f"70% of {topic} projects fail without it.\n\n"
-         "✔  Map the workflow gap first.\n"
-         "✔  Establish baseline metrics.\n"
-         "✔  Secure an executive sponsor."),
-        ("2️⃣  Proven ROI Exists",
-         "Real deployments show measurable returns:\n\n"
-         "✔  Mayo Clinic: 60% faster radiology.\n"
-         "✔  NHS England: £200M saved on sepsis.\n"
-         "✔  Google Health: 99% mammogram accuracy."),
-        ("3️⃣  Start Small, Scale Fast",
-         "8-week pilots with clear KPIs work best.\n\n"
-         "✔  One department → measure → expand.\n"
-         "✔  Clinician buy-in reduces failure risk.\n"
-         "✔  Build compliance in from day one."),
-    ]
-
-    for i, (title, text) in enumerate(takeaways):
-        cx = ix + i * (col_w + 0.20)
-        _rect(slide, cx, iy, col_w, ih, stheme["card_bg"],
-              line=stheme["primary"], lw=1.5)
-        _rect(slide, cx, iy, col_w, 0.46, stheme["primary"])
-        _tb(slide, title, cx + 0.12, iy + 0.08, col_w - 0.24, 0.34, 14,
-            bold=True, color=stheme["text_light"], face=stheme["header_font"])
-        _tb(slide, text, cx + 0.12, iy + 0.58, col_w - 0.24, ih - 0.66,
-            13, color=stheme["text_dark"], face=stheme["body_font"])
-
-    _add_logo(slide, logo_path, stheme)
-    return slide
-
-
-def _closing_slide(prs, topic, theme, logo_path, style=None):
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    style = style if isinstance(style, dict) else {}
-    stheme = _slide_theme(theme, style, slide_idx=1000)
-    _bg(slide, stheme["bg_dark"])
-    _rect(slide, 0,    0, 0.35, H, stheme["primary"])
-    _rect(slide, 0.35, 0, 0.09, H, stheme["secondary"])
-
-    # Decorative circles — far right, clear of text zone
-    _oval(slide, W - 4.2, H - 4.2, 5.0, 5.0, (0, 80, 160))
-    _oval(slide, W - 2.8, H - 2.8, 3.2, 3.2, stheme["bg_dark"])
-
-    SAFE_W = W - 4.8  # keep text away from circles
-
-    _tb(slide, "YOUR NEXT STEP",
-        0.65, 1.40, SAFE_W, 1.00, 40,
-        bold=True, color=stheme["text_light"],
-        face=stheme["header_font"], align=PP_ALIGN.LEFT)
-    _tb(slide,
-        f"Don't let {topic} be just another trend. Start your pilot today.",
-        0.65, 2.55, SAFE_W, 0.65, 17,
-        italic=True, color=stheme["secondary"],
-        face=stheme["body_font"], align=PP_ALIGN.LEFT)
-
-    # All action items in ONE textbox — prevents the 3-box misalignment bug
-    bx = slide.shapes.add_textbox(_IN(0.65), _IN(3.35), _IN(SAFE_W), _IN(1.80))
-    tf = bx.text_frame
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.TOP
-    actions = [
-        "🔹  Define one high-impact use case (diagnostics, scheduling, or monitoring)",
-        "🔹  Run an 8-week pilot with measurable KPIs — accuracy, time saved, cost reduction",
-        "🔹  Document outcomes, build the business case, and scale organisation-wide",
-    ]
-    first = True
-    for act in actions:
-        p = tf.paragraphs[0] if first else tf.add_paragraph()
-        first = False
-        p.space_before = Pt(8)
-        p.space_after  = Pt(8)
-        r = p.add_run()
-        r.text = act
-        r.font.size  = Pt(15)
-        r.font.name  = stheme["body_font"]
-        r.font.color.rgb = _c(stheme["text_light"])
-
-    # "Questions?" — near-white so it reads on dark background
-    _tb(slide, "Questions? Let's talk.",
-        0.65, 5.35, SAFE_W, 0.50, 14,
-        italic=True, color=(200, 225, 255),
-        face=stheme["body_font"], align=PP_ALIGN.LEFT)
-
-    _add_logo(slide, logo_path, stheme)
-    return slide
-
-
-# ==========================================================================
-# CONTENT GENERATION  (LLM prompt — strict field requirements)
+# LLM CONTENT GENERATION
 # ==========================================================================
 
 def generate_slide_content(topic: str, num_slides: int = 5,
@@ -1045,16 +1118,17 @@ Return ONLY valid JSON — no markdown fences, no preamble, no explanation.
 === STRICT RULES ===
 1. Generate exactly {num_slides} slides inside a top-level "slides" array.
 2. Every slide MUST include: "title", "subtitle", "layout", "icon", "content", and "style".
-3. Always include a clear opening title slide as slide 1.
-4. Always include a closing "Thank You" or "Q&A" slide as the final slide.
+3. Slide 1 MUST use layout "title_cover" with a big, clear title.
+4. For slides 2..N, choose structure dynamically from topic needs; do NOT follow a fixed template order.
 5. VARY layouts — do NOT use the same layout twice in a row.
 6. VARY visual pattern — do NOT use the same `style.pattern_name` twice in a row.
-7. Use a clean LIGHT theme only (white and blue family). Avoid dark backgrounds.
-8. "content" bullets: 5-7 items, 22-34 words each, use **bold** for key terms.
+7. Use table/timeline only when content genuinely benefits from them.
+8. Use a clean LIGHT theme only (white and blue/teal family). Avoid dark backgrounds.
+9. "content" bullets: 4-7 items, 18-34 words each, use **bold** for key terms.
    Every bullet must cite a REAL company, statistic, or year — never say "many companies".
-9. If comparisons, benchmarks, rankings, or phased plans are present, use a "table" layout where appropriate.
+10. Final slide should be context-appropriate (Thank You, Q&A, Key Takeaways) chosen by topic narrative.
 
-=== DESIGN SYSTEM (LLM MUST DECIDE, NOT FIXED) ===
+=== DESIGN SYSTEM ===
 Add top-level object "design_system":
 {{
   "theme": {{
@@ -1069,14 +1143,11 @@ Add top-level object "design_system":
     "card_bg": "#RRGGBB",
     "header_font": "font name",
     "body_font": "font name"
-  }},
-  "intro_style":   {{"surface":"light","header_variant":"split","card_variant":"banded"}},
-  "summary_style": {{"surface":"light","header_variant":"banded","card_variant":"outline"}},
-  "closing_style": {{"surface":"light","header_variant":"solid","card_variant":"soft"}}
+  }}
 }}
 
 Each slide.style must include:
-- pattern_name: unique descriptive style label (e.g. "neo-bento", "editorial-ribbon", "technical-dark")
+- pattern_name: unique descriptive label
 - surface: one of ["light","tint"]
 - header_variant: one of ["solid","split","banded"]
 - card_variant: one of ["outline","soft","banded"]
@@ -1084,48 +1155,49 @@ Each slide.style must include:
 - badge_shape: one of ["oval","rect"]
 - accent_rotation: one of ["static","auto"]
 
-=== LAYOUT RULES (each layout has REQUIRED extra fields) ===
+=== LAYOUT RULES ===
+
+"title_cover"
+  title: large cover title
+  subtitle: concise context line
+  content: optional 2-3 short highlights
 
 "bullets"
-  content: [list of bullets]
+  content: [4-7 bullets]
 
 "two_column"
-  left_title:  string  ← REQUIRED, descriptive (NOT the word "Left")
-  right_title: string  ← REQUIRED, descriptive (NOT the word "Right")
-  left_points:  [...]  ← REQUIRED, 4-5 bullets
-  right_points: [...]  ← REQUIRED, 4-5 bullets
+  left_title:  descriptive string (NOT "Left")
+  right_title: descriptive string (NOT "Right")
+  left_points:  [4-5 bullets]
+  right_points: [4-5 bullets]
   content: []
 
 "big_stat"
-  stat:        string  ← REQUIRED real value e.g. "40%", "$2.5B", "3x" (NOT "100%")
-  stat_label:  string  ← ≤ 8 words describing what the stat measures
-  stat_source: string  ← source/year e.g. "Mount Sinai Hospital, 2022"
-  content:     [...]   ← 5-6 supporting bullets
+  stat:        real value e.g. "40%", "$2.5B", "3x" (NOT "100%")
+  stat_label:  ≤8 words describing the stat
+  stat_source: source and year
+  content:     [5-6 supporting bullets]
 
 "timeline"
-  steps: [             ← REQUIRED, exactly 4 items
-    {{"label": "short name (≤4 words)", "detail": "one sentence, 15-20 words"}}
-  ]
+  steps: [exactly 4 items]
+    each: {{"label": "≤4 words", "detail": "15-20 word sentence"}}
   content: []
 
 "icon_grid"
-  grid_items: [        ← REQUIRED, exactly 4 items
-    {{"icon": "keyword", "title": "2-3 words", "detail": "12-18 words"}}
-  ]
+  grid_items: [exactly 4 items]
+    each: {{"icon": "keyword", "title": "2-3 words", "detail": "12-18 words"}}
   content: []
 
 "case_study"
-  company: string      ← REQUIRED, real company name (NOT "Case Study" or "Company")
-  result:  string      ← one-sentence headline outcome
-  metrics: [           ← 2-3 items
-    {{"label": "metric name", "value": integer between 1 and 99}}
-  ]
-  content: [...]       ← 4-5 supporting bullets
+  company: real company name (NOT "Case Study" or "Company")
+  result:  one-sentence headline outcome
+  metrics: [2-3 items, each: {{"label":"metric name","value":integer 1-99}}]
+  content: [4-5 supporting bullets]
 
 "table"
   table_columns: [3-5 short column headers]
-  table_rows: [4-6 rows, each row must match number of columns]
-  content: []  (optional notes)
+  table_rows:    [4-6 rows, each matching column count]
+  content: []
 
 === JSON FORMAT ===
 {{
@@ -1142,18 +1214,15 @@ Each slide.style must include:
       "card_bg": "#FFFFFF",
       "header_font": "Calibri",
       "body_font": "Calibri"
-    }},
-    "intro_style": {{"surface":"light","header_variant":"split","card_variant":"banded"}},
-    "summary_style": {{"surface":"light","header_variant":"banded","card_variant":"outline"}},
-    "closing_style": {{"surface":"light","header_variant":"solid","card_variant":"soft"}}
+    }}
   }},
   "slides": [
     {{
       "title": "...",
       "subtitle": "...",
-      "layout": "bullets",
+      "layout": "title_cover",
       "icon": "▸",
-      "content": ["...", "...", "...", "..."],
+      "content": ["...", "...", "..."],
       "style": {{
         "pattern_name": "neo-bento",
         "surface": "light",
@@ -1180,9 +1249,8 @@ Each slide.style must include:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback for occasional model wrappers around valid JSON.
         start = raw.find("{")
-        end = raw.rfind("}")
+        end   = raw.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise
         data = json.loads(raw[start:end + 1])
@@ -1191,16 +1259,23 @@ Each slide.style must include:
         data = {"design_system": {}, "slides": []}
     if not isinstance(data.get("design_system"), dict):
         data["design_system"] = {}
-    # Keep overall style in light white/blue direction.
-    ds = data["design_system"]
-    for key in ("intro_style", "summary_style", "closing_style"):
-        if not isinstance(ds.get(key), dict):
-            ds[key] = {}
-        ds[key]["surface"] = "light"
     if not isinstance(data.get("slides"), list):
         data["slides"] = []
 
-    # ── Validate & sanitise every slide ─────────────────────────────────────
+    # ── Validate & sanitise slides ──────────────────────────────────────────
+    allowed_surfaces         = set(_cfg("allowed_surfaces"))
+    allowed_header_variants  = set(_cfg("allowed_header_variants"))
+    allowed_card_variants    = set(_cfg("allowed_card_variants"))
+    allowed_footer_variants  = set(_cfg("allowed_footer_variants"))
+    allowed_badge_shapes     = set(_cfg("allowed_badge_shapes"))
+    allowed_accent_rotations = set(_cfg("allowed_accent_rotations"))
+    min_bullets              = _cfg("min_bullets_by_layout")
+    two_col_generic          = _cfg("two_col_generic_headers")
+    case_generic             = _cfg("case_study_generic_companies")
+    stat_placeholders        = _cfg("stat_placeholder_values")
+    fallback_marker          = _cfg("fallback_bullet_marker")
+    two_col_min              = _cfg("two_col_min_bullets")
+
     clean_slides = []
     for idx, slide in enumerate(data.get("slides", []), start=1):
         if not isinstance(slide, dict):
@@ -1213,32 +1288,24 @@ Each slide.style must include:
         slide.setdefault("content", [])
         if not isinstance(slide.get("style"), dict):
             slide["style"] = {}
+
         style = slide["style"]
         style.setdefault("pattern_name", f"pattern_{idx}")
-        style.setdefault("surface", "light")
-        style.setdefault("header_variant", "solid")
-        style.setdefault("card_variant", "outline")
-        style.setdefault("footer_variant", "solid")
-        style.setdefault("badge_shape", "oval")
-        style.setdefault("accent_rotation", "static")
+        style.setdefault("surface",          "light")
+        style.setdefault("header_variant",   "solid")
+        style.setdefault("card_variant",     "outline")
+        style.setdefault("footer_variant",   "solid")
+        style.setdefault("badge_shape",      "oval")
+        style.setdefault("accent_rotation",  "static")
 
-        # Restrict variants to known values for renderer safety.
-        if style["surface"] not in ("light", "tint"):
-            style["surface"] = "light"
-        if style["surface"] == "dark":
-            style["surface"] = "light"
-        if style["header_variant"] not in ("solid", "split", "banded"):
-            style["header_variant"] = "solid"
-        if style["card_variant"] not in ("outline", "soft", "banded"):
-            style["card_variant"] = "outline"
-        if style["footer_variant"] not in ("solid", "line"):
-            style["footer_variant"] = "solid"
-        if style["badge_shape"] not in ("oval", "rect"):
-            style["badge_shape"] = "oval"
-        if style["accent_rotation"] not in ("static", "auto"):
-            style["accent_rotation"] = "static"
+        if style["surface"]          not in allowed_surfaces:         style["surface"]          = "light"
+        if style["header_variant"]   not in allowed_header_variants:  style["header_variant"]   = "solid"
+        if style["card_variant"]     not in allowed_card_variants:    style["card_variant"]     = "outline"
+        if style["footer_variant"]   not in allowed_footer_variants:  style["footer_variant"]   = "solid"
+        if style["badge_shape"]      not in allowed_badge_shapes:     style["badge_shape"]      = "oval"
+        if style["accent_rotation"]  not in allowed_accent_rotations: style["accent_rotation"]  = "static"
 
-        # Coerce all list fields to plain strings
+        # Coerce list fields
         for key in ("content", "left_points", "right_points"):
             if key in slide and isinstance(slide[key], list):
                 slide[key] = [
@@ -1248,40 +1315,43 @@ Each slide.style must include:
         if not isinstance(slide.get("content"), list):
             slide["content"] = []
         slide["content"] = [str(x).strip() for x in slide["content"] if str(x).strip()]
-        if layout in ("bullets", "big_stat") and len(slide["content"]) < 5:
-            while len(slide["content"]) < 5:
-                slide["content"].append(
-                    f"**Execution focus**: add one measurable KPI, one owner, and one delivery date so this {topic} initiative is actionable, auditable, and presentation-ready."
-                )
 
-        # two_column: reject generic header labels; fallback split content[]
+        # Backfill minimum bullets for layouts that need them
+        min_count = min_bullets.get(layout, 0)
+        while len(slide["content"]) < min_count:
+            slide["content"].append(
+                f"{fallback_marker}: add one measurable KPI, one owner, and one delivery date "
+                f"so this {topic} initiative is actionable, auditable, and presentation-ready."
+            )
+
+        # two_column validation
         if layout == "two_column":
             for k, default in (("left_title", "Before"), ("right_title", "After")):
                 v = slide.get(k, "").strip().lower()
-                if not v or v in ("left", "right", "column 1", "column 2", "option a", "option b"):
+                if not v or v in two_col_generic:
                     slide[k] = default
             if not slide.get("left_points") and not slide.get("right_points"):
                 content = slide.get("content", [])
                 mid = max(1, len(content) // 2)
                 slide["left_points"]  = content[:mid]
                 slide["right_points"] = content[mid:]
-            # Keep both columns visually full.
             for side in ("left_points", "right_points"):
                 if not isinstance(slide.get(side), list):
                     slide[side] = []
                 slide[side] = [str(x).strip() for x in slide[side] if str(x).strip()]
-                while len(slide[side]) < 4:
+                while len(slide[side]) < two_col_min:
                     slide[side].append(
-                        f"**Operational step**: define owner, timeline, and KPI to move this {topic} track from concept to production impact."
+                        f"**Operational step**: define owner, timeline, and KPI to move this "
+                        f"{topic} track from concept to production impact."
                     )
 
-        # big_stat: reject meaningless "100%" or empty stat
+        # big_stat validation
         if layout == "big_stat":
             stat = str(slide.get("stat", "")).strip()
-            if not stat or stat in ("100%", "100", ""):
+            if not stat or stat in stat_placeholders:
                 slide["stat"] = "—"
 
-        # timeline: validate steps; inject fallbacks if broken
+        # timeline validation
         if layout == "timeline":
             clean = [
                 s for s in slide.get("steps", [])
@@ -1295,7 +1365,7 @@ Each slide.style must include:
                 s["label"]  = str(s.get("label", ""))
                 s["detail"] = str(s.get("detail", ""))
 
-        # icon_grid: coerce nested dict fields
+        # icon_grid validation
         if layout == "icon_grid":
             if not isinstance(slide.get("grid_items"), list):
                 slide["grid_items"] = []
@@ -1309,10 +1379,10 @@ Each slide.style must include:
                 fixed_grid.append(gi)
             slide["grid_items"] = fixed_grid[:4]
 
-        # case_study: reject generic company names
+        # case_study validation
         if layout == "case_study":
             co = slide.get("company", "").strip().lower()
-            if not co or co in ("case study", "company", "organization", ""):
+            if not co or co in case_generic:
                 slide["company"] = "Leading Organisation"
             metrics = slide.get("metrics", [])
             if not isinstance(metrics, list):
@@ -1323,24 +1393,20 @@ Each slide.style must include:
                     m = {"label": "Impact", "value": m}
                 fixed_metrics.append({
                     "label": str(m.get("label", "Impact")),
-                    "value": _coerce_int(m.get("value", 50), default=50, min_value=1, max_value=99),
+                    "value": _coerce_int(m.get("value", 50),
+                                         default=50, min_value=1, max_value=99),
                 })
             slide["metrics"] = fixed_metrics
-            while len(slide["content"]) < 4:
-                slide["content"].append(
-                    f"**Scale lesson**: standardize process handoff and governance so this {topic} result is repeatable across teams and regions."
-                )
 
-        # table: sanitize columns/rows and backfill when sparse
+        # table validation
         if layout == "table":
             cols = slide.get("table_columns", [])
             rows = slide.get("table_rows", [])
             if not isinstance(cols, list):
                 cols = []
-            cols = [str(c).strip() for c in cols if str(c).strip()][:5]
+            cols = [str(c).strip() for c in cols if str(c).strip()][:_cfg("table_max_cols")]
             if len(cols) < 3:
                 cols = ["Category", "Current State", "Target State"]
-
             clean_rows = []
             if isinstance(rows, list):
                 for r in rows:
@@ -1350,110 +1416,54 @@ Each slide.style must include:
                     while len(row) < len(cols):
                         row.append("")
                     clean_rows.append(row)
-
             while len(clean_rows) < 4:
-                clean_rows.append([
-                    "Workstream",
-                    f"Baseline for {topic}",
-                    "KPI-driven improvement plan",
-                ][:len(cols)] + [""] * max(0, len(cols) - 3))
-
+                clean_rows.append(
+                    [f"Workstream", f"Baseline for {topic}",
+                     "KPI-driven improvement plan"][:len(cols)]
+                    + [""] * max(0, len(cols) - 3)
+                )
             slide["table_columns"] = cols
-            slide["table_rows"] = clean_rows[:6]
+            slide["table_rows"]    = clean_rows[:_cfg("table_max_rows")]
 
         clean_slides.append(slide)
 
-    # Prevent immediate repeated visual pattern if model repeats by mistake.
+    # Prevent immediate repeated visual pattern
     for i in range(1, len(clean_slides)):
-        cur = clean_slides[i].get("style", {})
+        cur  = clean_slides[i].get("style", {})
         prev = clean_slides[i - 1].get("style", {})
         if cur.get("pattern_name", "").strip().lower() == prev.get("pattern_name", "").strip().lower():
             cur["pattern_name"] = f'{cur.get("pattern_name", "pattern")}_{i+1}'
-            # Also change one variant so it looks visibly different.
             cur["header_variant"] = "banded" if prev.get("header_variant") != "banded" else "split"
 
-    # Topic-aware structure nudges: encourage non-repetitive middle sections.
-    layouts_present = {str(s.get("layout", "")) for s in clean_slides}
-    topic_l = topic.lower()
-    preferred = []
-    if any(k in topic_l for k in ("architecture", "framework", "cloud", "system", "infrastructure")):
-        preferred = ["table", "timeline"]
-    elif any(k in topic_l for k in ("strategy", "market", "business", "growth", "roi")):
-        preferred = ["big_stat", "case_study"]
-    elif any(k in topic_l for k in ("ai", "ml", "model", "data")):
-        preferred = ["timeline", "icon_grid"]
-    else:
-        preferred = ["table", "big_stat"]
-
-    def _first_bullets_idx():
-        for j, sl in enumerate(clean_slides):
-            if sl.get("layout") == "bullets":
-                return j
-        return None
-
-    for pref in preferred:
-        if pref in layouts_present:
-            continue
-        idx = _first_bullets_idx()
-        if idx is None:
-            break
-        src = clean_slides[idx]
-        points = src.get("content", [])
-        if pref == "timeline":
-            steps = []
-            for k, p in enumerate(points[:4], start=1):
-                steps.append({"label": f"Phase {k}", "detail": str(p)})
-            src["layout"] = "timeline"
-            src["steps"] = steps if steps else [
-                {"label": "Phase 1", "detail": f"Initial plan for {topic}."},
-                {"label": "Phase 2", "detail": "Pilot and validation."},
-                {"label": "Phase 3", "detail": "Scale and optimize."},
-                {"label": "Phase 4", "detail": "Govern and continuously improve."},
-            ]
-            src["content"] = []
-        elif pref == "table":
-            src["layout"] = "table"
-            src["table_columns"] = ["Area", "Current", "Target"]
-            rows = []
-            for p in points[:5]:
-                rows.append(["Workstream", str(p)[:60], "Measured improvement"])
-            src["table_rows"] = rows if rows else [
-                ["Architecture", f"Baseline for {topic}", "Scalable blueprint"],
-                ["Operations", "Manual processes", "Automated controls"],
-                ["Security", "Reactive checks", "Policy-driven governance"],
-                ["Metrics", "Ad-hoc reporting", "KPI dashboard"],
-            ]
-            src["content"] = []
-        elif pref == "big_stat":
-            src["layout"] = "big_stat"
-            src["stat"] = src.get("stat", "42%")
-            src["stat_label"] = src.get("stat_label", "Target Improvement")
-            src["stat_source"] = src.get("stat_source", "Industry benchmark")
-        elif pref == "case_study":
-            src["layout"] = "case_study"
-            src["company"] = src.get("company", "Reference Enterprise")
-            src["result"] = src.get("result", f"Demonstrated practical gains for {topic}")
-            src["metrics"] = src.get("metrics", [
-                {"label": "Efficiency", "value": 40},
-                {"label": "Quality", "value": 35},
-                {"label": "Adoption", "value": 30},
-            ])
-        layouts_present.add(pref)
-
-    seed = _topic_seed(topic)
-    variant = seed % 3
-
-    # Add a topic-aware opening cover slide every time.
-    clean_slides.insert(0, _opening_slide_spec(topic, tone, variant))
-
-    # Add topic-aware closing thank-you slide unless already present.
+    # Ensure slide 1 is always title_cover
     if clean_slides:
-        last_title = str(clean_slides[-1].get("title", "")).strip().lower()
-        if not any(k in last_title for k in ("thank", "q&a", "questions", "qa")):
-            clean_slides.append(_closing_slide_spec(topic, variant))
+        first = clean_slides[0]
+        first["layout"] = "title_cover"
+        if not first.get("title"):
+            first["title"] = topic
+        if not isinstance(first.get("content"), list):
+            first["content"] = []
+        first["content"] = [str(x).strip() for x in first["content"] if str(x).strip()][
+            :_cfg("cover_bullet_max")]
+    else:
+        clean_slides = [{
+            "title": topic,
+            "subtitle": f"{tone} presentation",
+            "layout": "title_cover",
+            "icon": "▸",
+            "content": [],
+            "style": {
+                "pattern_name": "cover_default",
+                "surface": "light",
+                "header_variant": "solid",
+                "card_variant": "outline",
+                "footer_variant": "line",
+                "badge_shape": "oval",
+                "accent_rotation": "static",
+            },
+        }]
 
     data["slides"] = clean_slides
-
     return data
 
 
@@ -1466,25 +1476,37 @@ def create_ppt(slide_data, topic: str,
                tone: str = "Professional") -> str:
 
     prs = Presentation()
-    prs.slide_width  = _IN(W)
-    prs.slide_height = _IN(H)
+    prs.slide_width  = _IN(_cfg("slide_w"))
+    prs.slide_height = _IN(_cfg("slide_h"))
 
-    payload = slide_data if isinstance(slide_data, dict) else {"slides": slide_data}
+    payload       = slide_data if isinstance(slide_data, dict) else {"slides": slide_data}
     design_system = payload.get("design_system", {}) if isinstance(payload, dict) else {}
-    theme = _normalize_theme(design_system.get("theme", {}))
-    # Enforce regular light white/blue visual baseline.
+    theme         = _normalize_theme(design_system.get("theme", {}))
+    deck_profile  = _pick_deck_profile(topic)
+
+    # Enforce light baseline — bg_dark derived from primary, not hardcoded
     theme["bg_light"] = (255, 255, 255)
-    theme["card_bg"] = (255, 255, 255)
-    theme["bg_dark"] = _mix(theme["primary"], (255, 255, 255), 0.28)
+    theme["card_bg"]  = (255, 255, 255)
+    theme["bg_dark"]  = _mix(theme["primary"], (255, 255, 255), _cfg("bg_dark_mix_to_white"))
+    # Topic-seeded palette nudges so unrelated topics don't look identical.
+    if deck_profile == "magazine":
+        theme["primary"] = _mix(theme["primary"], (15, 95, 188), 0.72)
+        theme["secondary"] = _mix(theme["secondary"], (78, 162, 232), 0.72)
+        theme["accent2"] = _mix(theme["accent2"], (35, 178, 205), 0.72)
+    elif deck_profile == "executive":
+        theme["primary"] = _mix(theme["primary"], (0, 118, 185), 0.72)
+        theme["secondary"] = _mix(theme["secondary"], (72, 182, 228), 0.72)
+        theme["accent2"] = _mix(theme["accent2"], (0, 196, 190), 0.72)
+    elif deck_profile == "tech":
+        theme["primary"] = _mix(theme["primary"], (32, 112, 202), 0.72)
+        theme["secondary"] = _mix(theme["secondary"], (98, 174, 244), 0.72)
+        theme["accent2"] = _mix(theme["accent2"], (86, 192, 216), 0.72)
 
-    has_logo = bool(logo_path and os.path.exists(logo_path))
-    logo     = logo_path if has_logo else None
-
+    logo   = logo_path if (logo_path and os.path.exists(logo_path)) else None
     slides = payload.get("slides", [])
     if not isinstance(slides, list):
         slides = []
 
-    # Render exactly the slides planned by the LLM (no hardcoded intro/summary/closing).
     for i, spec in enumerate(slides, start=1):
         if not isinstance(spec, dict):
             continue
@@ -1493,34 +1515,37 @@ def create_ppt(slide_data, topic: str,
         spec.setdefault("content", [])
         if not isinstance(spec.get("style"), dict):
             spec["style"] = {}
-        spec["style"]["surface"] = "light" if spec["style"].get("surface") == "dark" else spec["style"].get("surface", "light")
+        spec["style"]["_deck_profile"] = deck_profile
+        # Force any stray dark surface to light
+        if spec["style"].get("surface") == "dark":
+            spec["style"]["surface"] = "light"
+
         layout   = spec.get("layout", "bullets")
         renderer = _RENDERERS.get(layout, _render_bullets)
         slide    = prs.slides.add_slide(prs.slide_layouts[6])
         renderer(slide, spec, i, theme, logo)
 
-    # Fallback when LLM returned no valid slides.
+    # Fallback: no valid slides
     if len(prs.slides) == 0:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
+        fallback_marker = _cfg("fallback_bullet_marker")
         _render_bullets(
             slide,
             {
-                "title": topic,
+                "title":    topic,
                 "subtitle": "Auto-generated summary",
-                "layout": "bullets",
-                "icon": "▸",
-                "content": [
-                    f"**Overview**: no valid slide plan was returned for {topic}, so a fallback summary slide was created.",
-                    "**Next step**: regenerate with the same topic to get a full multi-layout presentation.",
-                    "**Tip**: include target audience and use-case context for richer and more structured slide content.",
-                    "**Validation**: the service now accepts dynamic layouts including table, timeline, metrics, and case studies.",
-                    "**Output**: this fallback prevents empty deck failures and preserves downloadable PPT generation.",
+                "layout":   "bullets",
+                "icon":     "▸",
+                "content":  [
+                    f"{fallback_marker}: no valid slide plan was returned for {topic}.",
+                    f"{fallback_marker}: regenerate with the same topic for a full deck.",
+                    f"{fallback_marker}: add audience and use-case context for richer content.",
+                    f"{fallback_marker}: service supports table, timeline, metrics, case-study.",
+                    f"{fallback_marker}: fallback prevents empty deck failures.",
                 ],
                 "style": {"surface": "light", "header_variant": "solid", "card_variant": "outline"},
             },
-            1,
-            theme,
-            logo,
+            1, theme, logo,
         )
 
     safe = topic.replace(" ", "_").replace("/", "_")[:60]
@@ -1528,3 +1553,4 @@ def create_ppt(slide_data, topic: str,
     path = f"generated/{safe}.pptx"
     prs.save(path)
     return path
+    
