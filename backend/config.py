@@ -15,7 +15,7 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_LLM_DEPLOYMENT_41_MINI")
 # =========================
 # 🔹 Hugging Face (optional - for image)
 # =========================
-HF_API_KEY = os.getenv("HF_API_KEY")
+# HF_API_KEY = os.getenv("HF_API_KEY")
 
 # =========================
 # 🔹 Debug check (optional)

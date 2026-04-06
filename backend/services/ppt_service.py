@@ -2,17 +2,20 @@
 ppt_service.py  –  Fully Dynamic AI PPT Generator
 ===================================================
 
-All visual constants (dimensions, colors, fonts, layout geometry, slide structure,
-icon sets, bullet counts, stat thresholds, fallback text, etc.) are driven entirely
-by LLM output or derived from a single source-of-truth config block.
-
-There are NO magic numbers or hardcoded strings scattered across renderers.
-Every renderer reads from `spec`, `stheme`, and `cfg` — nothing else.
+IMPROVEMENTS over previous version:
+1. _pick_deck_profile() is now truly RANDOM (was deterministic hash — same topic always same profile)
+2. Each profile has a DISTINCT color family (was all blue nudges — magazine/executive/tech all looked same)
+3. bg_dark uses real dark values per profile (was 28% white mix — headers appeared light)
+4. Font pairs are profile-specific (was always Calibri)
+5. Added 2 new profiles: "bold" and "minimal" — 6 total for more variety
+6. Added dark cover mode that uses full dark background for cover slide variety
+7. Accent color is derived per-profile, not from a single formula
 """
 
 import os
 import json
 import re
+import random
 from openai import AzureOpenAI
 from PIL import Image
 from pptx import Presentation
@@ -32,77 +35,65 @@ _client = AzureOpenAI(
 
 # ==========================================================================
 # DECK CONFIG  — single source of truth for every numeric / structural constant
-# All renderers read from this dict. Nothing is written in-line.
 # ==========================================================================
 
 DECK_CFG = dict(
-    # ── Canvas ──────────────────────────────────────────────────────────────
     slide_w          = 13.3,
     slide_h          = 7.5,
 
-    # ── Header / footer ──────────────────────────────────────────────────────
     header_h         = 1.40,
     footer_h         = 0.25,
-    header_content_gap = 0.12,   # gap between bottom of header and content card
+    header_content_gap = 0.12,
 
-    # ── Logo badge ───────────────────────────────────────────────────────────
     badge_w          = 1.65,
     badge_h          = 0.90,
     badge_margin_r   = 0.18,
     badge_margin_t   = 0.18,
-    badge_inner_pad  = 0.15,     # padding inside logo badge
+    badge_inner_pad  = 0.15,
 
-    # ── Slide-number badge ───────────────────────────────────────────────────
     num_badge_w      = 0.60,
     num_badge_h      = 0.60,
-    num_badge_gap    = 0.78,     # distance left of logo badge
+    num_badge_gap    = 0.78,
     num_badge_top    = 0.22,
     num_font_1digit  = 15,
     num_font_2digit  = 13,
 
-    # ── Content card ─────────────────────────────────────────────────────────
     card_margin_l    = 0.40,
     card_margin_r    = 0.25,
     card_inner_pad   = 0.20,
     card_inner_pad_v = 0.18,
     card_inner_pad_b = 0.30,
 
-    # ── Title font sizing ────────────────────────────────────────────────────
     title_base_pt    = 30,
     title_size_steps = [(42, 0), (65, -4), (90, -7), (999, -10)],
     cover_title_base = 46,
 
-    # ── Subtitle font sizing ─────────────────────────────────────────────────
     subtitle_base_pt  = 13,
     subtitle_size_steps = [(60, 0), (95, -1), (999, -2)],
     cover_subtitle_base = 18,
 
-    # ── Bullet layout ────────────────────────────────────────────────────────
-    bullet_size_base     = 16,    # default bullet font size
-    bullet_max_default   = 6,     # default max bullets per slide
-    bullet_sparse_2_size = 24,    # font bump when only 2 bullets
+    bullet_size_base     = 16,
+    bullet_max_default   = 6,
+    bullet_sparse_2_size = 24,
     bullet_sparse_3_size = 22,
     bullet_sparse_4_size = 19,
-    bullet_space_sparse  = 11,    # paragraph spacing for ≤3 bullets (pt)
+    bullet_space_sparse  = 11,
     bullet_space_normal  = 6,
 
-    # ── Two-column ───────────────────────────────────────────────────────────
     two_col_gap          = 0.20,
     two_col_header_h     = 0.46,
     two_col_bullet_size  = 14,
     two_col_min_bullets  = 4,
 
-    # ── Big-stat ─────────────────────────────────────────────────────────────
     stat_panel_w         = 3.70,
-    stat_font_short      = 72,    # ≤4 chars
-    stat_font_long       = 54,    # >4 chars
+    stat_font_short      = 72,
+    stat_font_long       = 54,
     stat_label_size      = 15,
     stat_source_size     = 11,
     stat_bar_h           = 0.20,
     stat_bar_margin_x    = 0.30,
     stat_bullet_size     = 14,
 
-    # ── Timeline ─────────────────────────────────────────────────────────────
     timeline_dot_outer   = 0.28,
     timeline_dot_inner   = 0.14,
     timeline_rail_h      = 0.06,
@@ -110,7 +101,6 @@ DECK_CFG = dict(
     timeline_detail_size = 11,
     timeline_conn_w      = 0.05,
 
-    # ── Icon grid ────────────────────────────────────────────────────────────
     icon_grid_cols       = 2,
     icon_grid_gap        = 0.16,
     icon_grid_radius     = 0.38,
@@ -118,7 +108,6 @@ DECK_CFG = dict(
     icon_grid_detail_size= 13,
     icon_grid_bar_w      = 0.09,
 
-    # ── Case study ───────────────────────────────────────────────────────────
     case_banner_h        = 0.52,
     case_banner_size     = 17,
     case_ribbon_h        = 0.48,
@@ -129,7 +118,6 @@ DECK_CFG = dict(
     case_metric_pct_size = 11,
     case_bullet_size     = 13,
 
-    # ── Table ────────────────────────────────────────────────────────────────
     table_header_h       = 0.55,
     table_header_size    = 12,
     table_cell_size      = 11,
@@ -137,10 +125,18 @@ DECK_CFG = dict(
     table_max_rows       = 6,
     table_col_gap        = 0.02,
     table_cell_pad       = 0.06,
+    chart_max_items      = 5,
+    chart_label_size     = 12,
+    chart_value_size     = 11,
+    chart_source_size    = 10,
+    chart_bar_h          = 0.24,
+    chart_bar_gap        = 0.18,
+    split_image_ratio    = 0.44,
+    split_caption_size   = 12,
+    split_bullet_size    = 14,
 
-    # ── Cover slide ──────────────────────────────────────────────────────────
     cover_bar_top_h      = 1.25,
-    cover_bar_top_gap    = 0.08,   # accent bar thickness below top band
+    cover_bar_top_gap    = 0.08,
     cover_footer_h       = 0.18,
     cover_title_x        = 0.70,
     cover_title_y        = 2.05,
@@ -153,31 +149,21 @@ DECK_CFG = dict(
     cover_bullet_max     = 3,
     cover_bullet_size    = 14,
 
-    # ── Header text layout ────────────────────────────────────────────────────
     header_title_x       = 0.45,
     header_title_y       = 0.18,
     header_title_h       = 0.76,
     header_sub_y         = 0.96,
     header_sub_h         = 0.38,
 
-    # ── Accent rotation palette order ─────────────────────────────────────────
     accent_rotation_keys = ["primary", "secondary", "accent2", "accent"],
 
-    # ── Mix ratios for derived colors ─────────────────────────────────────────
-    bg_dark_mix_to_white = 0.28,   # create bg_dark from primary + white blend
-    tint_bg_mix          = 0.10,   # tint surface bg blend ratio
+    tint_bg_mix          = 0.10,
     tint_card_mix        = 0.05,
-    dark_card_mix        = 0.10,   # dark surface card bg blend ratio
-    dark_muted_mix       = 0.45,
-    sub_color_mix        = 0.35,   # header subtitle color mix
+    sub_color_mix        = 0.35,
+    stripe_mix           = 0.65,
 
-    # ── Logo badge border mix ─────────────────────────────────────────────────
-    stripe_mix           = 0.65,   # table stripe mix ratio
-
-    # ── Fallback bullet filler marker ─────────────────────────────────────────
     fallback_bullet_marker = "**Execution focus**",
 
-    # ── Allowed variant values ────────────────────────────────────────────────
     allowed_surfaces        = ("light", "tint"),
     allowed_header_variants = ("solid", "split", "banded"),
     allowed_card_variants   = ("outline", "soft", "banded"),
@@ -185,25 +171,112 @@ DECK_CFG = dict(
     allowed_badge_shapes    = ("oval", "rect"),
     allowed_accent_rotations= ("static", "auto"),
 
-    # ── Layouts that need a minimum bullet count ──────────────────────────────
-    min_bullets_by_layout = {"bullets": 5, "big_stat": 5, "case_study": 4},
+    min_bullets_by_layout = {"bullets": 5, "big_stat": 5, "case_study": 4, "image_text_split": 4},
 
-    # ── Two-column rejected generic header words ──────────────────────────────
     two_col_generic_headers = {"left", "right", "column 1", "column 2",
                                "option a", "option b"},
-
-    # ── Case-study rejected generic company names ─────────────────────────────
     case_study_generic_companies = {"case study", "company", "organization", ""},
-
-    # ── Stat values to reject as placeholder ─────────────────────────────────
     stat_placeholder_values = {"100%", "100", ""},
 )
 
+# ==========================================================================
+# PROFILE SYSTEM — 6 visually distinct profiles, randomly selected
+# ==========================================================================
+
 DECK_PROFILE_CFG = {
-    "classic":  {"cover_mode": "bands",    "header_mode": "full",    "card_shift_x": 0.00, "card_shift_y": 0.00, "card_shrink_w": 0.00, "footer_mode": "std"},
-    "magazine": {"cover_mode": "sidebar",  "header_mode": "sidebar", "card_shift_x": 0.18, "card_shift_y": 0.05, "card_shrink_w": 0.10, "footer_mode": "line"},
-    "executive":{"cover_mode": "centered", "header_mode": "band",    "card_shift_x": 0.00, "card_shift_y": 0.02, "card_shrink_w": 0.00, "footer_mode": "std"},
-    "tech":     {"cover_mode": "grid",     "header_mode": "split",   "card_shift_x": 0.08, "card_shift_y": 0.04, "card_shrink_w": 0.06, "footer_mode": "line"},
+    "classic":   {
+        "cover_mode": "bands",    "header_mode": "full",    "footer_mode": "std",
+        "card_shift_x": 0.00, "card_shift_y": 0.00, "card_shrink_w": 0.00,
+    },
+    "magazine":  {
+        "cover_mode": "sidebar",  "header_mode": "sidebar", "footer_mode": "line",
+        "card_shift_x": 0.18, "card_shift_y": 0.05, "card_shrink_w": 0.10,
+    },
+    "executive": {
+        "cover_mode": "centered", "header_mode": "band",    "footer_mode": "std",
+        "card_shift_x": 0.00, "card_shift_y": 0.02, "card_shrink_w": 0.00,
+    },
+    "tech":      {
+        "cover_mode": "grid",     "header_mode": "split",   "footer_mode": "line",
+        "card_shift_x": 0.08, "card_shift_y": 0.04, "card_shrink_w": 0.06,
+    },
+    "bold":      {
+        "cover_mode": "dark_full","header_mode": "band",    "footer_mode": "std",
+        "card_shift_x": 0.00, "card_shift_y": 0.00, "card_shrink_w": 0.00,
+    },
+    "minimal":   {
+        "cover_mode": "centered", "header_mode": "split",   "footer_mode": "line",
+        "card_shift_x": 0.12, "card_shift_y": 0.06, "card_shrink_w": 0.08,
+    },
+}
+
+# ==========================================================================
+# PROFILE PALETTES — each profile has its own distinct color family + fonts
+# classic=blue, magazine=terracotta, executive=forest, tech=berry,
+# bold=navy+coral, minimal=charcoal
+# ==========================================================================
+
+PROFILE_PALETTES = {
+    "classic": {
+        "primary":     (11,  95, 255),
+        "secondary":   (77, 163, 255),
+        "accent":      (0,   58, 160),
+        "accent2":     (0,  163, 163),
+        "bg_dark":     (11,  42,  74),
+        "text_muted":  (100, 130, 160),
+        "header_font": "Calibri",
+        "body_font":   "Calibri",
+    },
+    "magazine": {
+        "primary":     (184,  80,  66),
+        "secondary":   (231, 194,  89),
+        "accent":      (120,  45,  35),
+        "accent2":     (167, 190, 174),
+        "bg_dark":     ( 74,  28,  42),
+        "text_muted":  (140, 100,  90),
+        "header_font": "Georgia",
+        "body_font":   "Calibri",
+    },
+    "executive": {
+        "primary":     ( 44,  95,  45),
+        "secondary":   (151, 188,  98),
+        "accent":      ( 20,  55,  20),
+        "accent2":     ( 90, 175, 150),
+        "bg_dark":     ( 22,  55,  22),
+        "text_muted":  ( 90, 120,  90),
+        "header_font": "Trebuchet MS",
+        "body_font":   "Calibri",
+    },
+    "tech": {
+        "primary":     (109,  46,  70),
+        "secondary":   (162, 103, 105),
+        "accent":      ( 70,  22,  40),
+        "accent2":     (236, 226, 208),
+        "bg_dark":     ( 44,  18,  28),
+        "text_muted":  (130,  90, 100),
+        "header_font": "Consolas",
+        "body_font":   "Calibri",
+    },
+    "bold": {
+        "primary":     ( 20,  20,  90),
+        "secondary":   (240,  80,  60),
+        "accent":      ( 10,  10,  55),
+        "accent2":     (255, 200,   0),
+        "bg_dark":     ( 10,  10,  45),
+        "text_muted":  (110, 110, 150),
+        "header_font": "Arial Black",
+        "body_font":   "Arial",
+    },
+    "minimal": {
+        "primary":     ( 54,  69,  79),
+        "secondary":   (120, 145, 160),
+        "accent":      ( 28,  42,  50),
+        "accent2":     (  0, 164, 180),
+        "bg_dark":     ( 22,  35,  45),
+        "text_muted":  (110, 130, 140),
+        "header_font": "Calibri Light",
+        "body_font":   "Calibri",
+    },
 }
 
 
@@ -218,30 +291,20 @@ def _IN(v):
     return Inches(v)
 
 def _cfg(key):
-    """Shorthand accessor for DECK_CFG."""
     return DECK_CFG[key]
-
 
 def _mix(c1, c2, t):
     t = max(0.0, min(1.0, float(t)))
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
-
-def _topic_seed(text: str) -> int:
-    s = str(text or "")
-    return sum((i + 1) * ord(ch) for i, ch in enumerate(s)) % 10007
-
-
-def _pick_deck_profile(topic: str) -> str:
-    keys = list(DECK_PROFILE_CFG.keys())
-    return keys[_topic_seed(topic) % len(keys)]
-
+def _pick_deck_profile() -> str:
+    """Truly random profile selection — different visual style every generation."""
+    return random.choice(list(DECK_PROFILE_CFG.keys()))
 
 def _profile(style: dict):
     style = style if isinstance(style, dict) else {}
     name = str(style.get("_deck_profile", "classic"))
     return DECK_PROFILE_CFG.get(name, DECK_PROFILE_CFG["classic"])
-
 
 def _coerce_int(value, default=50, min_value=0, max_value=100):
     if isinstance(value, int):
@@ -252,7 +315,6 @@ def _coerce_int(value, default=50, min_value=0, max_value=100):
             return default
         n = int(m.group(0))
     return max(min_value, min(max_value, n))
-
 
 _SAFE_ICON_SET = {"▸", "•", "◆", "◼", "◻", "▲", "▼", "▶", "→", "✓", "✔", "★", "☆", "+", "-"}
 
@@ -266,7 +328,6 @@ def _safe_icon(value, default="▸"):
         return s
     return default
 
-
 def _title_size(text: str, base: int = None) -> int:
     if base is None:
         base = _cfg("title_base_pt")
@@ -276,7 +337,6 @@ def _title_size(text: str, base: int = None) -> int:
             return max(20, base + delta)
     return max(20, base - 10)
 
-
 def _subtitle_size(text: str, base: int = None) -> int:
     if base is None:
         base = _cfg("subtitle_base_pt")
@@ -285,7 +345,6 @@ def _subtitle_size(text: str, base: int = None) -> int:
         if n <= threshold:
             return max(10, base + delta)
     return max(10, base - 2)
-
 
 def _parse_color(value, fallback):
     if isinstance(value, (list, tuple)) and len(value) == 3:
@@ -312,12 +371,12 @@ def _parse_color(value, fallback):
 # ==========================================================================
 
 BASE_THEME = dict(
-    primary    = (0,  102, 204),
-    secondary  = (51, 153, 255),
-    accent     = (0,   82, 164),
-    accent2    = (0,  150, 200),
+    primary    = (11,  95, 255),
+    secondary  = (77, 163, 255),
+    accent     = (0,   58, 160),
+    accent2    = (0,  163, 163),
     bg_light   = (255, 255, 255),
-    bg_dark    = (0,  102, 204),
+    bg_dark    = (11,  42,  74),
     text_dark  = (30,  30,  30),
     text_light = (255, 255, 255),
     text_muted = (120, 140, 160),
@@ -325,7 +384,6 @@ BASE_THEME = dict(
     header_font= "Calibri",
     body_font  = "Calibri",
 )
-
 
 def _normalize_theme(theme_payload):
     theme = BASE_THEME.copy()
@@ -341,7 +399,6 @@ def _normalize_theme(theme_payload):
         if isinstance(v, str) and v.strip():
             theme[key] = v.strip()
     return theme
-
 
 def _slide_theme(base_theme, style=None, slide_idx=1):
     style = style if isinstance(style, dict) else {}
@@ -363,12 +420,10 @@ def _slide_theme(base_theme, style=None, slide_idx=1):
 
     surface = str(style.get("surface", "light")).lower()
     if surface == "dark":
-        # Force to light — callers should not set dark, but handle gracefully
         surface = "light"
     if surface == "tint":
-        theme["bg_light"] = _mix(theme["bg_light"], theme["primary"],   _cfg("tint_bg_mix"))
+        theme["bg_light"] = _mix(theme["bg_light"], theme["primary"], _cfg("tint_bg_mix"))
         theme["card_bg"]  = _mix(theme["card_bg"],  theme["secondary"], _cfg("tint_card_mix"))
-    # "light" is no-op (default)
 
     return theme
 
@@ -388,14 +443,12 @@ def _rect(slide, x, y, w, h, fill, line=None, lw=0.75):
         s.line.fill.background()
     return s
 
-
 def _oval(slide, x, y, w, h, fill):
     s = slide.shapes.add_shape(9, _IN(x), _IN(y), _IN(w), _IN(h))
     s.fill.solid()
     s.fill.fore_color.rgb = _c(fill)
     s.line.fill.background()
     return s
-
 
 def _tb(slide, text, x, y, w, h, size,
         bold=False, italic=False, color=None,
@@ -423,7 +476,6 @@ def _tb(slide, text, x, y, w, h, size,
             r.font.color.rgb = _c(color)
     return bx
 
-
 def _bullets(slide, points, x, y, w, h,
              size=None, icon="▸", icon_color=None, text_color=None,
              face="Calibri", max_pts=None):
@@ -445,7 +497,6 @@ def _bullets(slide, points, x, y, w, h,
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE if count <= 3 else MSO_ANCHOR.TOP
 
-    # Scale font with sparseness using cfg values
     if count <= 2:
         size = min(_cfg("bullet_sparse_2_size"), size + 5)
     elif count == 3:
@@ -537,7 +588,6 @@ def _header(slide, title, subtitle, num, theme, style=None):
     tx     = _cfg("header_title_x")
     ty     = _cfg("header_title_y")
     th     = _cfg("header_title_h")
-    # Title area width: from left margin to left of num-badge, minus small gap
     title_w = nbx - tx - 0.08
 
     prof    = _profile(style)
@@ -603,7 +653,6 @@ def _bg(slide, color):
 
 
 def _card(slide, theme, style=None, x=None, y=None, w=None, h=None):
-    """Draw the content card; return inner (ix, iy, iw, ih)."""
     style   = style if isinstance(style, dict) else {}
     W       = _cfg("slide_w")
     H_h     = _cfg("header_h")
@@ -619,13 +668,12 @@ def _card(slide, theme, style=None, x=None, y=None, w=None, h=None):
     cx = x if x is not None else ml + prof["card_shift_x"]
     cy = y if y is not None else H_h + gap + prof["card_shift_y"]
     cw = w if w is not None else W - cx - mr - prof["card_shrink_w"]
-    ch = h if h is not None else H_h + gap + (W * 0) or \
-         _cfg("slide_h") - H_h - fh - 0.22
 
-    # recalculate ch from globals when not overridden
     if h is None:
         slide_h = _cfg("slide_h")
         ch = slide_h - H_h - fh - 0.22
+    else:
+        ch = h
 
     variant = str(style.get("card_variant", "outline")).lower()
     if prof["header_mode"] == "sidebar":
@@ -691,7 +739,6 @@ def _render_two_column(slide, spec, num, theme, logo_path):
 
     icon = spec.get("icon", "▸")
 
-    # Left column
     _rect(slide, ix, iy, cw, hh, stheme["primary"])
     _tb(slide, left_title, ix + 0.10, iy + 0.08, cw - 0.20, hh - 0.12, bsz,
         bold=True, color=stheme["text_light"], face=stheme["header_font"])
@@ -700,7 +747,6 @@ def _render_two_column(slide, spec, num, theme, logo_path):
              icon_color=stheme["secondary"], text_color=stheme["text_dark"],
              max_pts=_cfg("two_col_min_bullets") + 1)
 
-    # Right column — accent2 to differentiate visually
     rx = ix + cw + gap
     _rect(slide, rx, iy, cw, hh, stheme["accent2"])
     _tb(slide, right_title, rx + 0.10, iy + 0.08, cw - 0.20, hh - 0.12, bsz,
@@ -721,7 +767,7 @@ def _render_big_stat(slide, spec, num, theme, logo_path):
     _footer(slide, stheme, style=style)
     ix, iy, iw, ih = _card(slide, stheme, style=style)
 
-    pw  = _cfg("stat_panel_w")
+    pw     = _cfg("stat_panel_w")
     stat   = str(spec.get("stat", "—"))
     label  = spec.get("stat_label", "")
     source = spec.get("stat_source", "")
@@ -742,11 +788,10 @@ def _render_big_stat(slide, spec, num, theme, logo_path):
             italic=True, color=(180, 210, 255),
             face=stheme["body_font"], align=PP_ALIGN.CENTER)
 
-    # Progress bar if stat is a percentage
     try:
         pct = float(stat.replace("%", "").replace("+", "").strip())
         if 0 < pct < 100:
-            bmar = _cfg("stat_bar_margin_x")
+            bmar  = _cfg("stat_bar_margin_x")
             bar_w = pw - bmar * 2
             bar_y = iy + ih - 0.55
             bh    = _cfg("stat_bar_h")
@@ -813,8 +858,8 @@ def _render_timeline(slide, spec, num, theme, logo_path):
         above  = (i % 2 == 0)
 
         if above:
-            cy = iy + 0.05
-            ch = max(0.40, tl_y - DR - 0.42 - cy)
+            cy  = iy + 0.05
+            ch  = max(0.40, tl_y - DR - 0.42 - cy)
             top = cy + ch
             bot = tl_y - DR
             if bot > top + 0.02:
@@ -871,7 +916,7 @@ def _render_icon_grid(slide, spec, num, theme, logo_path):
         IOX = cx + 0.24
         IOY = cy + (ch_ - IR * 2) / 2
         _oval(slide, IOX, IOY, IR * 2, IR * 2, ac)
-        raw_icon = str(gi.get("icon", gi.get("title", "A"))).strip()
+        raw_icon  = str(gi.get("icon", gi.get("title", "A"))).strip()
         first_char = next((c.upper() for c in raw_icon if c.isascii() and c.isalnum()), "A")
         _tb(slide, first_char, IOX + 0.04, IOY + 0.08, IR * 2 - 0.08, IR * 1.6, 17,
             bold=True, color=(255, 255, 255),
@@ -903,26 +948,24 @@ def _render_case_study(slide, spec, num, theme, logo_path):
     bullets  = spec.get("content", [])
     icon     = spec.get("icon", "▸")
 
-    bh  = _cfg("case_banner_h")
-    bsz = _cfg("case_banner_size")
-    rh  = _cfg("case_ribbon_h")
-    rsz = _cfg("case_ribbon_size")
-    mh  = _cfg("case_metric_row_h")
-    mlw = _cfg("case_metric_label_w")
-    mlsz= _cfg("case_metric_label_size")
-    mpsz= _cfg("case_metric_pct_size")
-    cbsz= _cfg("case_bullet_size")
+    bh   = _cfg("case_banner_h")
+    bsz  = _cfg("case_banner_size")
+    rh   = _cfg("case_ribbon_h")
+    rsz  = _cfg("case_ribbon_size")
+    mh   = _cfg("case_metric_row_h")
+    mlw  = _cfg("case_metric_label_w")
+    mlsz = _cfg("case_metric_label_size")
+    mpsz = _cfg("case_metric_pct_size")
+    cbsz = _cfg("case_bullet_size")
 
-    # Company banner
     _rect(slide, ix, iy, iw, bh, stheme["primary"])
-    _tb(slide, f"📌  {company}",
+    _tb(slide, f"  {company}",
         ix + 0.18, iy + 0.10, iw - 0.36, bh - 0.16, bsz,
         bold=True, color=stheme["text_light"], face=stheme["header_font"])
 
-    # Result ribbon
     if result:
         _rect(slide, ix, iy + bh + 0.06, iw, rh, stheme["accent2"])
-        _tb(slide, f"🏆  {result}",
+        _tb(slide, f"  {result}",
             ix + 0.14, iy + bh + 0.14, iw - 0.28, rh - 0.14, rsz,
             bold=True, color=stheme["text_light"], face=stheme["body_font"])
 
@@ -948,7 +991,7 @@ def _render_case_study(slide, spec, num, theme, logo_path):
     if bullet_h > 0.30 and bullets:
         _bullets(slide, bullets, ix + 0.10, bullet_y, iw - 0.20, bullet_h,
                  size=cbsz, icon=icon,
-                 icon_color=(180, 40, 40),
+                 icon_color=stheme["secondary"],
                  text_color=stheme["text_dark"],
                  max_pts=_cfg("min_bullets_by_layout").get("case_study", 4))
 
@@ -995,8 +1038,8 @@ def _render_table(slide, spec, num, theme, logo_path):
         _add_logo(slide, logo_path, stheme)
         return
 
-    col_w   = (iw - (ncols - 1) * col_gap) / ncols
-    row_h   = min(0.65, max(0.42, (ih - hdr_h - 0.08) / len(row_data)))
+    col_w = (iw - (ncols - 1) * col_gap) / ncols
+    row_h = min(0.65, max(0.42, (ih - hdr_h - 0.08) / len(row_data)))
 
     for cidx, c in enumerate(cols):
         cx = ix + cidx * (col_w + col_gap)
@@ -1021,10 +1064,173 @@ def _render_table(slide, spec, num, theme, logo_path):
     _add_logo(slide, logo_path, stheme)
 
 
-def _render_title_cover(slide, spec, num, theme, logo_path):
+def _render_chart(slide, spec, num, theme, logo_path):
     style  = spec.get("style", {})
     stheme = _slide_theme(theme, style, slide_idx=num)
     _bg(slide, stheme["bg_light"])
+    _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
+    _footer(slide, stheme, style=style)
+    ix, iy, iw, ih = _card(slide, stheme, style=style)
+
+    chart_data = spec.get("chart_data", [])
+    if not isinstance(chart_data, list):
+        chart_data = []
+    chart_data = [x for x in chart_data if isinstance(x, dict) and str(x.get("label", "")).strip()]
+    if not chart_data:
+        _tb(slide, "No chart data available.", ix, iy, iw, ih, 14, color=stheme["text_muted"])
+        _add_logo(slide, logo_path, stheme)
+        return
+
+    items = chart_data[:_cfg("chart_max_items")]
+    values = [max(1, _coerce_int(i.get("value", 0), default=1, min_value=1, max_value=100)) for i in items]
+    vmax = max(values) if values else 100
+
+    title_h = 0.48
+    row_h = _cfg("chart_bar_h")
+    row_gap = _cfg("chart_bar_gap")
+    lsz = _cfg("chart_label_size")
+    vsz = _cfg("chart_value_size")
+    source_size = _cfg("chart_source_size")
+
+    chart_top = iy + title_h + 0.06
+    available_h = ih - title_h - 0.38
+    needed_h = len(items) * row_h + (len(items) - 1) * row_gap
+    if needed_h > available_h and len(items) > 1:
+        scale = available_h / needed_h
+        row_h *= scale
+        row_gap *= scale
+
+    _tb(slide, str(spec.get("chart_title", "Performance Snapshot")),
+        ix + 0.02, iy + 0.02, iw - 0.04, title_h - 0.08, 15,
+        bold=True, color=stheme["primary"], face=stheme["header_font"])
+
+    label_w = max(1.95, iw * 0.28)
+    bar_x = ix + label_w + 0.16
+    bar_w = iw - label_w - 0.66
+    for i, item in enumerate(items):
+        y = chart_top + i * (row_h + row_gap)
+        label = str(item.get("label", "Metric")).strip()[:40]
+        val = max(1, _coerce_int(item.get("value", 0), default=1, min_value=1, max_value=100))
+        pct = val / vmax if vmax else 0.0
+        _tb(slide, label, ix + 0.02, y + 0.01, label_w - 0.08, row_h - 0.02, lsz,
+            color=stheme["text_dark"], face=stheme["body_font"], shrink_to_fit=True)
+        _rect(slide, bar_x, y, bar_w, row_h, _mix(stheme["card_bg"], stheme["secondary"], 0.90))
+        _rect(slide, bar_x, y, bar_w * pct, row_h, stheme["accent2"])
+        _tb(slide, f"{val}", bar_x + bar_w + 0.06, y + 0.01, 0.35, row_h - 0.02, vsz,
+            bold=True, color=stheme["primary"], align=PP_ALIGN.RIGHT)
+
+    source = str(spec.get("chart_source", "")).strip()
+    if source:
+        _tb(slide, source, ix + 0.02, iy + ih - 0.24, iw - 0.04, 0.18, source_size,
+            italic=True, color=stheme["text_muted"], face=stheme["body_font"])
+
+    _add_logo(slide, logo_path, stheme)
+
+
+def _render_image_text_split(slide, spec, num, theme, logo_path):
+    style  = spec.get("style", {})
+    stheme = _slide_theme(theme, style, slide_idx=num)
+    _bg(slide, stheme["bg_light"])
+    _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
+    _footer(slide, stheme, style=style)
+    ix, iy, iw, ih = _card(slide, stheme, style=style)
+
+    image_ratio = _cfg("split_image_ratio")
+    gap = 0.20
+    image_w = iw * image_ratio
+    text_w = iw - image_w - gap
+    image_side = str(spec.get("image_side", "")).strip().lower()
+    if image_side not in {"left", "right"}:
+        image_side = random.choice(["left", "right"])
+
+    if image_side == "left":
+        imx, tx = ix, ix + image_w + gap
+    else:
+        tx, imx = ix, ix + text_w + gap
+
+    # Visual placeholder block that varies with theme and still looks intentional.
+    _rect(slide, imx, iy, image_w, ih, _mix(stheme["secondary"], stheme["card_bg"], 0.75),
+          line=stheme["secondary"], lw=1.0)
+    _rect(slide, imx + 0.10, iy + 0.10, image_w - 0.20, ih * 0.20, stheme["primary"])
+    _rect(slide, imx + 0.10, iy + ih * 0.34, image_w - 0.20, ih * 0.52,
+          _mix(stheme["accent2"], stheme["card_bg"], 0.55))
+    _oval(slide, imx + image_w * 0.10, iy + ih * 0.72, 0.45, 0.45, stheme["accent"])
+    _oval(slide, imx + image_w * 0.78, iy + ih * 0.16, 0.36, 0.36, stheme["accent2"])
+
+    caption = str(spec.get("image_caption", "")).strip()
+    if caption:
+        _tb(slide, caption, imx + 0.14, iy + ih - 0.48, image_w - 0.28, 0.38, _cfg("split_caption_size"),
+            bold=True, color=stheme["text_dark"], face=stheme["body_font"], align=PP_ALIGN.CENTER)
+
+    _bullets(slide, spec.get("content", []), tx, iy + 0.06, text_w, ih - 0.12,
+             size=_cfg("split_bullet_size"),
+             icon=spec.get("icon", "▸"),
+             icon_color=stheme["secondary"],
+             text_color=stheme["text_dark"],
+             max_pts=_cfg("bullet_max_default"))
+
+    _add_logo(slide, logo_path, stheme)
+
+
+def _render_hybrid_insight(slide, spec, num, theme, logo_path):
+    # Hybrid composition: KPI + mini bars + explanatory bullets.
+    style  = spec.get("style", {})
+    stheme = _slide_theme(theme, style, slide_idx=num)
+    _bg(slide, stheme["bg_light"])
+    _header(slide, spec["title"], spec.get("subtitle", ""), num, stheme, style=style)
+    _footer(slide, stheme, style=style)
+    ix, iy, iw, ih = _card(slide, stheme, style=style)
+
+    lw = iw * 0.43
+    gap = 0.20
+    rw = iw - lw - gap
+    rx = ix + lw + gap
+
+    stat = str(spec.get("stat", "")).strip() or "—"
+    label = str(spec.get("stat_label", "")).strip() or "Key indicator"
+    _rect(slide, ix, iy, lw, ih, _mix(stheme["card_bg"], stheme["secondary"], 0.86),
+          line=stheme["secondary"], lw=1.0)
+    _tb(slide, stat, ix + 0.12, iy + 0.30, lw - 0.24, 1.15, 52 if len(stat) <= 4 else 42,
+        bold=True, color=stheme["primary"], face=stheme["header_font"], align=PP_ALIGN.CENTER)
+    _tb(slide, label, ix + 0.12, iy + 1.45, lw - 0.24, 0.42, 13,
+        color=stheme["text_dark"], face=stheme["body_font"], align=PP_ALIGN.CENTER)
+
+    chart = spec.get("chart_data", [])
+    if not isinstance(chart, list):
+        chart = []
+    rows = [r for r in chart if isinstance(r, dict)][:3]
+    if not rows:
+        rows = [{"label": "Current", "value": 52},
+                {"label": "Target", "value": 71},
+                {"label": "Potential", "value": 88}]
+    vmax = max(max(1, _coerce_int(r.get("value", 1), default=1, min_value=1, max_value=100)) for r in rows)
+    by = iy + 2.05
+    row_h = 0.26
+    row_gap = 0.16
+    for i, row in enumerate(rows):
+        y = by + i * (row_h + row_gap)
+        v = max(1, _coerce_int(row.get("value", 1), default=1, min_value=1, max_value=100))
+        _tb(slide, str(row.get("label", "Metric"))[:18], ix + 0.12, y - 0.01, 1.40, row_h, 11,
+            color=stheme["text_dark"], face=stheme["body_font"], shrink_to_fit=True)
+        bar_x = ix + 1.55
+        bar_w = lw - 2.08
+        _rect(slide, bar_x, y, bar_w, row_h, _mix(stheme["card_bg"], stheme["secondary"], 0.93))
+        _rect(slide, bar_x, y, bar_w * (v / vmax), row_h, stheme["accent2"])
+        _tb(slide, f"{v}", bar_x + bar_w + 0.03, y - 0.01, 0.26, row_h, 10,
+            bold=True, color=stheme["primary"], align=PP_ALIGN.RIGHT)
+
+    _rect(slide, rx, iy, rw, ih, stheme["card_bg"], line=stheme["primary"], lw=1.0)
+    _bullets(slide, spec.get("content", []), rx + 0.10, iy + 0.10, rw - 0.20, ih - 0.20,
+             size=14, icon=spec.get("icon", "▸"),
+             icon_color=stheme["secondary"], text_color=stheme["text_dark"],
+             max_pts=_cfg("bullet_max_default"))
+
+    _add_logo(slide, logo_path, stheme)
+
+
+def _render_title_cover(slide, spec, num, theme, logo_path):
+    style  = spec.get("style", {})
+    stheme = _slide_theme(theme, style, slide_idx=num)
 
     W  = _cfg("slide_w")
     H  = _cfg("slide_h")
@@ -1038,31 +1244,62 @@ def _render_title_cover(slide, spec, num, theme, logo_path):
 
     prof = _profile(style)
     mode = prof["cover_mode"]
-    if mode == "sidebar":
+
+    if mode == "dark_full":
+        # NEW: full dark background cover — premium look
+        _bg(slide, stheme["bg_dark"])
+        _rect(slide, 0, 0, 0.35, H, stheme["secondary"])
+        _rect(slide, 0, H - 0.12, W, 0.12, stheme["accent2"])
+        title_color  = stheme["text_light"]
+        sub_color    = stheme["secondary"]
+        bullet_color = stheme["text_light"]
+        icon_color   = stheme["accent2"]
+    elif mode == "sidebar":
+        _bg(slide, stheme["bg_light"])
         _rect(slide, 0, 0, 2.05, H, stheme["primary"])
         _rect(slide, 2.05, 0, 0.10, H, stheme["secondary"])
+        title_color  = stheme["primary"]
+        sub_color    = stheme["accent"]
+        bullet_color = stheme["text_dark"]
+        icon_color   = stheme["secondary"]
     elif mode == "centered":
+        _bg(slide, stheme["bg_light"])
         _rect(slide, 0, 0, W, th * 0.85, stheme["primary"])
         _oval(slide, W - 3.2, 0.8, 3.7, 3.7, _mix(stheme["secondary"], (255, 255, 255), 0.15))
         _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
+        title_color  = stheme["primary"]
+        sub_color    = stheme["accent"]
+        bullet_color = stheme["text_dark"]
+        icon_color   = stheme["secondary"]
     elif mode == "grid":
+        _bg(slide, stheme["bg_light"])
         _rect(slide, 0, 0, W, th, stheme["primary"])
         _rect(slide, 0, th, W, tg, stheme["secondary"])
         for gx in (0.8, 2.6, 4.4, 6.2, 8.0, 9.8, 11.6):
             _rect(slide, gx, 0, 0.04, H, _mix(stheme["secondary"], stheme["bg_light"], 0.65))
         _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
-    else:
+        title_color  = stheme["primary"]
+        sub_color    = stheme["accent"]
+        bullet_color = stheme["text_dark"]
+        icon_color   = stheme["secondary"]
+    else:  # bands (classic)
+        _bg(slide, stheme["bg_light"])
         _rect(slide, 0, 0, W, th, stheme["primary"])
         _rect(slide, 0, th, W, tg, stheme["secondary"])
         _rect(slide, 0, H - fh, W, fh, _mix(stheme["primary"], stheme["secondary"], 0.55))
+        title_color  = stheme["primary"]
+        sub_color    = stheme["accent"]
+        bullet_color = stheme["text_dark"]
+        icon_color   = stheme["secondary"]
 
     title    = spec.get("title", "Presentation")
     subtitle = spec.get("subtitle", "")
     t_size   = _title_size(title, base=_cfg("cover_title_base"))
-    title_x = tx if mode != "sidebar" else 2.40
-    title_w = tw if mode != "sidebar" else W - 3.00
+    title_x  = tx if mode != "sidebar" else 2.40
+    title_w  = tw if mode != "sidebar" else W - 3.00
+
     _tb(slide, title, title_x, ty, title_w, tH, t_size,
-        bold=True, color=stheme["primary"],
+        bold=True, color=title_color,
         face=stheme["header_font"], align=PP_ALIGN.LEFT, shrink_to_fit=True)
 
     if subtitle:
@@ -1070,20 +1307,20 @@ def _render_title_cover(slide, spec, num, theme, logo_path):
         sy     = _cfg("cover_sub_y")
         sh     = _cfg("cover_sub_h")
         _tb(slide, subtitle, title_x + 0.02, sy, title_w, sh, s_size,
-            italic=True, color=stheme["accent"],
+            italic=True, color=sub_color,
             face=stheme["body_font"], shrink_to_fit=True)
 
     points = spec.get("content", [])
     if points:
-        by  = _cfg("cover_bullet_y")
-        bh  = _cfg("cover_bullet_h")
-        bsz = _cfg("cover_bullet_size")
-        bmax= _cfg("cover_bullet_max")
-        _bullets(slide, points[:bmax], title_x + 0.04, by, title_w, bh,
+        by   = _cfg("cover_bullet_y")
+        bh_  = _cfg("cover_bullet_h")
+        bsz  = _cfg("cover_bullet_size")
+        bmax = _cfg("cover_bullet_max")
+        _bullets(slide, points[:bmax], title_x + 0.04, by, title_w, bh_,
                  size=bsz,
                  icon=_safe_icon(spec.get("icon"), default="▸"),
-                 icon_color=stheme["secondary"],
-                 text_color=stheme["text_dark"],
+                 icon_color=icon_color,
+                 text_color=bullet_color,
                  max_pts=bmax)
 
     _add_logo(slide, logo_path, stheme)
@@ -1102,7 +1339,581 @@ _RENDERERS = {
     "icon_grid":   _render_icon_grid,
     "case_study":  _render_case_study,
     "table":       _render_table,
+    "chart":       _render_chart,
+    "image_text_split": _render_image_text_split,
+    "hybrid_insight": _render_hybrid_insight,
 }
+
+_CONTENT_LAYOUTS = (
+    "bullets", "two_column", "big_stat", "timeline", "icon_grid",
+    "case_study", "table", "chart", "image_text_split", "hybrid_insight"
+)
+_LAYOUT_ALIASES = {
+    "comparison": "two_column",
+    "grid": "icon_grid",
+    "infographic": "icon_grid",
+    "kpi": "big_stat",
+    "metric": "big_stat",
+    "chart_slide": "chart",
+    "graph": "chart",
+    "bar_chart": "chart",
+    "image_text": "image_text_split",
+    "split": "image_text_split",
+    "hybrid": "hybrid_insight",
+    "storytelling": "hybrid_insight",
+}
+_BLUEPRINT_INTENTS = (
+    "hook", "problem", "solution", "comparison", "evidence", "architecture",
+    "roadmap", "risk", "use_case", "future", "summary"
+)
+_INTENT_LAYOUT_MAP = {
+    "hook":         ("big_stat", "hybrid_insight", "image_text_split", "bullets"),
+    "problem":      ("bullets", "two_column", "image_text_split"),
+    "solution":     ("icon_grid", "image_text_split", "hybrid_insight", "two_column"),
+    "comparison":   ("table", "two_column", "chart"),
+    "evidence":     ("chart", "big_stat", "hybrid_insight", "case_study"),
+    "architecture": ("image_text_split", "icon_grid", "hybrid_insight"),
+    "roadmap":      ("timeline", "image_text_split", "bullets"),
+    "risk":         ("two_column", "table", "bullets"),
+    "use_case":     ("case_study", "image_text_split", "bullets"),
+    "future":       ("icon_grid", "timeline", "bullets"),
+    "summary":      ("bullets", "big_stat", "hybrid_insight"),
+}
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_NUMBER_RE = re.compile(r"\b\d+([.,]\d+)?\s*(%|x|k|m|b|bn|million|billion)?\b", re.IGNORECASE)
+
+
+def _safe_lower_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _canonical_layout(value, default="bullets") -> str:
+    raw = _safe_lower_text(value)
+    raw = _LAYOUT_ALIASES.get(raw, raw)
+    return raw if raw in _CONTENT_LAYOUTS or raw == "title_cover" else default
+
+
+def _parse_json_payload(raw: str):
+    if not raw:
+        return {}
+    txt = raw.strip()
+    if txt.startswith("```"):
+        txt = txt.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        try:
+            return json.loads(txt[start:end + 1])
+        except json.JSONDecodeError:
+            return {}
+
+
+def _slide_text_blob(slide: dict, topic: str) -> str:
+    parts = [topic, slide.get("title", ""), slide.get("subtitle", "")]
+    for key in ("content", "left_points", "right_points"):
+        val = slide.get(key)
+        if isinstance(val, list):
+            parts.extend([str(x) for x in val])
+    steps = slide.get("steps", [])
+    if isinstance(steps, list):
+        for s in steps:
+            if isinstance(s, dict):
+                parts.append(str(s.get("label", "")))
+                parts.append(str(s.get("detail", "")))
+    for key in ("left_title", "right_title", "stat_label", "stat_source", "company"):
+        parts.append(str(slide.get(key, "")))
+    return " ".join(parts).lower()
+
+
+def _extract_chart_data_from_content(content, max_items=5):
+    if not isinstance(content, list):
+        return []
+    out = []
+    for point in content:
+        text = str(point).strip()
+        if not text:
+            continue
+        num_match = re.search(r"(-?\d+(?:\.\d+)?)\s*(%|x)?", text)
+        if not num_match:
+            continue
+        raw = float(num_match.group(1))
+        value = int(max(1, min(100, round(raw if raw <= 100 else raw / 10))))
+        # Create a short, readable label from the leading phrase.
+        label = re.sub(r"\*\*", "", text)
+        label = re.split(r"[:;,.\-]", label)[0].strip()
+        words = label.split()
+        label = " ".join(words[:4]) if words else "Metric"
+        out.append({"label": label or "Metric", "value": value})
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _slide_signals(slide: dict, topic: str) -> dict:
+    blob = _slide_text_blob(slide, topic)
+    return {
+        "timeline": bool(_YEAR_RE.search(blob)) or any(k in blob for k in
+            ("timeline", "history", "evolution", "roadmap", "milestone", "phase", "journey")),
+        "comparison": any(k in blob for k in
+            ("compare", "comparison", "versus", " vs ", "before", "after", "pros", "cons", "trade-off")),
+        "numbers": bool(_NUMBER_RE.search(blob)),
+        "architecture": any(k in blob for k in
+            ("architecture", "stack", "pipeline", "system design", "workflow", "layer", "component")),
+        "risk": any(k in blob for k in
+            ("risk", "challenge", "mitigation", "constraint", "limitation")),
+        "use_case": any(k in blob for k in
+            ("case study", "customer", "deployment", "implementation", "real-world", "example")),
+        "future": any(k in blob for k in
+            ("future", "next", "outlook", "trend", "road ahead")),
+    }
+
+
+def _count_years(text: str) -> int:
+    return len({m.group(0) for m in _YEAR_RE.finditer(text or "")})
+
+
+def _count_numeric_mentions(text: str) -> int:
+    return len(_NUMBER_RE.findall(text))
+
+
+def _layout_supported_by_content(slide: dict, layout: str, topic: str) -> bool:
+    layout = _canonical_layout(layout, default="bullets")
+    if layout in {"bullets", "icon_grid", "image_text_split"}:
+        return True
+
+    blob = _slide_text_blob(slide, topic)
+    sig = _slide_signals(slide, topic)
+
+    steps = slide.get("steps", [])
+    if not isinstance(steps, list):
+        steps = []
+    has_valid_steps = len([s for s in steps if isinstance(s, dict) and s.get("label") and s.get("detail")]) >= 3
+
+    metrics = slide.get("metrics", [])
+    if not isinstance(metrics, list):
+        metrics = []
+    has_metrics = len([m for m in metrics if isinstance(m, dict)]) >= 2
+
+    chart_data = slide.get("chart_data", [])
+    if not isinstance(chart_data, list):
+        chart_data = []
+    has_chart_data = len([c for c in chart_data if isinstance(c, dict)]) >= 3
+
+    table_cols = slide.get("table_columns", [])
+    table_rows = slide.get("table_rows", [])
+    if not isinstance(table_cols, list):
+        table_cols = []
+    if not isinstance(table_rows, list):
+        table_rows = []
+
+    left_pts = slide.get("left_points", [])
+    right_pts = slide.get("right_points", [])
+    if not isinstance(left_pts, list):
+        left_pts = []
+    if not isinstance(right_pts, list):
+        right_pts = []
+
+    stat = str(slide.get("stat", "")).strip()
+    company = str(slide.get("company", "")).strip().lower()
+    generic_case = company in _cfg("case_study_generic_companies")
+    years = _count_years(blob)
+    nums = _count_numeric_mentions(blob)
+
+    if layout == "timeline":
+        return has_valid_steps or years >= 2 or sig["timeline"]
+    if layout == "case_study":
+        return has_metrics or ("case study" in blob) or (company and not generic_case)
+    if layout == "table":
+        return (len(table_cols) >= 3 and len(table_rows) >= 3) or sig["comparison"]
+    if layout == "two_column":
+        return len(left_pts) >= 3 or len(right_pts) >= 3 or sig["comparison"] or sig["risk"]
+    if layout == "chart":
+        return has_chart_data or nums >= 3
+    if layout == "big_stat":
+        return bool(stat) and stat not in _cfg("stat_placeholder_values") or nums >= 1
+    if layout == "hybrid_insight":
+        return (nums >= 2 and (sig["architecture"] or sig["numbers"])) or has_chart_data
+    return True
+
+
+def _coerce_layout_by_evidence(slide: dict, layout: str, topic: str) -> str:
+    layout = _canonical_layout(layout, default="bullets")
+    if _layout_supported_by_content(slide, layout, topic):
+        return layout
+    fallback_map = {
+        "timeline": ("image_text_split", "bullets"),
+        "case_study": ("hybrid_insight", "bullets"),
+        "table": ("two_column", "bullets"),
+        "two_column": ("bullets", "image_text_split"),
+        "chart": ("hybrid_insight", "bullets"),
+        "big_stat": ("chart", "bullets"),
+        "hybrid_insight": ("image_text_split", "bullets"),
+    }
+    for cand in fallback_map.get(layout, ("bullets",)):
+        if _layout_supported_by_content(slide, cand, topic):
+            return cand
+    return "bullets"
+
+
+def _infer_blueprint_intent(slide: dict, topic: str, idx: int, total: int) -> str:
+    s = _slide_signals(slide, topic)
+    if idx == total:
+        return "summary"
+    if s["architecture"]:
+        return "architecture"
+    if s["comparison"]:
+        return "comparison"
+    if s["timeline"]:
+        return "roadmap"
+    if s["use_case"]:
+        return "use_case"
+    if s["risk"]:
+        return "risk"
+    if s["numbers"]:
+        return "evidence"
+    if idx == 2:
+        return random.choice(["hook", "problem"])
+    if s["future"]:
+        return "future"
+    return random.choice(["solution", "evidence", "problem"])
+
+
+def _pick_layout_for_intent(intent: str, previous_layout: str, used_counts: dict, caps: dict) -> str:
+    candidates = list(_INTENT_LAYOUT_MAP.get(intent, ("bullets",)))
+    random.shuffle(candidates)
+    for c in candidates:
+        if c == previous_layout:
+            continue
+        if used_counts.get(c, 0) >= caps.get(c, 1):
+            continue
+        return c
+    for c in candidates:
+        if c != previous_layout:
+            return c
+    return "bullets"
+
+
+def _fallback_blueprint(topic: str, slides: list) -> list:
+    # Build an intent-driven blueprint with optional sections (no forced timeline/case-study).
+    if not isinstance(slides, list) or len(slides) <= 1:
+        return []
+    total = len(slides)
+    caps = _layout_caps(total)
+    used = {k: 0 for k in _CONTENT_LAYOUTS}
+    prev = ""
+    blueprint = []
+    indices = list(range(2, total + 1))
+    random.shuffle(indices)
+    ordered = sorted(indices, key=lambda i: 0 if i in (2, total) else 1)
+    for idx in ordered:
+        slide = slides[idx - 1] if idx - 1 < len(slides) else {}
+        intent = _infer_blueprint_intent(slide, topic, idx, total)
+        layout = _pick_layout_for_intent(intent, prev, used, caps)
+        used[layout] = used.get(layout, 0) + 1
+        prev = layout
+        blueprint.append({"source_index": idx, "intent": intent, "layout": layout})
+    # Ensure actual slide order follows blueprint sequence.
+    return blueprint
+
+
+def _plan_blueprint_with_llm(topic: str, tone: str, slides: list) -> list:
+    if not isinstance(slides, list) or len(slides) <= 1:
+        return []
+    compact = []
+    for idx, s in enumerate(slides, start=1):
+        if not isinstance(s, dict):
+            s = {}
+        sig = _slide_signals(s, topic)
+        compact.append({
+            "index": idx,
+            "title": str(s.get("title", ""))[:110],
+            "subtitle": str(s.get("subtitle", ""))[:130],
+            "layout_hint": _canonical_layout(s.get("layout", "bullets")),
+            "signals": sig,
+            "sample_points": [str(x)[:140] for x in (s.get("content", []) if isinstance(s.get("content"), list) else [])[:2]],
+        })
+    prompt = f"""
+You are a presentation blueprint architect.
+Topic: "{topic}"
+Tone: "{tone}"
+
+Create a structurally diverse blueprint for slides 2..{len(slides)}.
+Goal: avoid fixed patterns like always timeline/case-study/challenges.
+Only include special sections when content signals justify them.
+
+Allowed intents: {list(_BLUEPRINT_INTENTS)}
+Allowed layouts: {list(_CONTENT_LAYOUTS)}
+
+Return JSON only:
+{{
+  "blueprint": [
+    {{"source_index": 2, "intent": "hook", "layout": "big_stat"}},
+    ...
+  ]
+}}
+
+Rules:
+- Use each source_index from 2..{len(slides)} exactly once.
+- You may reorder source_index to create a different narrative.
+- Choose layout from intent and content signals.
+- Keep adjacent layouts different when possible.
+- Do NOT force timeline, case_study, or risk slides unless strongly supported.
+
+Slide summaries:
+{json.dumps(compact, ensure_ascii=True)}
+"""
+    try:
+        resp = _client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1.0,
+            max_tokens=1200,
+        )
+        parsed = _parse_json_payload((resp.choices[0].message.content or "").strip())
+        bp = parsed.get("blueprint", []) if isinstance(parsed, dict) else []
+        if not isinstance(bp, list):
+            return []
+        clean = []
+        needed = set(range(2, len(slides) + 1))
+        seen = set()
+        for node in bp:
+            if not isinstance(node, dict):
+                continue
+            src = _coerce_int(node.get("source_index", -1), default=-1, min_value=-1, max_value=1000)
+            if src not in needed or src in seen:
+                continue
+            seen.add(src)
+            intent = _safe_lower_text(node.get("intent", "solution"))
+            if intent not in _BLUEPRINT_INTENTS:
+                intent = _infer_blueprint_intent(slides[src - 1], topic, src, len(slides))
+            layout = _canonical_layout(node.get("layout", "bullets"), default="bullets")
+            clean.append({"source_index": src, "intent": intent, "layout": layout})
+        if seen != needed:
+            return []
+        return clean
+    except Exception:
+        return []
+
+
+def _reorder_and_stamp_by_blueprint(slides: list, topic: str, tone: str) -> list:
+    if not isinstance(slides, list) or not slides:
+        return []
+    first = slides[0]
+    rest = slides[1:]
+    if not rest:
+        return [first]
+    llm_bp = _plan_blueprint_with_llm(topic=topic, tone=tone, slides=slides)
+    bp = llm_bp if llm_bp else _fallback_blueprint(topic=topic, slides=slides)
+    index_map = {i: s for i, s in enumerate(slides, start=1)}
+    ordered = [first]
+    prev_layout = ""
+    for node in bp:
+        s = index_map.get(node.get("source_index"), {})
+        if not isinstance(s, dict):
+            s = {}
+        s = dict(s)
+        layout = _canonical_layout(node.get("layout", s.get("layout", "bullets")), default="bullets")
+        if layout == prev_layout:
+            # force local diversity when blueprint repeats
+            intent = _safe_lower_text(node.get("intent", "solution"))
+            layout = _pick_layout_for_intent(intent, prev_layout, used_counts={}, caps=_layout_caps(len(slides)))
+        s["layout"] = layout
+        s["_blueprint_intent"] = _safe_lower_text(node.get("intent", "solution"))
+        ordered.append(s)
+        prev_layout = layout
+    return ordered
+
+
+def _layout_caps(num_slides: int) -> dict:
+    # Keep heavy/specialized layouts rare and content-driven.
+    core = max(1, num_slides - 1)
+    return {
+        "bullets": max(1, core),
+        "two_column": 1 if core <= 5 else 2,
+        "big_stat": 1,
+        "timeline": 1,
+        "icon_grid": 1 if core <= 6 else 2,
+        "case_study": 1,
+        "table": 1,
+        "chart": 1 if core <= 6 else 2,
+        "image_text_split": 1 if core <= 6 else 2,
+        "hybrid_insight": 1 if core <= 6 else 2,
+    }
+
+
+def _choose_layout_for_slide(slide: dict, topic: str, idx: int, total: int,
+                             prev_layout: str, used_counts: dict, caps: dict) -> str:
+    blob = _slide_text_blob(slide, topic)
+    requested = _canonical_layout(slide.get("layout", "bullets"), default="bullets")
+
+    has_steps = isinstance(slide.get("steps"), list) and len(slide.get("steps")) >= 3
+    has_table = isinstance(slide.get("table_columns"), list) and isinstance(slide.get("table_rows"), list) \
+        and len(slide.get("table_columns")) >= 3 and len(slide.get("table_rows")) >= 2
+    has_two_col = (isinstance(slide.get("left_points"), list) and len(slide.get("left_points")) >= 3) \
+        or (isinstance(slide.get("right_points"), list) and len(slide.get("right_points")) >= 3)
+    has_grid = isinstance(slide.get("grid_items"), list) and len(slide.get("grid_items")) >= 3
+    has_metrics = isinstance(slide.get("metrics"), list) and len(slide.get("metrics")) >= 2
+    has_stat = bool(str(slide.get("stat", "")).strip()) and str(slide.get("stat", "")).strip() != "—"
+    has_chart = isinstance(slide.get("chart_data"), list) and len(slide.get("chart_data")) >= 3
+
+    is_timeline = has_steps or bool(_YEAR_RE.search(blob)) or any(
+        k in blob for k in ("timeline", "history", "evolution", "roadmap", "milestone", "journey", "phase")
+    )
+    is_table = has_table or any(
+        k in blob for k in ("comparison", "compare", "benchmark", "matrix", "pricing", "options", "feature")
+    ) or " vs " in blob
+    is_two_col = has_two_col or any(
+        k in blob for k in ("before after", "pros and cons", "pros", "cons", "challenges", "solutions",
+                            "current state", "target state", "risks", "mitigation")
+    )
+    is_big_stat = has_stat or bool(_NUMBER_RE.search(blob)) and any(
+        k in blob for k in ("growth", "reduction", "roi", "increase", "decrease", "adoption", "efficiency")
+    )
+    is_chart = has_chart or bool(_NUMBER_RE.search(blob)) and any(
+        k in blob for k in ("distribution", "breakdown", "share", "segment", "performance", "trend", "quarter")
+    )
+    is_case = has_metrics or bool(str(slide.get("company", "")).strip()) or any(
+        k in blob for k in ("case study", "customer story", "success story", "deployment", "implementation")
+    )
+    is_grid = has_grid or any(
+        k in blob for k in ("pillars", "components", "capabilities", "framework", "building blocks", "modules")
+    )
+    is_split = any(
+        k in blob for k in ("architecture", "workflow", "stack", "pipeline", "system design", "application")
+    )
+    is_hybrid = (is_chart and is_split) or (is_big_stat and is_split)
+
+    if idx == total and any(k in blob for k in ("q&a", "questions", "thank you", "takeaway", "next steps")):
+        candidates = ["bullets"]
+    else:
+        semantic_candidates = []
+        if is_timeline:
+            semantic_candidates.append("timeline")
+        if is_table:
+            semantic_candidates.append("table")
+        if is_two_col:
+            semantic_candidates.append("two_column")
+        if is_case:
+            semantic_candidates.append("case_study")
+        if is_big_stat:
+            semantic_candidates.append("big_stat")
+        if is_chart:
+            semantic_candidates.append("chart")
+        if is_grid:
+            semantic_candidates.append("icon_grid")
+        if is_split:
+            semantic_candidates.append("image_text_split")
+        if is_hybrid:
+            semantic_candidates.append("hybrid_insight")
+        random.shuffle(semantic_candidates)
+        candidates = semantic_candidates + [requested, "bullets"]
+
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c in _CONTENT_LAYOUTS and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    for c in ordered:
+        if used_counts.get(c, 0) >= caps.get(c, 1):
+            continue
+        if c == prev_layout and len(ordered) > 1:
+            continue
+        return c
+
+    for c in ("two_column", "icon_grid", "bullets"):
+        if used_counts.get(c, 0) < caps.get(c, 1) and c != prev_layout:
+            return c
+    return "bullets"
+
+
+def _plan_layouts_with_llm(topic: str, tone: str, slides: list) -> list:
+    if not isinstance(slides, list) or len(slides) <= 1:
+        return []
+
+    compact = []
+    for idx, s in enumerate(slides, start=1):
+        if not isinstance(s, dict):
+            s = {}
+        content = s.get("content", [])
+        if not isinstance(content, list):
+            content = []
+        compact.append({
+            "index": idx,
+            "title": str(s.get("title", ""))[:120],
+            "subtitle": str(s.get("subtitle", ""))[:140],
+            "layout_hint": _canonical_layout(s.get("layout", "bullets")),
+            "has_steps_data": isinstance(s.get("steps"), list) and len(s.get("steps")) >= 3,
+            "has_table_data": isinstance(s.get("table_columns"), list) and isinstance(s.get("table_rows"), list),
+            "has_metrics_data": isinstance(s.get("metrics"), list) and len(s.get("metrics")) >= 2,
+            "has_stat_data": bool(str(s.get("stat", "")).strip()),
+            "has_chart_data": isinstance(s.get("chart_data"), list) and len(s.get("chart_data")) >= 3,
+            "sample_points": [str(x)[:160] for x in content[:2]],
+        })
+
+    prompt = f"""
+You are a presentation layout planner.
+Topic: "{topic}"
+Tone: "{tone}"
+
+Task:
+Choose the best layout for each slide from 2..{len(slides)} based on semantic intent.
+Do NOT follow any fixed order pattern.
+Do NOT default slide 2 to timeline unless the content clearly indicates chronology/history/roadmap.
+Across different topics, structure must differ naturally.
+
+Allowed layouts:
+{list(_CONTENT_LAYOUTS)}
+
+Selection rules:
+- timeline: only for chronology, milestones, phases, evolution, roadmap
+- table: only for true comparison matrix/data rows
+- two_column: for contrasts (before/after, pros/cons, challenges/solutions)
+- big_stat: only when one key metric deserves emphasis
+- case_study: for company/example outcomes
+- icon_grid: for grouped capability pillars/components
+- chart: for multiple numeric datapoints or performance breakdown
+- image_text_split: for architecture/workflow/application explanations
+- hybrid_insight: for combined KPI + mini-data + explanation on one slide
+- bullets: default when none of the above strongly fits
+- avoid repeating the same layout in adjacent slides when possible
+
+Input slide summaries:
+{json.dumps(compact, ensure_ascii=True)}
+
+Return ONLY valid JSON:
+{{
+  "layouts": ["layout_for_slide_2", "layout_for_slide_3", "..."]
+}}
+Exactly {len(slides)-1} items in order.
+"""
+    try:
+        resp = _client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.9,
+            max_tokens=900,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _parse_json_payload(raw)
+        layouts = parsed.get("layouts", []) if isinstance(parsed, dict) else []
+        if not isinstance(layouts, list):
+            return []
+        cleaned = []
+        for x in layouts[:len(slides)-1]:
+            cleaned.append(_canonical_layout(x, default="bullets"))
+        if len(cleaned) != len(slides) - 1:
+            return []
+        return cleaned
+    except Exception:
+        return []
 
 
 # ==========================================================================
@@ -1127,6 +1938,7 @@ Return ONLY valid JSON — no markdown fences, no preamble, no explanation.
 9. "content" bullets: 4-7 items, 18-34 words each, use **bold** for key terms.
    Every bullet must cite a REAL company, statistic, or year — never say "many companies".
 10. Final slide should be context-appropriate (Thank You, Q&A, Key Takeaways) chosen by topic narrative.
+11. Timeline and case-study slides are OPTIONAL; include them only if the topic/sections clearly require them.
 
 === DESIGN SYSTEM ===
 Add top-level object "design_system":
@@ -1174,13 +1986,13 @@ Each slide.style must include:
 
 "big_stat"
   stat:        real value e.g. "40%", "$2.5B", "3x" (NOT "100%")
-  stat_label:  ≤8 words describing the stat
+  stat_label:  <=8 words describing the stat
   stat_source: source and year
   content:     [5-6 supporting bullets]
 
 "timeline"
   steps: [exactly 4 items]
-    each: {{"label": "≤4 words", "detail": "15-20 word sentence"}}
+    each: {{"label": "<=4 words", "detail": "15-20 word sentence"}}
   content: []
 
 "icon_grid"
@@ -1198,6 +2010,23 @@ Each slide.style must include:
   table_columns: [3-5 short column headers]
   table_rows:    [4-6 rows, each matching column count]
   content: []
+
+"chart"
+  chart_title: short chart heading
+  chart_data: [3-5 items, each: {{"label":"name","value":integer 1-100}}]
+  chart_source: optional source/year line
+  content: []
+
+"image_text_split"
+  image_caption: short visual caption
+  image_side: one of ["left","right"]
+  content: [4-6 bullets]
+
+"hybrid_insight"
+  stat: short KPI value
+  stat_label: <=8 words
+  chart_data: [3 items, each: {{"label":"name","value":integer 1-100}}]
+  content: [4-6 bullets]
 
 === JSON FORMAT ===
 {{
@@ -1243,17 +2072,7 @@ Each slide.style must include:
         max_tokens=6000,
     )
     raw = (resp.choices[0].message.content or "").strip()
-    if raw.startswith("```"):
-        raw = raw.replace("```json", "").replace("```", "").strip()
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end   = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        data = json.loads(raw[start:end + 1])
+    data = _parse_json_payload(raw)
 
     if not isinstance(data, dict):
         data = {"design_system": {}, "slides": []}
@@ -1262,7 +2081,6 @@ Each slide.style must include:
     if not isinstance(data.get("slides"), list):
         data["slides"] = []
 
-    # ── Validate & sanitise slides ──────────────────────────────────────────
     allowed_surfaces         = set(_cfg("allowed_surfaces"))
     allowed_header_variants  = set(_cfg("allowed_header_variants"))
     allowed_card_variants    = set(_cfg("allowed_card_variants"))
@@ -1276,14 +2094,21 @@ Each slide.style must include:
     fallback_marker          = _cfg("fallback_bullet_marker")
     two_col_min              = _cfg("two_col_min_bullets")
 
+    source_slides = [s for s in data.get("slides", []) if isinstance(s, dict)]
+    source_slides = _reorder_and_stamp_by_blueprint(source_slides, topic=topic, tone=tone)
+    llm_layout_plan = _plan_layouts_with_llm(topic=topic, tone=tone, slides=source_slides)
+
     clean_slides = []
-    for idx, slide in enumerate(data.get("slides", []), start=1):
+    layout_counts = {k: 0 for k in _CONTENT_LAYOUTS}
+    caps = _layout_caps(max(1, len(source_slides)))
+    prev_content_layout = ""
+    for idx, slide in enumerate(source_slides, start=1):
         if not isinstance(slide, dict):
             continue
 
         slide.setdefault("title", f"Slide {idx}")
         slide.setdefault("subtitle", "")
-        layout = slide.get("layout", "bullets")
+        layout = _canonical_layout(slide.get("layout", "bullets"))
         slide["icon"] = _safe_icon(slide.get("icon"), default="▸")
         slide.setdefault("content", [])
         if not isinstance(slide.get("style"), dict):
@@ -1305,7 +2130,6 @@ Each slide.style must include:
         if style["badge_shape"]      not in allowed_badge_shapes:     style["badge_shape"]      = "oval"
         if style["accent_rotation"]  not in allowed_accent_rotations: style["accent_rotation"]  = "static"
 
-        # Coerce list fields
         for key in ("content", "left_points", "right_points"):
             if key in slide and isinstance(slide[key], list):
                 slide[key] = [
@@ -1316,15 +2140,32 @@ Each slide.style must include:
             slide["content"] = []
         slide["content"] = [str(x).strip() for x in slide["content"] if str(x).strip()]
 
-        # Backfill minimum bullets for layouts that need them
-        min_count = min_bullets.get(layout, 0)
-        while len(slide["content"]) < min_count:
-            slide["content"].append(
-                f"{fallback_marker}: add one measurable KPI, one owner, and one delivery date "
-                f"so this {topic} initiative is actionable, auditable, and presentation-ready."
-            )
+        if idx == 1:
+            layout = "title_cover"
+        else:
+            blueprint_choice = _canonical_layout(slide.get("layout", "bullets"))
+            llm_choice = ""
+            if len(llm_layout_plan) >= idx - 1:
+                llm_choice = _canonical_layout(llm_layout_plan[idx - 2])
+            if blueprint_choice in _CONTENT_LAYOUTS and blueprint_choice != prev_content_layout:
+                layout = blueprint_choice
+            elif llm_choice in _CONTENT_LAYOUTS and llm_choice != prev_content_layout:
+                layout = llm_choice
+            else:
+                layout = _choose_layout_for_slide(
+                    slide=slide,
+                    topic=topic,
+                    idx=idx,
+                    total=len(source_slides),
+                    prev_layout=prev_content_layout,
+                    used_counts=layout_counts,
+                    caps=caps,
+                )
+            layout = _coerce_layout_by_evidence(slide, layout, topic)
+            layout_counts[layout] = layout_counts.get(layout, 0) + 1
+            prev_content_layout = layout
+        slide["layout"] = layout
 
-        # two_column validation
         if layout == "two_column":
             for k, default in (("left_title", "Before"), ("right_title", "After")):
                 v = slide.get(k, "").strip().lower()
@@ -1345,27 +2186,26 @@ Each slide.style must include:
                         f"{topic} track from concept to production impact."
                     )
 
-        # big_stat validation
         if layout == "big_stat":
             stat = str(slide.get("stat", "")).strip()
             if not stat or stat in stat_placeholders:
                 slide["stat"] = "—"
 
-        # timeline validation
         if layout == "timeline":
             clean = [
                 s for s in slide.get("steps", [])
                 if isinstance(s, dict) and s.get("label") and s.get("detail")
             ]
-            slide["steps"] = clean if clean else [
-                {"label": f"Phase {i+1}", "detail": "Details to be confirmed."}
-                for i in range(4)
-            ]
-            for s in slide["steps"]:
-                s["label"]  = str(s.get("label", ""))
-                s["detail"] = str(s.get("detail", ""))
+            if not clean:
+                # Do not force synthetic timeline placeholders; downgrade to content slide.
+                layout = "bullets"
+                slide["layout"] = layout
+            else:
+                slide["steps"] = clean
+                for s in slide["steps"]:
+                    s["label"]  = str(s.get("label", ""))
+                    s["detail"] = str(s.get("detail", ""))
 
-        # icon_grid validation
         if layout == "icon_grid":
             if not isinstance(slide.get("grid_items"), list):
                 slide["grid_items"] = []
@@ -1379,11 +2219,14 @@ Each slide.style must include:
                 fixed_grid.append(gi)
             slide["grid_items"] = fixed_grid[:4]
 
-        # case_study validation
         if layout == "case_study":
             co = slide.get("company", "").strip().lower()
             if not co or co in case_generic:
-                slide["company"] = "Leading Organisation"
+                t = str(slide.get("title", ""))
+                if ":" in t:
+                    slide["company"] = t.split(":", 1)[1].strip() or "Featured Organisation"
+                else:
+                    slide["company"] = "Featured Organisation"
             metrics = slide.get("metrics", [])
             if not isinstance(metrics, list):
                 metrics = []
@@ -1398,7 +2241,6 @@ Each slide.style must include:
                 })
             slide["metrics"] = fixed_metrics
 
-        # table validation
         if layout == "table":
             cols = slide.get("table_columns", [])
             rows = slide.get("table_rows", [])
@@ -1425,6 +2267,74 @@ Each slide.style must include:
             slide["table_columns"] = cols
             slide["table_rows"]    = clean_rows[:_cfg("table_max_rows")]
 
+        if layout == "chart":
+            chart_data = slide.get("chart_data", [])
+            if not isinstance(chart_data, list):
+                chart_data = []
+            fixed = []
+            for item in chart_data[:_cfg("chart_max_items")]:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label", "Metric")).strip()[:40]
+                value = _coerce_int(item.get("value", 50), default=50, min_value=1, max_value=100)
+                if label:
+                    fixed.append({"label": label, "value": value})
+            if not fixed:
+                fixed = _extract_chart_data_from_content(slide.get("content", []), max_items=_cfg("chart_max_items"))
+            if len(fixed) < 3:
+                fixed.extend([
+                    {"label": "Current", "value": 55},
+                    {"label": "Target", "value": 78},
+                    {"label": "Potential", "value": 92},
+                ][:max(0, 3 - len(fixed))])
+            slide["chart_data"] = fixed[:_cfg("chart_max_items")]
+            slide["chart_title"] = str(slide.get("chart_title", "")).strip() or "Performance Snapshot"
+
+        if layout == "image_text_split":
+            side = str(slide.get("image_side", "")).strip().lower()
+            if side not in {"left", "right"}:
+                slide["image_side"] = random.choice(["left", "right"])
+            slide["image_caption"] = str(slide.get("image_caption", "")).strip() or "Visual Brief"
+
+        if layout == "hybrid_insight":
+            stat = str(slide.get("stat", "")).strip()
+            if not stat or stat in stat_placeholders:
+                extracted = _extract_chart_data_from_content(slide.get("content", []), max_items=1)
+                stat = str(extracted[0]["value"]) if extracted else "65"
+            slide["stat"] = stat
+            slide["stat_label"] = str(slide.get("stat_label", "")).strip() or "Composite impact"
+
+            chart_data = slide.get("chart_data", [])
+            if not isinstance(chart_data, list):
+                chart_data = []
+            fixed = []
+            for item in chart_data[:3]:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label", "Metric")).strip()[:24]
+                value = _coerce_int(item.get("value", 50), default=50, min_value=1, max_value=100)
+                if label:
+                    fixed.append({"label": label, "value": value})
+            if len(fixed) < 3:
+                generated = _extract_chart_data_from_content(slide.get("content", []), max_items=3)
+                for g in generated:
+                    if len(fixed) >= 3:
+                        break
+                    if not any(g["label"] == x["label"] for x in fixed):
+                        fixed.append(g)
+            while len(fixed) < 3:
+                defaults = [("Current", 48), ("Target", 70), ("Potential", 90)]
+                label, value = defaults[len(fixed)]
+                fixed.append({"label": label, "value": value})
+            slide["chart_data"] = fixed[:3]
+
+        min_count = min_bullets.get(layout, 0)
+        while len(slide["content"]) < min_count:
+            slide["content"].append(
+                f"{fallback_marker}: add one measurable KPI, one owner, and one delivery date "
+                f"so this {topic} initiative is actionable, auditable, and presentation-ready."
+            )
+
         clean_slides.append(slide)
 
     # Prevent immediate repeated visual pattern
@@ -1435,7 +2345,6 @@ Each slide.style must include:
             cur["pattern_name"] = f'{cur.get("pattern_name", "pattern")}_{i+1}'
             cur["header_variant"] = "banded" if prev.get("header_variant") != "banded" else "split"
 
-    # Ensure slide 1 is always title_cover
     if clean_slides:
         first = clean_slides[0]
         first["layout"] = "title_cover"
@@ -1481,26 +2390,30 @@ def create_ppt(slide_data, topic: str,
 
     payload       = slide_data if isinstance(slide_data, dict) else {"slides": slide_data}
     design_system = payload.get("design_system", {}) if isinstance(payload, dict) else {}
-    theme         = _normalize_theme(design_system.get("theme", {}))
-    deck_profile  = _pick_deck_profile(topic)
 
-    # Enforce light baseline — bg_dark derived from primary, not hardcoded
-    theme["bg_light"] = (255, 255, 255)
-    theme["card_bg"]  = (255, 255, 255)
-    theme["bg_dark"]  = _mix(theme["primary"], (255, 255, 255), _cfg("bg_dark_mix_to_white"))
-    # Topic-seeded palette nudges so unrelated topics don't look identical.
-    if deck_profile == "magazine":
-        theme["primary"] = _mix(theme["primary"], (15, 95, 188), 0.72)
-        theme["secondary"] = _mix(theme["secondary"], (78, 162, 232), 0.72)
-        theme["accent2"] = _mix(theme["accent2"], (35, 178, 205), 0.72)
-    elif deck_profile == "executive":
-        theme["primary"] = _mix(theme["primary"], (0, 118, 185), 0.72)
-        theme["secondary"] = _mix(theme["secondary"], (72, 182, 228), 0.72)
-        theme["accent2"] = _mix(theme["accent2"], (0, 196, 190), 0.72)
-    elif deck_profile == "tech":
-        theme["primary"] = _mix(theme["primary"], (32, 112, 202), 0.72)
-        theme["secondary"] = _mix(theme["secondary"], (98, 174, 244), 0.72)
-        theme["accent2"] = _mix(theme["accent2"], (86, 192, 216), 0.72)
+    # Start from LLM theme (parse what it gave us)
+    theme = _normalize_theme(design_system.get("theme", {}))
+
+    # Pick a RANDOM profile every time — this is the key fix
+    deck_profile = _pick_deck_profile()
+
+    # Apply the profile's distinct palette — completely overwrites the LLM theme's colors
+    # so every profile looks genuinely different instead of all-blue
+    pp = PROFILE_PALETTES.get(deck_profile, PROFILE_PALETTES["classic"])
+    theme["primary"]     = pp["primary"]
+    theme["secondary"]   = pp["secondary"]
+    theme["accent"]      = pp["accent"]
+    theme["accent2"]     = pp["accent2"]
+    theme["bg_dark"]     = pp["bg_dark"]
+    theme["text_muted"]  = pp["text_muted"]
+    theme["header_font"] = pp["header_font"]
+    theme["body_font"]   = pp["body_font"]
+
+    # These stay constant across all profiles
+    theme["bg_light"]   = (255, 255, 255)
+    theme["card_bg"]    = (255, 255, 255)
+    theme["text_dark"]  = (30, 30, 30)
+    theme["text_light"] = (255, 255, 255)
 
     logo   = logo_path if (logo_path and os.path.exists(logo_path)) else None
     slides = payload.get("slides", [])
@@ -1516,7 +2429,6 @@ def create_ppt(slide_data, topic: str,
         if not isinstance(spec.get("style"), dict):
             spec["style"] = {}
         spec["style"]["_deck_profile"] = deck_profile
-        # Force any stray dark surface to light
         if spec["style"].get("surface") == "dark":
             spec["style"]["surface"] = "light"
 
@@ -1525,7 +2437,6 @@ def create_ppt(slide_data, topic: str,
         slide    = prs.slides.add_slide(prs.slide_layouts[6])
         renderer(slide, spec, i, theme, logo)
 
-    # Fallback: no valid slides
     if len(prs.slides) == 0:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         fallback_marker = _cfg("fallback_bullet_marker")
@@ -1540,7 +2451,7 @@ def create_ppt(slide_data, topic: str,
                     f"{fallback_marker}: no valid slide plan was returned for {topic}.",
                     f"{fallback_marker}: regenerate with the same topic for a full deck.",
                     f"{fallback_marker}: add audience and use-case context for richer content.",
-                    f"{fallback_marker}: service supports table, timeline, metrics, case-study.",
+                    f"{fallback_marker}: service supports table, timeline, chart, split-view, case-study.",
                     f"{fallback_marker}: fallback prevents empty deck failures.",
                 ],
                 "style": {"surface": "light", "header_variant": "solid", "card_variant": "outline"},
@@ -1553,4 +2464,3 @@ def create_ppt(slide_data, topic: str,
     path = f"generated/{safe}.pptx"
     prs.save(path)
     return path
-    
