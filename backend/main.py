@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import asyncio
 from fastapi import File, UploadFile, Form
+import json
 
 # Services
 from backend.services.ppt_service import generate_slide_content, create_ppt
@@ -19,6 +19,12 @@ class PPTRequest(BaseModel):
     topic: str
     num_slides: int = 5
     tone: str = "Professional"
+
+
+class PPTBuildRequest(BaseModel):
+    topic: str
+    tone: str = "Professional"
+    slide_data: dict
 
 
 # =========================
@@ -52,7 +58,7 @@ async def generate_ppt(
         # Generate content (bounded timeout so request doesn't hang forever)
         try:
             slide_data = await asyncio.wait_for(
-                asyncio.to_thread(generate_slide_content, topic, num_slides, tone),
+                asyncio.to_thread(generate_slide_content, topic, num_slides, tone, logo_path),
                 timeout=150,
             )
         except asyncio.TimeoutError:
@@ -90,5 +96,73 @@ async def generate_ppt(
             "ppt_base64": ppt_base64
         })
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate-outline")
+async def generate_outline(
+    topic: str = Form(...),
+    num_slides: int = Form(5),
+    tone: str = Form("Professional"),
+):
+    try:
+        try:
+            slide_data = await asyncio.wait_for(
+                asyncio.to_thread(generate_slide_content, topic, num_slides, tone),
+                timeout=150,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Slide generation timed out after 150 seconds. Try fewer slides or retry.",
+            )
+
+        return JSONResponse(slide_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/build-ppt")
+async def build_ppt(
+    topic: str = Form(...),
+    tone: str = Form("Professional"),
+    slides_json: str = Form(...),
+    logo: UploadFile = File(None),
+):
+    try:
+        try:
+            slide_data = json.loads(slides_json)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid slides_json: {e}")
+
+        logo_path = None
+        if logo:
+            os.makedirs("uploads", exist_ok=True)
+            logo_path = f"uploads/{logo.filename}"
+            with open(logo_path, "wb") as f:
+                f.write(await logo.read())
+
+        try:
+            file_path = await asyncio.wait_for(
+                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="PPT rendering timed out after 90 seconds. Please retry.",
+            )
+
+        with open(file_path, "rb") as f:
+            ppt_bytes = f.read()
+
+        ppt_base64 = base64.b64encode(ppt_bytes).decode()
+        return JSONResponse({
+            "slides": slide_data.get("slides", []),
+            "ppt_base64": ppt_base64,
+        })
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
