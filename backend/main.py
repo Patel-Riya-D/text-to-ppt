@@ -43,7 +43,8 @@ async def generate_ppt(
     topic: str = Form(...),
     num_slides: int = Form(5),
     tone: str = Form("Professional"),
-    logo: UploadFile = File(None)
+    logo: UploadFile = File(None),
+    content_image: UploadFile = File(None),
 ):
     try:
         # Save logo if provided
@@ -54,6 +55,13 @@ async def generate_ppt(
 
             with open(logo_path, "wb") as f:
                 f.write(await logo.read())
+
+        content_image_path = None
+        if content_image:
+            os.makedirs("uploads", exist_ok=True)
+            content_image_path = f"uploads/{content_image.filename}"
+            with open(content_image_path, "wb") as f:
+                f.write(await content_image.read())
 
         # Generate content (bounded timeout so request doesn't hang forever)
         try:
@@ -70,7 +78,7 @@ async def generate_ppt(
         # Build PPT (also bounded)
         try:
             file_path = await asyncio.wait_for(
-                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone),
+                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone, content_image_path),
                 timeout=90,
             )
         except asyncio.TimeoutError:
@@ -93,7 +101,8 @@ async def generate_ppt(
         # Return slides + file
         return JSONResponse({
             "slides": slide_data["slides"],
-            "ppt_base64": ppt_base64
+            "ppt_base64": ppt_base64,
+            "usage": slide_data.get("usage"),
         })
 
     except Exception as e:
@@ -129,6 +138,7 @@ async def build_ppt(
     tone: str = Form("Professional"),
     slides_json: str = Form(...),
     logo: UploadFile = File(None),
+    content_image: UploadFile = File(None),
 ):
     try:
         try:
@@ -143,15 +153,35 @@ async def build_ppt(
             with open(logo_path, "wb") as f:
                 f.write(await logo.read())
 
+        content_image_path = None
+        if content_image:
+            os.makedirs("uploads", exist_ok=True)
+            content_image_path = f"uploads/{content_image.filename}"
+            with open(content_image_path, "wb") as f:
+                f.write(await content_image.read())
+
         try:
             file_path = await asyncio.wait_for(
-                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone),
+                asyncio.to_thread(create_ppt, slide_data, topic, logo_path, tone, content_image_path),
                 timeout=90,
             )
+
         except asyncio.TimeoutError:
             raise HTTPException(
                 status_code=504,
                 detail="PPT rendering timed out after 90 seconds. Please retry.",
+            )
+
+        except Exception as e:
+            import traceback
+            print("\n❌ PPT BUILD ERROR START ----------")
+            print("Error:", str(e))
+            traceback.print_exc()
+            print("❌ PPT BUILD ERROR END ------------\n")
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"PPT build failed: {str(e)}"
             )
 
         with open(file_path, "rb") as f:
