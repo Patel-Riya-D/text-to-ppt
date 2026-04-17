@@ -1,18 +1,142 @@
-# app.py
 """
-app.py — FULLY DYNAMIC CONVERSATIONAL AI ASSISTANT
-===================================================
-FIXES APPLIED:
-  FIX 1: Chat-first UX — PPT previews appear inside chat flow, no scroll issue
-  FIX 2: JSON content parsing — nested dict/list content flattened to clean bullets
-  FIX 3: Type safety — slide_number always cast to int with validation
-- Slot‑filling state machine (no hardcoded flows)
-- Multi‑turn memory with pending intent
-- One clarification question at a time
-- Executes only when all required slots are filled
-- Works for ANY user input (not predefined patterns)
-- Enhanced with PPT reference resolution, semantic search with disambiguation,
-  context override, strict execution rules, and robust failure handling.
+app.py
+======
+
+Frontend conversational interface for the AI PPT Generator system.
+
+Built using Streamlit, this module provides a fully interactive,
+chat-based experience for creating, editing, and managing presentations.
+
+──────────────────────────────────────────────────────────────
+
+💬 Core Features
+
+1. Conversational PPT Creation
+
+   * Users can create presentations using natural language
+   * Example: "Create a PPT on Generative AI with 5 slides"
+
+2. Multi-Turn Chat Intelligence
+
+   * Maintains session memory
+   * Supports follow-up edits:
+
+     * "Edit slide 3"
+     * "Add more points"
+     * "Change tone to formal"
+
+3. Slot-Filling Workflow
+
+   * Dynamically collects required inputs:
+
+     * topic
+     * number of slides
+     * tone
+   * Avoids hardcoded flows
+
+4. Live PPT Preview
+
+   * Displays slides inside chat UI
+   * Shows structured content before final generation
+
+5. PPT Editing System
+
+   * Users can modify:
+
+     * slide titles
+     * bullet points
+     * layouts (chart, timeline, etc.)
+   * Changes reflected instantly
+
+6. PPT History & Switching
+
+   * Maintains multiple generated presentations
+   * Allows switching between them using semantic search
+
+──────────────────────────────────────────────────────────────
+
+🧹 Content Cleaning Layer
+
+To ensure clean output:
+
+* Removes icon tokens (check-circle, handshake, etc.)
+* Strips markdown and emojis
+* Ensures only plain text is displayed in UI
+
+Functions:
+
+* clean_icon_tokens()
+* flatten_slide_content()
+
+──────────────────────────────────────────────────────────────
+
+🔗 Backend Integration
+
+Communicates with FastAPI backend:
+
+* /generate-outline → Generates slide structure
+* /build-ppt       → Generates final PPT file
+
+Handles:
+
+* API requests
+* Response parsing
+* Error handling
+
+──────────────────────────────────────────────────────────────
+
+📦 Session State Management
+
+Uses Streamlit session_state to manage:
+
+* chat history
+* current presentation
+* slide data
+* token usage
+* user inputs
+
+──────────────────────────────────────────────────────────────
+
+🎯 Design Principle
+
+The UI follows a strict conversational model:
+
+```
+User Input → Intent Detection → Slot Filling → API Call → Preview → Edit → Download
+```
+
+No static flows — everything is dynamic and context-aware.
+
+──────────────────────────────────────────────────────────────
+
+🚀 Key Functions
+
+* init_state()
+  Initializes session variables
+
+* flatten_slide_content()
+  Converts structured content into displayable bullets
+
+* render_inline_preview()
+  Displays slides in chat interface
+
+* save_editor_content()
+  Handles user edits to slides
+
+──────────────────────────────────────────────────────────────
+
+🎯 Goal
+
+To provide a seamless, intelligent, and interactive experience for:
+
+* creating presentations
+* editing slides
+* previewing content
+* downloading final PPT
+
+All through natural conversation.
+
+──────────────────────────────────────────────────────────────
 """
 
 import base64
@@ -43,20 +167,101 @@ BUILD_URL   = "http://127.0.0.1:9000/build-ppt"
 st.set_page_config(page_title="AI PPT Chat Builder", page_icon="💬", layout="wide")
 
 # ------------------------------------------------------------------------------
-#  FIX 2: JSON CONTENT FLATTENING UTILITY
+#  GLOBAL ICON / MARKDOWN CLEANING (applies everywhere)
+# ------------------------------------------------------------------------------
+def clean_icon_tokens(text: str) -> str:
+    """
+    Remove all known icon keywords, markdown bold, emojis, and leading symbols.
+    Returns cleaned text or empty string.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    t = str(text)
+    # Remove **any-word** patterns (including **check-circle**)
+    t = re.sub(r'\*\*.*?\*\*', '', t)
+    # Remove known icon words (with underscores, hyphens, spaces)
+    icon_pattern = r'\b(check[-_ ]?circle|handshake|thank_you|trending_up|trending_down|arrow|star|heart|flag|bullet|check|circle)\b'
+    t = re.sub(icon_pattern, '', t, flags=re.IGNORECASE)
+    # Remove :emoji_name:
+    t = re.sub(r':[a-z_\-]{2,30}:', '', t)
+    # Remove actual emoji characters
+    t = re.sub(r'[\U0001F300-\U0001F6FF]', '', t)
+    # Remove leading symbols (bullets, arrows, etc.)
+    t = re.sub(r'^[\-\–\—\•\▸\▹\►\→\✓\✔\s]+', '', t)
+    # Normalise spaces
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+_SAFE_BULLET_ICONS = {"▸", "◆", "✓", "•", "●", "▪", "‣", "→", "➜", "➤", "▶", "►"}
+
+
+def clean_bullet_icon(icon: str, fallback: str = "▸") -> str:
+    """Keep bullet icons to a safe glyph set so text tokens never render literally."""
+    token = str(icon).strip() if icon is not None else ""
+    if not token:
+        return fallback
+    if token in _SAFE_BULLET_ICONS:
+        return token
+    if len(token) == 1 and not token.isalnum() and not token.isspace():
+        return token
+    return fallback
+
+# ------------------------------------------------------------------------------
+#  COLOR EXTRACTION UTILITIES
+# ------------------------------------------------------------------------------
+_COLOR_NAMES = {
+    "red", "blue", "green", "yellow", "orange", "purple", "pink",
+    "cyan", "teal", "white", "black", "gray", "grey", "navy", "gold",
+    "silver", "brown", "indigo", "violet", "magenta", "lime",
+    "dark blue", "light blue", "dark green", "light green",
+    "dark red", "light red", "mint", "lavender", "coral"
+}
+
+def extract_theme_colors(text: str) -> dict:
+    """Extract primary/secondary color names from natural language."""
+    if not text:
+        return {}
+    lower = text.lower()
+    colors = {}
+    # Pattern: "X and Y theme/color"
+    m = re.search(
+        r'(\b(?:dark|light)?\s*\w+)\s+and\s+(\b(?:dark|light)?\s*\w+)\s*(?:theme|color|colors|palette)',
+        lower
+    )
+    if m:
+        c1, c2 = m.group(1).strip(), m.group(2).strip()
+        if c1 in _COLOR_NAMES:
+            colors["primary"] = c1
+        if c2 in _COLOR_NAMES:
+            colors["secondary"] = c2
+    if not colors:
+        m = re.search(r'(\b(?:dark|light)?\s*\w+)\s+(?:theme|color|colors)', lower)
+        if m:
+            c = m.group(1).strip()
+            if c in _COLOR_NAMES:
+                colors["primary"] = c
+    if not colors:
+        m = re.search(r'with\s+(\w+)\s+and\s+(\w+)', lower)
+        if m:
+            c1, c2 = m.group(1), m.group(2)
+            if c1 in _COLOR_NAMES:
+                colors["primary"] = c1
+            if c2 in _COLOR_NAMES:
+                colors["secondary"] = c2
+    return colors
+
+# ------------------------------------------------------------------------------
+#  JSON CONTENT FLATTENING WITH CLEANING
 # ------------------------------------------------------------------------------
 def _flatten_content_item(item) -> list:
-    """
-    Recursively flatten a content item (str, dict, list) into plain strings.
-    Handles nested structures like {'header': '...', 'points': [...]}
-    """
+    """Recursively flatten a content item and clean icon tokens."""
     if item is None:
         return []
     if isinstance(item, str):
         s = item.strip()
         if not s:
             return []
-        # Detect if it looks like a JSON/dict string and try to parse it
         if s.startswith("{") or s.startswith("["):
             try:
                 parsed = json.loads(s)
@@ -68,50 +273,52 @@ def _flatten_content_item(item) -> list:
                 return _flatten_content_item(parsed)
             except Exception:
                 pass
-        return [s]
+        cleaned = clean_icon_tokens(s)
+        return [cleaned] if cleaned else []
     if isinstance(item, dict):
         results = []
-        # Common pattern: {'header': '...', 'points': [...]}
         header = item.get("header") or item.get("title") or item.get("label") or ""
         points = item.get("points") or item.get("items") or item.get("content") or []
         detail = item.get("detail") or item.get("description") or item.get("text") or ""
         if header and points:
-            results.append(str(header).strip())
+            cleaned_header = clean_icon_tokens(header)
+            if cleaned_header:
+                results.append(cleaned_header)
             for p in (points if isinstance(points, list) else [points]):
                 results.extend(_flatten_content_item(p))
         elif header and detail:
-            results.append(f"{str(header).strip()}: {str(detail).strip()}")
+            combined = f"{header}: {detail}"
+            cleaned = clean_icon_tokens(combined)
+            if cleaned:
+                results.append(cleaned)
         elif header:
-            results.append(str(header).strip())
+            cleaned = clean_icon_tokens(header)
+            if cleaned:
+                results.append(cleaned)
         elif detail:
-            results.append(str(detail).strip())
+            cleaned = clean_icon_tokens(detail)
+            if cleaned:
+                results.append(cleaned)
         elif points:
             for p in (points if isinstance(points, list) else [points]):
                 results.extend(_flatten_content_item(p))
         else:
-            # fallback: join all values
             for v in item.values():
                 if v and isinstance(v, (str, int, float)):
-                    results.append(str(v).strip())
+                    results.append(clean_icon_tokens(str(v)))
         return [r for r in results if r]
     if isinstance(item, list):
         results = []
         for sub in item:
             results.extend(_flatten_content_item(sub))
         return results
-    # int, float, bool etc.
-    return [str(item).strip()]
-
+    return [clean_icon_tokens(str(item))] if item else []
 
 def flatten_slide_content(content) -> list:
-    """
-    Convert any content value (str, list, dict with nested structures)
-    into a clean list of plain bullet strings.
-    """
+    """Convert any content value into a clean list of plain bullet strings."""
     if content is None:
         return []
     if isinstance(content, str):
-        # Could be a JSON string
         stripped = content.strip()
         if stripped.startswith("[") or stripped.startswith("{"):
             try:
@@ -124,18 +331,16 @@ def flatten_slide_content(content) -> list:
                 return flatten_slide_content(parsed)
             except Exception:
                 pass
-        # Plain string — treat as single bullet or split by newlines
-        lines = [l.strip() for l in stripped.splitlines() if l.strip()]
-        return lines if lines else ([stripped] if stripped else [])
+        lines = [clean_icon_tokens(l) for l in stripped.splitlines() if clean_icon_tokens(l)]
+        return lines if lines else ([clean_icon_tokens(stripped)] if stripped else [])
     if isinstance(content, list):
         result = []
         for item in content:
             result.extend(_flatten_content_item(item))
-        return [r for r in result if r]
+        return [clean_icon_tokens(r) for r in result if clean_icon_tokens(r)]
     if isinstance(content, dict):
-        return _flatten_content_item(content)
-    return [str(content).strip()] if content else []
-
+        return flatten_slide_content(list(content.values()))
+    return [clean_icon_tokens(str(content))] if content else []
 
 # ------------------------------------------------------------------------------
 #  STATE INIT
@@ -184,14 +389,9 @@ init_state()
 def add_message(role, content):
     st.session_state.messages.append({"role": role, "content": content})
 
-
 def add_message_with_preview(role: str, text: str, preview_slides: list = None,
                               ppt_label: str = "", ppt_bytes: bytes = None,
                               ppt_filename: str = ""):
-    """
-    FIX 1: Store a message that contains both text and an optional PPT preview.
-    Preview is stored as structured data so it renders inside the chat message.
-    """
     entry = {
         "role": role,
         "content": text,
@@ -204,7 +404,6 @@ def add_message_with_preview(role: str, text: str, preview_slides: list = None,
         entry["ppt_filename"] = ppt_filename
     st.session_state.messages.append(entry)
 
-
 def extract_chat_input(value):
     if value is None:
         return None, []
@@ -213,7 +412,6 @@ def extract_chat_input(value):
     text = getattr(value, "text", None)
     files = getattr(value, "files", None) or []
     return text, files
-
 
 def usage_to_dict(usage):
     if not usage:
@@ -224,7 +422,6 @@ def usage_to_dict(usage):
         "total_tokens":      int(getattr(usage, "total_tokens", 0) or 0),
     }
 
-
 def record_usage(kind: str, usage: dict):
     if not usage:
         return
@@ -233,17 +430,15 @@ def record_usage(kind: str, usage: dict):
         totals[k] += int(usage.get(k, 0) or 0)
     st.session_state.last_usage = {"kind": kind, **usage}
 
-
 def ensure_editor_id(slide: dict) -> dict:
     slide = dict(slide or {})
     slide.setdefault("_editor_id", uuid4().hex)
     slide.setdefault("title", "Untitled Slide")
     slide.setdefault("subtitle", "")
     slide.setdefault("layout", "bullets")
-    slide.setdefault("icon", "▸")
+    slide["icon"] = clean_bullet_icon(slide.get("icon", "▸"))
     slide.setdefault("content", [])
     slide.setdefault("style", {})
-    # FIX 2: Always flatten content when loading a slide
     if not isinstance(slide["content"], list):
         slide["content"] = flatten_slide_content(slide["content"])
     else:
@@ -252,16 +447,13 @@ def ensure_editor_id(slide: dict) -> dict:
         slide["style"] = {}
     return slide
 
-
 def normalize_slide(slide: dict) -> dict:
     return ensure_editor_id(slide or {})
-
 
 def reset_editor_widget_state():
     keys = [k for k in st.session_state.keys() if re.match(r"^[tslc]_[0-9a-f]{32}$", k)]
     for key in keys:
         st.session_state.pop(key, None)
-
 
 def prime_editor_widget_state(slide: dict, force: bool = False):
     sid = slide.get("_editor_id")
@@ -277,19 +469,16 @@ def prime_editor_widget_state(slide: dict, force: bool = False):
         if force or key not in st.session_state:
             st.session_state[key] = value
 
-
 def sync_all_editor_widgets(slides: list):
     reset_editor_widget_state()
     for slide in slides:
         if isinstance(slide, dict):
             prime_editor_widget_state(slide, force=True)
 
-
 def bullets_to_text(items) -> str:
     if not isinstance(items, list):
         return ""
     return "\n".join(str(x).strip() for x in items if str(x).strip())
-
 
 def text_to_bullets(value: str) -> list:
     bullets = []
@@ -299,12 +488,10 @@ def text_to_bullets(value: str) -> list:
             bullets.append(c)
     return bullets
 
-
 def seq_icon(idx: int) -> str:
     if 0 <= idx < 26:
         return chr(ord("A") + idx)
     return str(idx + 1)
-
 
 def normalize_icon_grid_items(slide: dict, text: str = "") -> list:
     items = slide.get("grid_items", []) if isinstance(slide, dict) else []
@@ -321,7 +508,6 @@ def normalize_icon_grid_items(slide: dict, text: str = "") -> list:
             cleaned.append({"icon": icon, "title": title, "detail": detail})
     if cleaned:
         return cleaned[:4]
-
     source = str(text or "").strip()
     parsed_items = None
     if source:
@@ -340,7 +526,6 @@ def normalize_icon_grid_items(slide: dict, text: str = "") -> list:
                     parsed_items = parsed
             except Exception:
                 parsed_items = None
-
     if isinstance(parsed_items, list):
         for i, item in enumerate(parsed_items):
             if not isinstance(item, dict):
@@ -353,7 +538,6 @@ def normalize_icon_grid_items(slide: dict, text: str = "") -> list:
             cleaned.append({"icon": icon, "title": title, "detail": detail})
         if cleaned:
             return cleaned[:4]
-
     for i, line in enumerate(text_to_bullets(source)):
         if len(cleaned) >= 4:
             break
@@ -379,7 +563,6 @@ def normalize_icon_grid_items(slide: dict, text: str = "") -> list:
         if title:
             cleaned.append({"icon": seq_icon(i), "title": title, "detail": detail})
     return cleaned[:4]
-
 
 def get_editor_content(slide: dict) -> str:
     layout = slide.get("layout", "bullets")
@@ -440,9 +623,7 @@ def get_editor_content(slide: dict) -> str:
     elif layout == "section_index":
         secs = slide.get("sections", []) or slide.get("content", []) or []
         return bullets_to_text(secs)
-    # FIX 2: flatten before display
     return bullets_to_text(flatten_slide_content(slide.get("content", [])))
-
 
 def save_editor_content(slide: dict, text: str) -> dict:
     layout = slide.get("layout", "bullets")
@@ -521,34 +702,29 @@ def save_editor_content(slide: dict, text: str) -> dict:
         slide["content"] = lines
     return slide
 
-
 # ------------------------------------------------------------------------------
-#  FIX 1: CHAT-INLINE PREVIEW RENDERER
+#  CHAT-INLINE PREVIEW RENDERER (simplified – content already cleaned)
 # ------------------------------------------------------------------------------
-# ── REPLACE render_inline_preview ──────────────────────────────────────────
 def render_inline_preview(slides: list, label: str = "", ppt_bytes: bytes = None,
                            ppt_filename: str = "presentation.pptx", key_suffix: str = ""):
     if not slides:
         st.caption("No slides to preview.")
         return
-
     header = f"📊 **{label}**" if label else "📊 **Presentation Preview**"
     st.markdown(header)
     st.caption(f"{len(slides)} slides")
-
     for idx, slide in enumerate(slides, start=1):
         if not isinstance(slide, dict):
             continue
         title = slide.get("title", f"Slide {idx}")
         layout = slide.get("layout", "bullets")
         subtitle = slide.get("subtitle", "")
-
         with st.expander(f"Slide {idx}: {title}  `{layout}`", expanded=(idx == 1)):
             if subtitle:
                 st.markdown(f"*{subtitle}*")
             content = flatten_slide_content(slide.get("content", []))
             if content:
-                for item in content[:6]:
+                for item in content:
                     st.markdown(f"- {item}")
             if layout == "two_column":
                 col1, col2 = st.columns(2)
@@ -562,32 +738,48 @@ def render_inline_preview(slides: list, label: str = "", ppt_bytes: bytes = None
                         st.markdown(f"- {pt}")
             elif layout == "big_stat":
                 st.metric(
-                    label=slide.get("stat_label", ""),
-                    value=slide.get("stat", "—")
+                    label=clean_icon_tokens(slide.get("stat_label", "")),
+                    value=clean_icon_tokens(slide.get("stat", "—"))
                 )
             elif layout == "timeline":
                 steps = slide.get("steps", []) or []
                 for s in steps[:5]:
                     if isinstance(s, dict):
-                        st.markdown(f"**{s.get('label', '')}** — {s.get('detail', '')}")
+                        label_clean = clean_icon_tokens(s.get("label", ""))
+                        detail_clean = clean_icon_tokens(s.get("detail", ""))
+                        if label_clean or detail_clean:
+                            st.markdown(f"**{label_clean}** — {detail_clean}")
             elif layout == "icon_grid":
                 items = slide.get("grid_items", []) or []
                 for g in items[:4]:
                     if isinstance(g, dict):
-                        st.markdown(f"{g.get('icon', '•')} **{g.get('title', '')}** — {g.get('detail', '')}")
+                        title_clean = clean_icon_tokens(g.get("title", ""))
+                        detail_clean = clean_icon_tokens(g.get("detail", ""))
+                        if title_clean or detail_clean:
+                            st.markdown(f"{g.get('icon', '•')} **{title_clean}** — {detail_clean}")
             elif layout == "chart":
                 data = slide.get("chart_data", []) or []
+                chart_title = clean_icon_tokens(slide.get("chart_title", slide.get("title", "")))
                 for d in data[:5]:
                     if isinstance(d, dict):
+                        lbl = clean_icon_tokens(d.get("label", ""))
                         val = d.get("value", 0)
-                        lbl = d.get("label", "")
-                        st.markdown(f"- {lbl}: **{val}**")
+                        if lbl:
+                            st.markdown(f"- {lbl}: **{val}**")
+                if chart_title:
+                    st.caption(f"Chart: {chart_title}")
+                extra = flatten_slide_content(slide.get("content", []))
+                if extra:
+                    st.markdown("**Key Takeaways**")
+                    for item in extra[:4]:
+                        st.markdown(f"- {item}")
             elif layout == "case_study":
-                if slide.get("company"):
-                    st.markdown(f"🏢 **{slide['company']}**")
-                if slide.get("result"):
-                    st.markdown(f"✅ {slide['result']}")
-
+                company = clean_icon_tokens(slide.get("company", ""))
+                result = clean_icon_tokens(slide.get("result", ""))
+                if company:
+                    st.markdown(f"🏢 **{company}**")
+                if result:
+                    st.markdown(f"✅ {result}")
     if ppt_bytes is not None:
         dl_key = f"dl_{key_suffix}" if key_suffix else f"dl_{abs(hash(ppt_filename + str(len(slides))))}"
         st.download_button(
@@ -600,8 +792,6 @@ def render_inline_preview(slides: list, label: str = "", ppt_bytes: bytes = None
             key=dl_key,
         )
 
-
-# ── REPLACE render_message ─────────────────────────────────────────────────
 def render_message(msg: dict, msg_index: int = 0):
     role = msg["role"]
     with st.chat_message(role):
@@ -621,7 +811,6 @@ def render_message(msg: dict, msg_index: int = 0):
 def next_ppt_id() -> str:
     return f"ppt_{len(st.session_state.get('ppt_history', [])) + 1}"
 
-
 def _upsert_ppt_history(ppt_id: str, **fields):
     history = st.session_state.setdefault("ppt_history", [])
     for item in history:
@@ -632,13 +821,11 @@ def _upsert_ppt_history(ppt_id: str, **fields):
     record.update(fields)
     history.append(record)
 
-
 def get_ppt_by_id(ppt_id: str):
     for item in st.session_state.get("ppt_history", []):
         if item.get("id") == ppt_id:
             return item
     return None
-
 
 def ppt_sections_preview(item: dict):
     sections = (item or {}).get("sections") or ""
@@ -650,9 +837,7 @@ def ppt_sections_preview(item: dict):
     preview = ", ".join([t for t in titles[2:6] if t]) if len(titles) > 2 else ", ".join([t for t in titles[:4] if t])
     return preview or "—"
 
-
 def semantic_search_ppts(query: str) -> List[Dict]:
-    """Return list of PPTs with relevance scores (sorted)."""
     history = st.session_state.get("ppt_history", [])
     if not history:
         return []
@@ -702,7 +887,6 @@ PPTs:
         pass
     return []
 
-
 def find_ppt_semantically(query: str, disambiguate: bool = False) -> Tuple[Optional[str], Optional[str]]:
     ranked = semantic_search_ppts(query)
     if not ranked:
@@ -722,7 +906,6 @@ def find_ppt_semantically(query: str, disambiguate: bool = False) -> Tuple[Optio
             return None, question
     return high_conf[0]["id"], None
 
-
 def switch_active_ppt(ppt_id: str) -> bool:
     item = get_ppt_by_id(ppt_id)
     if not item:
@@ -739,7 +922,6 @@ def switch_active_ppt(ppt_id: str) -> bool:
         sync_all_editor_widgets(item["outline_payload"].get("slides", []))
     st.session_state.pending_intent = None
     return True
-
 
 def resolve_ppt_reference(user_input: str) -> Tuple[bool, Optional[str], Optional[str]]:
     override_patterns = [
@@ -779,7 +961,6 @@ def resolve_ppt_reference(user_input: str) -> Tuple[bool, Optional[str], Optiona
             return False, None, "No previous presentation found."
     return False, None, None
 
-
 # ------------------------------------------------------------------------------
 #  SLOT-FILLING CONVERSATIONAL AGENT
 # ------------------------------------------------------------------------------
@@ -796,7 +977,6 @@ class ConversationalAgent:
         "greeting": [],
         "smalltalk": [],
     }
-
     def __init__(self):
         self.state = {
             "intent": None,
@@ -805,15 +985,12 @@ class ConversationalAgent:
             "next_question": None,
             "action": "ask",
         }
-
     def load_state(self):
         pending = st.session_state.get("pending_intent")
         if pending:
             self.state = pending
-
     def save_state(self):
         st.session_state["pending_intent"] = self.state
-
     def clear_state(self):
         self.state = {
             "intent": None,
@@ -823,7 +1000,6 @@ class ConversationalAgent:
             "action": "ask",
         }
         st.session_state["pending_intent"] = None
-
     def process(self, user_input: str, context: dict) -> Tuple[str, Optional[Dict], bool]:
         self.load_state()
         prompt = self._build_prompt(user_input, context)
@@ -845,22 +1021,18 @@ class ConversationalAgent:
             missing = data.get("missing_slots", [])
             next_q = data.get("next_question")
             action = data.get("action", "ask")
-
             if self.state["intent"] == new_intent:
                 merged_slots = {**self.state["slots"], **new_slots}
             else:
                 merged_slots = new_slots
                 self.state["intent"] = new_intent
-
             self.state["slots"] = merged_slots
             self.state["missing_slots"] = missing
             self.state["next_question"] = next_q
             self.state["action"] = action
-
             if action == "ask" and missing:
                 self.save_state()
                 return next_q, None, False
-
             if action == "execute" or not missing:
                 action_data = {
                     "intent": self.state["intent"],
@@ -871,19 +1043,15 @@ class ConversationalAgent:
             else:
                 self.save_state()
                 return next_q or "Could you please provide more information?", None, False
-
         except Exception as e:
             st.error(f"Agent error: {e}")
             return "Sorry, I had trouble understanding. Could you rephrase?", None, False
-
     def _build_prompt(self, user_input: str, context: dict) -> str:
         current_intent = self.state.get("intent")
         current_slots = self.state.get("slots", {})
         current_missing = self.state.get("missing_slots", [])
-
         slides_summary = summarize_slides_for_llm(context.get("slides", []))
         has_deck = context.get("has_deck", False)
-
         prompt = f"""
 You are a conversational AI assistant for building presentations. Your job is to fill in missing information (slots) for the user's intent.
 
@@ -937,29 +1105,25 @@ Return ONLY valid JSON. No extra text.
 """
         return prompt
 
-
 # ------------------------------------------------------------------------------
-#  FIX 1 + FIX 3: ACTION EXECUTORS
+#  ACTION EXECUTORS
 # ------------------------------------------------------------------------------
 def commit_changes(updated_slides, success_msg):
     st.session_state.outline_payload["slides"] = updated_slides
     sync_all_editor_widgets(updated_slides)
-    ppt_bytes = rebuild_ppt_from_outline()  # capture return value directly
-
+    ppt_bytes = rebuild_ppt_from_outline()
     ppt_id = st.session_state.get("current_ppt_id", "")
     topic = st.session_state.get("topic", "Presentation")
     label = f"Updated Preview — {topic} ({ppt_id})"
-
     add_message_with_preview(
         role="assistant",
         text=success_msg,
         preview_slides=updated_slides,
         ppt_label=label,
-        ppt_bytes=ppt_bytes,  # use captured value, not session_state
+        ppt_bytes=ppt_bytes,
         ppt_filename=st.session_state.get("ppt_filename", "presentation.pptx"),
     )
     st.rerun()
-
 
 def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     if intent in ("edit_slide", "add_slide", "delete_slide", "preview_ppt", "download_ppt"):
@@ -974,26 +1138,71 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         sections = slots.get("sections", "")
         if not topic or not slide_count:
             return "Missing topic or slide count for creation.", False
-        # FIX 3: ensure slide_count is int
         try:
             slide_count = int(slide_count)
         except (ValueError, TypeError):
             return "Slide count must be a number. Please provide a valid number.", False
-        generate_outline_and_reply(topic, slide_count, st.session_state.tone, sections or None)
+
+        # Extract colors from the full original user message
+        all_messages = st.session_state.get("messages", [])
+        last_user_msg = next((m["content"] for m in reversed(all_messages) if m["role"] == "user"), "")
+        theme_colors = extract_theme_colors(last_user_msg) or extract_theme_colors(topic)
+
+        # Remove color phrases from topic to avoid duplication in slide titles
+        color_pattern = r'\b(?:in\s+)?(?:dark\s+|light\s+)?(?:' + '|'.join(_COLOR_NAMES) + r')\s*(?:and\s+(?:dark\s+|light\s+)?(?:' + '|'.join(_COLOR_NAMES) + r'))?\s*(?:theme|color|colors|palette|scheme)?\b'
+        topic_clean = re.sub(color_pattern, '', topic, flags=re.IGNORECASE).strip().strip(',').strip()
+        topic_final = topic_clean if len(topic_clean) > 3 else topic
+
+        generate_outline_and_reply(topic_final, slide_count, st.session_state.tone, sections or None, theme_colors)
         return "Generating presentation...", True
 
     elif intent == "edit_slide":
         slide_num = slots.get("slide_number")
         change_content = slots.get("change_content")
-        # FIX 3: always cast to int with validation
         try:
             slide_num = int(slide_num)
         except (ValueError, TypeError):
-            return "Please provide a valid slide number (e.g. 'edit slide 3').", False
+            return "Please provide a valid slide number.", False
         if not change_content:
             return "Missing change content for editing.", False
         if slide_num < 1 or slide_num > len(slides):
-            return f"Slide {slide_num} doesn't exist. The deck has {len(slides)} slide(s). Please provide a valid slide number.", False
+            return f"Slide {slide_num} doesn't exist. Deck has {len(slides)} slides.", False
+
+        # SPECIAL HANDLE: "add bullet points" - use direct fallback, skip LLM
+        if "add" in change_content.lower() and re.search(r'\d+\s*points?', change_content.lower()):
+            num_match = re.search(r'(\d+)\s*points?', change_content.lower())
+            num = int(num_match.group(1)) if num_match else 2
+            slide = slides[slide_num - 1]
+            if slide.get("layout") != "bullets":
+                slide["layout"] = "bullets"
+            prompt = f"Generate {num} short bullet points about: {slide.get('title')}. Return only as JSON list of strings."
+            resp = _client.chat.completions.create(
+                model=AZURE_DEPLOYMENT,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith('['):
+                new_points = json.loads(raw)
+            else:
+                match = re.search(r'\[.*\]', raw, re.DOTALL)
+                new_points = json.loads(match.group()) if match else []
+            if new_points:
+                # Clean the generated points immediately
+                new_points = [clean_icon_tokens(pt) for pt in new_points if clean_icon_tokens(pt)]
+                existing = slide.get("content", [])
+                for pt in new_points:
+                    if pt not in existing:
+                        existing.append(pt)
+                slide["content"] = existing
+                updated_slides = refresh_section_index_slide(slides)
+                commit_changes(updated_slides, f"✅ Added {num} bullet points to slide {slide_num}.")
+                return f"Added {num} bullet points to slide {slide_num}.", True
+            else:
+                return "Failed to generate bullet points. Please try again.", False
+
+        # For all other edits (remove, change, etc.), use the LLM
         edit_prompt = f"Edit slide {slide_num}: {change_content}"
         target_layout = slides[slide_num - 1].get("layout", "bullets")
         if target_layout in ("section_index", "title_cover") and "point" in change_content.lower():
@@ -1002,13 +1211,43 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             result, usage = interpret_edit_with_llm(edit_prompt, slides)
             record_usage("edit", usage)
             if result.get("action") == "edit":
-                # FIX 2: flatten all content after LLM edit
                 raw_slides = result.get("slides", [])
+                # Clean content of each edited slide
+                for s in raw_slides:
+                    if "content" in s and isinstance(s["content"], list):
+                        s["content"] = [clean_icon_tokens(item) for item in s["content"] if clean_icon_tokens(item)]
+                    if "left_points" in s:
+                        s["left_points"] = [clean_icon_tokens(p) for p in s["left_points"] if clean_icon_tokens(p)]
+                    if "right_points" in s:
+                        s["right_points"] = [clean_icon_tokens(p) for p in s["right_points"] if clean_icon_tokens(p)]
                 cleaned = [ensure_editor_id(s) for s in raw_slides]
                 updated_slides = refresh_section_index_slide(cleaned)
                 commit_changes(updated_slides, f"✅ Slide {slide_num} updated.")
                 return f"Slide {slide_num} updated.", True
             else:
+                if "add" in change_content.lower() and re.search(r'\d+\s*points?', change_content.lower()):
+                    num_match = re.search(r'(\d+)\s*points?', change_content.lower())
+                    num = int(num_match.group(1)) if num_match else 2
+                    slide = slides[slide_num - 1]
+                    prompt = f"Generate {num} short bullet points about: {slide.get('title')}. Return only as JSON list of strings."
+                    resp = _client.chat.completions.create(
+                        model=AZURE_DEPLOYMENT,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.4,
+                        max_tokens=300,
+                    )
+                    raw = resp.choices[0].message.content.strip()
+                    if raw.startswith('['):
+                        new_points = json.loads(raw)
+                    else:
+                        match = re.search(r'\[.*\]', raw, re.DOTALL)
+                        new_points = json.loads(match.group()) if match else []
+                    if new_points:
+                        new_points = [clean_icon_tokens(pt) for pt in new_points if clean_icon_tokens(pt)]
+                        slide['content'].extend(new_points)
+                        updated_slides = refresh_section_index_slide(slides)
+                        commit_changes(updated_slides, f"✅ Added {num} bullet points to slide {slide_num}.")
+                        return f"Added {num} bullet points to slide {slide_num}.", True
                 return result.get("question", "Edit failed. Please rephrase."), False
         except Exception as e:
             return f"Edit failed: {e}", False
@@ -1039,7 +1278,6 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                     else:
                         idx = len(slides) + 1
             else:
-                # FIX 3: cast to int
                 try:
                     idx = min(max(1, int(position)), len(slides) + 1)
                 except (ValueError, TypeError):
@@ -1054,7 +1292,6 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
 
     elif intent == "delete_slide":
         slide_num = slots.get("slide_number")
-        # FIX 3: cast to int with validation
         try:
             slide_num = int(slide_num)
         except (ValueError, TypeError):
@@ -1110,7 +1347,6 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             else:
                 return "I couldn't find that PPT.", False
         else:
-            # Show current
             outline = st.session_state.get("outline_payload")
             if outline and outline.get("slides"):
                 preview_slides = outline["slides"]
@@ -1162,7 +1398,6 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     else:
         return "I'm not sure how to help with that. Could you rephrase?", False
 
-
 # ------------------------------------------------------------------------------
 #  LLM HELPERS (edit, draft)
 # ------------------------------------------------------------------------------
@@ -1182,7 +1417,6 @@ def summarize_slides_for_llm(slides: list) -> list:
             "content_preview": [str(x).strip() for x in content[:3] if str(x).strip()],
         })
     return summary
-
 
 def extract_first_json(text: str) -> dict:
     text = text.strip()
@@ -1210,30 +1444,28 @@ def extract_first_json(text: str) -> dict:
                     return json.loads(text[start:i + 1])
     raise ValueError("Unbalanced braces")
 
-
 def interpret_edit_with_llm(user_text, slides):
     prompt = f"""
-You are an AI presentation editor.
+You are an AI presentation editor. You MUST preserve existing content and only modify as requested.
 
-User request:
-{user_text}
+User request: {user_text}
 
 Current slides (FULL DECK):
 {json.dumps(slides, indent=2)}
 
 RULES:
-- Return the ENTIRE updated slides array.
-- If the request is vague, generate 2 relevant bullet points based on the slide's title.
-- If the request contains "add X bullet points", generate exactly X.
-- If a slide layout does not support bullet points (section_index, title_cover), change layout to 'bullets' and add content.
-- Preserve all other data.
-- Content fields must be plain string arrays — never nested dicts or lists inside content.
+1. Identify the slide number from the request (e.g., "slide 9").
+2. For that slide, **KEEP ALL EXISTING CONTENT**.
+3. If the request says "add X bullet points", generate X new, relevant bullet points based on the slide's title and existing content, and **APPEND** them to the existing content list.
+4. Do NOT remove or replace any existing bullet points.
+5. If the request says "change" or "replace", then you may modify, but for "add" you must only append.
+6. Return the ENTIRE updated slides array with all other slides unchanged.
+7. Content fields must be plain string arrays – no nested dicts.
 
 Return ONLY valid JSON:
 {{
-  "action": "edit" | "clarify",
-  "slides": [ ... full updated slides array ... ],
-  "question": "..."  // only for clarify
+  "action": "edit",
+  "slides": [ ... full updated slides array ... ]
 }}
 """
     response = _client.chat.completions.create(
@@ -1245,11 +1477,19 @@ Return ONLY valid JSON:
     raw = response.choices[0].message.content
     try:
         data = extract_first_json(raw)
+        # Clean content in the edited slides
+        if "slides" in data:
+            for s in data["slides"]:
+                if "content" in s and isinstance(s["content"], list):
+                    s["content"] = [clean_icon_tokens(item) for item in s["content"] if clean_icon_tokens(item)]
+                if "left_points" in s:
+                    s["left_points"] = [clean_icon_tokens(p) for p in s["left_points"] if clean_icon_tokens(p)]
+                if "right_points" in s:
+                    s["right_points"] = [clean_icon_tokens(p) for p in s["right_points"] if clean_icon_tokens(p)]
         return data, usage
     except Exception as e:
         st.error(f"JSON parse error: {e}\nRaw output: {raw[:500]}")
         raise ValueError("Invalid JSON from LLM")
-
 
 def draft_slide_from_request(user_text: str, slides: list):
     titles = [str(s.get("title", "")).strip() for s in (slides or []) if isinstance(s, dict)]
@@ -1274,6 +1514,13 @@ Choose the most appropriate layout.
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("Invalid slide JSON")
+    # Clean the content immediately
+    if "content" in data and isinstance(data["content"], list):
+        data["content"] = [clean_icon_tokens(item) for item in data["content"] if clean_icon_tokens(item)]
+    if "left_points" in data:
+        data["left_points"] = [clean_icon_tokens(p) for p in data["left_points"] if clean_icon_tokens(p)]
+    if "right_points" in data:
+        data["right_points"] = [clean_icon_tokens(p) for p in data["right_points"] if clean_icon_tokens(p)]
     data.setdefault("title", "New Slide")
     data.setdefault("subtitle", "")
     data.setdefault("layout", "bullets")
@@ -1282,51 +1529,38 @@ Choose the most appropriate layout.
     data.setdefault("style", {})
     return data
 
-
 # ------------------------------------------------------------------------------
 #  OUTLINE GENERATION
 # ------------------------------------------------------------------------------
 def has_asked(step: str) -> bool:
     return step in st.session_state.get("asked_steps", [])
-
-
 def mark_asked(step: str):
     asked = st.session_state.get("asked_steps", [])
     if step not in asked:
         asked.append(step)
         st.session_state["asked_steps"] = asked
-
-
 def build_outline_topic(topic: str, sections) -> str:
     base = (topic or "").strip() or "Presentation"
     if sections:
         return f"{base}. Include sections: {sections}."
     return base
 
-
-def request_outline(topic: str, num_slides: int, tone: str, sections=None) -> dict:
+def request_outline(topic: str, num_slides: int, tone: str, sections=None, theme_colors=None) -> dict:
     topic_for_outline = build_outline_topic(topic, sections)
-    resp = requests.post(
-        OUTLINE_URL,
-        data={"topic": topic_for_outline, "num_slides": num_slides, "tone": tone},
-        timeout=(10, 180),
-    )
+    data = {"topic": topic_for_outline, "num_slides": num_slides, "tone": tone}
+    if theme_colors:
+        data["theme_colors"] = json.dumps(theme_colors)
+    resp = requests.post(OUTLINE_URL, data=data, timeout=(10, 180))
     if resp.status_code != 200:
         raise RuntimeError(resp.text)
     payload = resp.json()
     usage = payload.get("usage")
     if isinstance(usage, dict):
         record_usage("outline", usage)
-    # FIX 2: ensure_editor_id already flattens content via updated ensure_editor_id
-    slides = [
-        ensure_editor_id(s) for s in payload.get("slides", [])
-    ]
-
-    slides = enforce_slide_count(slides, num_slides, topic, tone)
-
+    slides = [ensure_editor_id(s) for s in payload.get("slides", [])]
+    slides = enforce_slide_count(slides, num_slides, topic, tone, theme_colors)
     payload["slides"] = slides
     return payload
-
 
 def summarize_outline(slides: list) -> str:
     if not slides:
@@ -1337,16 +1571,15 @@ def summarize_outline(slides: list) -> str:
     lines.append("\nAsk me in chat if you want any changes.")
     return "\n".join(lines)
 
-def enforce_slide_count(slides, required_count, topic, tone):
+def enforce_slide_count(slides, required_count, topic, tone, theme_colors=None):
     slides = slides or []
     if len(slides) > required_count:
         return slides[:required_count]
-
     max_attempts = 5
     attempts = 0
     while len(slides) < required_count and attempts < max_attempts:
         missing = required_count - len(slides)
-        extra_data = generate_slide_content(topic, missing, tone)
+        extra_data = generate_slide_content(topic, missing, tone, theme_colors)
         extra_slides = extra_data.get("slides", [])
         if len(extra_slides) > missing:
             extra_slides = extra_slides[-missing:]
@@ -1354,13 +1587,12 @@ def enforce_slide_count(slides, required_count, topic, tone):
             break
         slides.extend(extra_slides)
         attempts += 1
-
     return slides[:required_count]
 
-def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None):
+def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None, theme_colors=None):
     with st.spinner(f"✍️ Building {count}-slide deck on '{topic}'…"):
         try:
-            payload = request_outline(topic, count, tone, sections)
+            payload = request_outline(topic, count, tone, sections, theme_colors)
             payload["slides"] = payload.get("slides", [])[:count]
             st.session_state.outline_payload = payload
             st.session_state.topic = topic
@@ -1380,18 +1612,16 @@ def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None)
                 file_path=None,
             )
             sync_all_editor_widgets(payload.get("slides", []))
-            ppt_bytes = rebuild_ppt_from_outline()  # capture return value directly
-
+            ppt_bytes = rebuild_ppt_from_outline()
             reply_text = summarize_outline(payload.get("slides", []))
             slides_for_preview = payload.get("slides", [])
             label = f"Preview — {topic} ({ppt_id})"
-
             add_message_with_preview(
                 role="assistant",
                 text=reply_text,
                 preview_slides=slides_for_preview,
                 ppt_label=label,
-                ppt_bytes=ppt_bytes,  # use captured value, not session_state
+                ppt_bytes=ppt_bytes,
                 ppt_filename=st.session_state.get("ppt_filename", "presentation.pptx"),
             )
             st.rerun()
@@ -1438,15 +1668,11 @@ def rebuild_ppt_from_outline() -> bytes | None:
             st.session_state.ppt_filename = filename
             ppt_id = st.session_state.get("current_ppt_id")
             if ppt_id:
-                os.makedirs("generated", exist_ok=True)
-                file_path = os.path.join("generated", f"{ppt_id}.pptx")
-                with open(file_path, "wb") as f:
-                    f.write(ppt_bytes)
                 _upsert_ppt_history(
                     ppt_id,
                     ppt_bytes=ppt_bytes,
                     ppt_filename=filename,
-                    file_path=file_path,
+                    file_path=None,
                     outline_payload=outline,
                     topic=st.session_state.topic,
                     sections=st.session_state.sections,
@@ -1460,7 +1686,6 @@ def rebuild_ppt_from_outline() -> bytes | None:
         st.session_state.last_build_error = str(e)
         return None
 
-
 def sanitize_outline_for_build(payload: dict) -> dict:
     safe = {
         "design_system": payload.get("design_system", {}) if isinstance(payload, dict) else {},
@@ -1470,12 +1695,11 @@ def sanitize_outline_for_build(payload: dict) -> dict:
         if not isinstance(slide, dict):
             continue
         layout = str(slide.get("layout", "bullets")).strip() or "bullets"
-        # FIX 2: Always flatten content before building
         s = {
             "title": str(slide.get("title", "")).strip(),
             "subtitle": str(slide.get("subtitle", "")).strip(),
             "layout": layout,
-            "icon": str(slide.get("icon", "▸")).strip() or "▸",
+            "icon": clean_bullet_icon(slide.get("icon", "▸")),
             "content": flatten_slide_content(slide.get("content", [])),
             "style": slide.get("style", {}) if isinstance(slide.get("style"), dict) else {},
         }
@@ -1497,10 +1721,7 @@ def sanitize_outline_for_build(payload: dict) -> dict:
             s["steps"] = slide.get("steps", []) or []
         elif layout == "icon_grid":
             s["grid_items"] = normalize_icon_grid_items(slide, bullets_to_text(flatten_slide_content(slide.get("content", []))))
-            s["content"] = [
-                f"{item['title']}: {item['detail']}".rstrip(": ").strip()
-                for item in s["grid_items"]
-            ]
+            s["content"] = [f"{item['title']}: {item['detail']}".rstrip(": ").strip() for item in s["grid_items"]]
         elif layout == "case_study":
             s["company"] = slide.get("company", "")
             s["result"] = slide.get("result", "")
@@ -1521,7 +1742,6 @@ def sanitize_outline_for_build(payload: dict) -> dict:
         safe["slides"].append(s)
     return safe
 
-
 def refresh_section_index_slide(slides: list) -> list:
     normalized = [ensure_editor_id(s) for s in (slides or []) if isinstance(s, dict)]
     if len(normalized) < 2:
@@ -1529,16 +1749,11 @@ def refresh_section_index_slide(slides: list) -> list:
     index_slide = normalized[1]
     if str(index_slide.get("layout", "")).strip() != "section_index":
         return normalized
-    sections = [
-        str(s.get("title", "")).strip()
-        for s in normalized[2:]
-        if isinstance(s, dict) and str(s.get("title", "")).strip()
-    ][:6]
+    sections = [str(s.get("title", "")).strip() for s in normalized[2:] if isinstance(s, dict) and str(s.get("title", "")).strip()][:6]
     index_slide["sections"] = sections
     index_slide["content"] = sections
     normalized[1] = index_slide
     return normalized
-
 
 def make_thank_you_slide(slide: dict) -> dict:
     slide = ensure_editor_id(slide)
@@ -1547,7 +1762,6 @@ def make_thank_you_slide(slide: dict) -> dict:
     slide["layout"] = "title_cover"
     slide["content"] = []
     return slide
-
 
 def apply_add_action(old_slides, slide, position):
     new_slide = ensure_editor_id(slide)
@@ -1584,7 +1798,6 @@ def apply_add_action(old_slides, slide, position):
     else:
         slides.append(new_slide)
     return slides
-
 
 # ------------------------------------------------------------------------------
 #  MAIN UI — CHAT-FIRST LAYOUT
@@ -1653,11 +1866,11 @@ if history:
                     st.rerun()
 
 # ------------------------------------------------------------------------------
-#  FIX 1: CHAT HISTORY — replay with embedded previews
+#  CHAT HISTORY — replay with embedded previews
 # ------------------------------------------------------------------------------
-# ── REPLACE the chat history replay loop ───────────────────────────────────
 for msg_index, msg in enumerate(st.session_state.messages):
     render_message(msg, msg_index=msg_index)
+
 # Chat input
 chat_value = None
 try:
@@ -1691,6 +1904,11 @@ if prompt is not None:
     if not prompt:
         st.stop()
 
+    # If this is a create_ppt request and no file was uploaded, clear any leftover logo
+    if (files is None or len(files) == 0) and re.search(r'\b(?:make|create|generate|new)\s+(?:a\s+)?(?:ppt|presentation|deck)', prompt, re.IGNORECASE):
+        st.session_state.logo_bytes = None
+        st.session_state.logo_name = None
+
     # Render user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -1698,12 +1916,7 @@ if prompt is not None:
 
     # 1. Resolve PPT reference (possibly switch active PPT)
     def should_resolve_ppt(user_input: str) -> bool:
-        return bool(re.search(
-            r"(ppt|presentation|deck)\s*\d+|switch|open|go to|previous ppt",
-            user_input.lower()
-        ))
-
-    # ----- PRIORITY ORDER -----
+        return bool(re.search(r"(ppt|presentation|deck)\s*\d+|switch|open|go to|previous ppt", user_input.lower()))
     if should_resolve_ppt(prompt):
         changed, new_ppt_id, clarification = resolve_ppt_reference(prompt)
     else:
@@ -1738,8 +1951,6 @@ if prompt is not None:
         intent = action_data["intent"]
         slots = action_data["slots"]
         result_msg, success = execute_action(intent, slots, slides)
-        # execute_action may have called st.rerun() already (via commit_changes)
-        # If not (simple text response), show it here
         with st.chat_message("assistant"):
             st.markdown(result_msg)
         add_message("assistant", result_msg)

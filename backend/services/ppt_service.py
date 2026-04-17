@@ -1,11 +1,100 @@
-# backend/ppt_service.py
 """
-ppt_service.py  — FIXED & PRODUCTION-READY
-===================================================
-- Dominant-color logo extraction (histogram clustering)
-- Every layout renders from its own data fields
-- Attractive, varied visual styles per deck profile
-- Strict field validation with meaningful LLM-fallback repair
+ppt_service.py
+==============
+
+Core presentation generation engine for the AI PPT system.
+
+This module is responsible for:
+
+* Generating structured slide content using LLMs
+* Cleaning and normalizing AI-generated text
+* Rendering PowerPoint presentations using python-pptx
+* Applying visual themes, layouts, and design systems
+* Ensuring output quality (no icons, markdown, or noise in slides)
+
+──────────────────────────────────────────────────────────────
+
+🔧 Key Responsibilities
+
+1. Content Generation
+
+   * Uses LLM to generate structured slide data (title, subtitle, content)
+   * Supports multiple layouts (bullets, charts, timeline, icon grid, etc.)
+
+2. Content Cleaning (Critical Layer)
+
+   * Removes unwanted tokens such as:
+
+     * icon names (check-circle, arrow, handshake, etc.)
+     * markdown (**bold**, symbols)
+     * emojis and special characters
+   * Ensures ONLY clean, human-readable text is rendered in slides
+
+3. Content Flattening
+
+   * Converts nested JSON/dict/list structures into flat bullet lists
+   * Handles inconsistent LLM outputs robustly
+
+4. Rendering Engine
+
+   * Uses python-pptx to generate slides
+   * Supports:
+
+     * headers, footers, page numbers
+     * bullet layouts, grids, timelines, case studies
+     * adaptive font sizing and spacing
+
+5. Theming System
+
+   * Predefined visual profiles (classic, tech, bold, etc.)
+   * Dynamic color extraction from uploaded logos
+   * Automatic contrast and readability adjustments
+
+6. Final Safety Layer (Important)
+
+   * Applies aggressive text sanitization before rendering
+   * Guarantees no icon tokens or formatting artifacts appear in PPT
+
+──────────────────────────────────────────────────────────────
+
+⚠️ Design Principle
+
+The system follows a strict pipeline:
+
+```
+LLM Output → Flatten → Clean → Validate → Render
+```
+
+No raw LLM text is ever rendered directly.
+
+──────────────────────────────────────────────────────────────
+
+🚀 Key Functions
+
+* generate_slide_content()
+  Generates structured slide JSON using LLM
+
+* create_ppt()
+  Converts cleaned slide data into a PowerPoint file
+
+* _clean_bullet_text()
+  Core sanitization function for removing unwanted tokens
+
+* _validate_and_clean_content()
+  Final gate before rendering
+
+──────────────────────────────────────────────────────────────
+
+🎯 Goal
+
+To produce professional, clean, and visually appealing presentations
+without any LLM artifacts such as:
+
+* icon keywords
+* markdown syntax
+* noisy or malformed content
+
+──────────────────────────────────────────────────────────────
 """
 
 import os
@@ -20,6 +109,8 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
+from io import BytesIO
+import base64
 
 from backend.config import (
     AZURE_KEY, AZURE_ENDPOINT, AZURE_API_VERSION, AZURE_DEPLOYMENT
@@ -67,6 +158,165 @@ PALETTES = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  ICON / MARKDOWN CLEANING  ← THE CORE FIX
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Every token that must NEVER appear in slide text.
+_ICON_TOKENS = {
+    "check-circle", "check_circle", "checkcircle",
+    "check-square", "check_square",
+    "thank-you", "thank_you",
+    "handshake",
+    "trending-up", "trending_up", "trendingup",
+    "trending-down", "trending_down",
+    "arrow-right", "arrow_right", "arrowright",
+    "arrow-left", "arrow_left",
+    "arrow-up", "arrow_up",
+    "arrow-down", "arrow_down",
+    "arrow",
+    "star", "heart", "flag", "circle", "check",
+    "bullet", "info", "warning", "error", "success",
+    "close", "done",
+    "thumb-up", "thumb_up", "thumbup",
+    "thumb-down", "thumb_down",
+    "lightbulb", "rocket", "target", "shield",
+    "chart-bar", "chart_bar", "chartbar",
+    "pie-chart", "pie_chart", "piechart",
+    "bar-chart", "bar_chart", "barchart",
+    "line-chart", "line_chart",
+    "users", "user", "person", "team",
+    "building", "office", "company", "globe",
+    "lock", "key", "settings", "gear",
+    "plus", "minus", "cross", "tick",
+    "checkmark", "checkbox",
+    "diamond", "square", "triangle",
+    "dot", "dash", "hyphen",
+}
+
+# Pre-compiled: matches **any-icon-token** with optional surrounding spaces
+_RE_BOLD_ICON = re.compile(
+    r'\*\*\s*(' + '|'.join(re.escape(t) for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')\s*\*\*',
+    re.IGNORECASE
+)
+
+# Matches a bare icon token at the VERY START of a string
+_RE_LEADING_ICON = re.compile(
+    r'^\s*(' + '|'.join(re.escape(t) for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')[\s:\-\.]*',
+    re.IGNORECASE
+)
+
+# Matches **anything** at the very start (catches unknown icon names too)
+_RE_LEADING_BOLD_WORD = re.compile(r'^\s*\*\*[^*\s][^*]{0,40}\*\*\s*')
+
+# Remaining **bold** markers (keep text, drop asterisks)
+_RE_INLINE_BOLD = re.compile(r'\*\*(.+?)\*\*')
+
+# Leading bullet/arrow/symbol characters
+_RE_LEADING_SYMBOLS = re.compile(r'^[\-\–\—\•\▸\▹\►\→\✓\✔\★\☆\◆\◇\»\›\s]+')
+
+# :emoji_name: patterns
+_RE_COLON_EMOJI = re.compile(r':[a-z_\-]{2,30}:')
+
+# Actual emoji Unicode ranges
+_RE_EMOJI_CHARS = re.compile(
+    r'[\U0001F300-\U0001FFFF'
+    r'\U00002600-\U000027BF'
+    r'\U0001F900-\U0001F9FF'
+    r'\U00002700-\U000027BF]'
+)
+
+# Heuristic: bare lowercase_token at start followed by a Capital letter
+_RE_BARE_ICON_HEURISTIC = re.compile(r'^([a-z][a-z0-9_\-]{2,24})\s+([A-Z])')
+
+_COMMON_STARTERS = {
+    'a','an','the','in','on','at','by','to','of','as','is','it','or','if',
+    'do','be','no','so','go','use','ai','ml','api','data','with','from',
+    'each','per','new','key','top','low','high','more','less','cost','this',
+    'that','both','many','most','some','such','all','our','its','not','yet',
+    'over','just','also','only','even','well','here','when','then','than',
+    'but','and','for','nor','via','due','upon',
+}
+
+_SAFE_BULLET_ICONS = {
+    "▸", "◆", "✓", "•", "●", "▪", "‣", "→", "➜", "➤", "▶", "►",
+}
+
+
+def _clean_bullet_text(text: str) -> str:
+    """
+    Guaranteed-clean bullet text.
+    Strips **icon-name**, bare icon tokens, markdown, emoji, leading symbols.
+    Returns empty string if nothing useful remains.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    t = text.strip()
+
+    # ── Pass 1: remove **known-icon** patterns (e.g. **check-circle**) ──────
+    t = _RE_BOLD_ICON.sub('', t)
+
+    # ── Pass 2: remove **any-bold-word** at the very start of the string ─────
+    #    This catches unknown icon names the LLM invents.
+    t = _RE_LEADING_BOLD_WORD.sub('', t)
+
+    # ── Pass 3: remove known bare icon tokens at start ────────────────────────
+    t = _RE_LEADING_ICON.sub('', t)
+
+    # ── Pass 4: inline **bold** → keep text, remove asterisks ────────────────
+    t = _RE_INLINE_BOLD.sub(r'\1', t)
+
+    # ── Pass 5: remove leading bullet/arrow/symbol prefixes ──────────────────
+    t = _RE_LEADING_SYMBOLS.sub('', t)
+
+    # ── Pass 6: remove :emoji_name: tokens ───────────────────────────────────
+    t = _RE_COLON_EMOJI.sub('', t)
+
+    # ── Pass 7: remove actual emoji characters ────────────────────────────────
+    t = _RE_EMOJI_CHARS.sub('', t)
+
+    # ── Pass 8: normalise whitespace ─────────────────────────────────────────
+    t = re.sub(r'\s+', ' ', t).strip()
+
+    # ── Pass 9: heuristic — bare lowercase_token followed by Capital letter ──
+    m = _RE_BARE_ICON_HEURISTIC.match(t)
+    if m:
+        first = m.group(1).lower()
+        if first not in _COMMON_STARTERS:
+            # Strip the suspicious token
+            remainder = t[m.end(1):].strip()
+            if remainder and remainder[0].isupper():
+                t = remainder
+            elif not remainder:
+                t = ""
+
+    return t.strip()
+
+
+def _validate_and_clean_content(items: list) -> list:
+    """Final gate: cleans every item and discards empties."""
+    result = []
+    for raw in (items or []):
+        t = _clean_bullet_text(str(raw) if raw is not None else "")
+        if t:
+            result.append(t)
+    return result
+
+
+def _sanitize_icon_marker(icon: str, fallback: str = "▸") -> str:
+    """
+    Keep only safe bullet glyphs. Any word-like token falls back to a glyph.
+    """
+    token = _safe_str(icon).strip()
+    if not token:
+        return fallback
+    if token in _SAFE_BULLET_ICONS:
+        return token
+    if len(token) == 1 and not token.isalnum() and not token.isspace():
+        return token
+    return fallback
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  LOW-LEVEL HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -82,7 +332,7 @@ def _contrast_text(bg, dark=(0,0,0), light=(255,255,255), threshold=0.56):
     return light if _lum(bg) < threshold else dark
 def _font_pt(size, role="body"):
     size = float(size)
-    if role == "title":   return max(size, round(size * 1.08, 1))
+    if role == "title":    return max(size, round(size * 1.08, 1))
     if role == "subtitle": return max(size, round(size * 1.10, 1))
     return max(size, round(size * 1.09, 1))
 def _is_neutral(c, thr=0.16):
@@ -192,7 +442,7 @@ def _merge_usage(total, add):
     return total
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  THEME BUILDING — FIXED dominant-color logo extraction
+#  THEME BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
 
 _BASE = dict(
@@ -204,77 +454,111 @@ _BASE = dict(
 def _dominant_color_from_pixels(pixels, n_clusters=5):
     if not pixels:
         return None
-    bucket_size = 32
+    if len(pixels) > 5000:
+        pixels = random.sample(pixels, 5000)
+    try:
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=min(n_clusters, len(pixels)), random_state=0, n_init=10)
+        kmeans.fit(pixels)
+        colors = kmeans.cluster_centers_.astype(int)
+        best = None
+        best_score = -1
+        for c in colors:
+            r, g, b = c
+            if max(r,g,b) - min(r,g,b) < 30:
+                continue
+            _, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+            score = s * v
+            if score > best_score:
+                best_score = score
+                best = (r, g, b)
+        if best is not None:
+            return best
+    except ImportError:
+        pass
+    bucket_size = 16
     buckets = {}
     for r, g, b in pixels:
         key = (r // bucket_size, g // bucket_size, b // bucket_size)
         buckets[key] = buckets.get(key, 0) + 1
-    if not buckets:
-        return None
-    sorted_buckets = sorted(buckets.items(), key=lambda x: x[1], reverse=True)
-    for (rb, gb, bb), count in sorted_buckets[:n_clusters]:
-        r = rb * bucket_size + bucket_size // 2
-        g = gb * bucket_size + bucket_size // 2
-        b = bb * bucket_size + bucket_size // 2
-        _, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
-        if s > 0.20 and v > 0.15:
-            return (r, g, b)
+    sorted_buckets = sorted(buckets.items(), key=lambda x: x[1], reverse=True)[:5]
+    best = None
+    best_sat = -1
+    for (rb, gb, bb), _ in sorted_buckets:
+        bucket_pixels = [(r, g, b) for (r, g, b) in pixels
+                         if r // bucket_size == rb and g // bucket_size == gb and b // bucket_size == bb]
+        if not bucket_pixels:
+            continue
+        avg_r = sum(p[0] for p in bucket_pixels) // len(bucket_pixels)
+        avg_g = sum(p[1] for p in bucket_pixels) // len(bucket_pixels)
+        avg_b = sum(p[2] for p in bucket_pixels) // len(bucket_pixels)
+        _, s, v = colorsys.rgb_to_hsv(avg_r/255, avg_g/255, avg_b/255)
+        if s > 0.2 and v > 0.15 and s > best_sat:
+            best_sat = s
+            best = (avg_r, avg_g, avg_b)
+    if best:
+        return best
     n = len(pixels)
-    avg = tuple(int(sum(c[i] for c in pixels) / n) for i in range(3))
-    return avg
+    return tuple(int(sum(c[i] for c in pixels) / n) for i in range(3))
+
 
 def _flatten_to_strings(obj):
-    """Recursively convert any nested dict/list into a list of plain strings."""
+    result = []
     if isinstance(obj, str):
-        return [obj]
+        cleaned = _clean_bullet_text(obj)
+        return [cleaned] if cleaned else []
     if isinstance(obj, dict):
-        if 'points' in obj and isinstance(obj['points'], list):
+        if 'points' in obj:
             return _flatten_to_strings(obj['points'])
-        if 'header' in obj and 'points' in obj:
-            header = str(obj['header'])
-            points = _flatten_to_strings(obj['points'])
-            return [f"{header}: {p}" for p in points] if points else [header]
-        return [str(v) for v in obj.values() if v]
-    if isinstance(obj, list):
-        result = []
+        for v in obj.values():
+            result.extend(_flatten_to_strings(v))
+    elif isinstance(obj, list):
         for item in obj:
             result.extend(_flatten_to_strings(item))
-        return result
-    return [str(obj)]
+    return [t for t in (_clean_bullet_text(x) for x in result) if t]
 
 
 def _extract_logo_theme(logo_path: str, base: dict) -> dict:
+    theme = dict(base)
     if not logo_path or not os.path.exists(logo_path):
-        return base
+        return theme
     try:
         with Image.open(logo_path) as img:
-            img = img.convert("RGBA")
-            img = img.resize((128, 128), Image.LANCZOS)
-            pixels = []
-            for r, g, b, a in img.getdata():
-                if a < 30:
-                    continue
-                if r > 235 and g > 235 and b > 235:
-                    continue
-                if r < 20 and g < 20 and b < 20:
-                    continue
-                pixels.append((r, g, b))
-            if not pixels:
-                return base
-            dominant = _dominant_color_from_pixels(pixels, n_clusters=8)
-            if not dominant:
-                return base
-    except Exception:
-        return base
-
-    themed = dict(base)
-    themed["p"]    = dominant
-    themed["s"]    = _mix(dominant, (255, 255, 255), 0.40)
-    themed["a"]    = _mix(dominant, (0,   0,   0  ), 0.18)
-    themed["a2"]   = _mix(dominant, (255, 255, 255), 0.58)
-    themed["dk"]   = _mix(dominant, (0,   0,   0  ), 0.38)
-    themed["muted"]= _mix(dominant, (255, 255, 255), 0.68)
-    return themed
+            rgba = img.convert("RGBA")
+            bg   = Image.new("RGBA", rgba.size, (255,255,255,255))
+            comp = Image.alpha_composite(bg, rgba).convert("RGB")
+            comp.thumbnail((220,220))
+            q    = comp.quantize(colors=6)
+            pal  = q.getpalette() or []
+            cnts = q.getcolors() or []
+        extracted = []
+        for cnt, idx in sorted(cnts, reverse=True):
+            b = idx*3
+            if b+2 >= len(pal): continue
+            col = tuple(pal[b:b+3])
+            lm  = _lum(col)
+            if lm > 0.96 or lm < 0.04: continue
+            extracted.append((cnt,col))
+        colors  = [c for _,c in extracted]
+        vivid   = [c for c in colors if not _is_neutral(c)]
+        neutral = [c for c in colors if _is_neutral(c)]
+        vivid.sort(key=lambda c: colorsys.rgb_to_hsv(*[v/255 for v in c])[1], reverse=True)
+        primary   = vivid[0] if vivid else theme["p"]
+        secondary = vivid[1] if len(vivid)>1 else _mix(primary,(255,255,255),0.35)
+        accent    = vivid[2] if len(vivid)>2 else _mix(primary,(0,0,0),0.28)
+        accent2   = neutral[0] if neutral else _mix(secondary,(255,255,255),0.18)
+        theme.update(dict(
+            p=primary, s=secondary, a=accent, a2=accent2,
+            dk=_mix(primary,(12,18,28),0.42),
+            bg=(255,255,255),
+            td=_mix(primary,(15,15,15),0.70) if _lum(primary)>0.35 else (28,36,48),
+            tl=(255,255,255),
+            muted=_mix((28,36,48),(255,255,255),0.48),
+            card=(255,255,255),
+        ))
+    except Exception as e:
+        print(f"[logo-theme] {e}")
+    return theme
 
 def _build_theme(palette_name: str, design_system: dict, logo_path: str = None) -> dict:
     pal = PALETTES.get(palette_name, PALETTES["classic"])
@@ -321,7 +605,10 @@ def _oval(slide, x, y, w, h, fill):
 
 def _tb(slide, text, x, y, w, h, size, bold=False, italic=False,
         color=None, face="Calibri", align=PP_ALIGN.LEFT, shrink=False):
-    text = _safe_str(text)
+    # ── ICON LEAK FIX: clean text before ANY rendering ──────────────────────
+    text = _clean_bullet_text(_safe_str(text))
+    if not text:
+        return None
     bx = slide.shapes.add_textbox(_IN(x), _IN(y), _IN(w), _IN(h))
     tf = bx.text_frame; tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.TOP
@@ -329,10 +616,12 @@ def _tb(slide, text, x, y, w, h, size, bold=False, italic=False,
     p = tf.paragraphs[0]; p.alignment = align
     role = "title" if bold and size >= 18 else ("subtitle" if italic else "body")
     font_size = _font_pt(size, role=role)
-    for i, part in enumerate(str(text).split("**")):
+    # Split on ** only after cleaning — so no icon name ever becomes a bold run
+    parts = text.split("**")
+    for i, part in enumerate(parts):
         if not part: continue
         r = p.add_run(); r.text = part
-        r.font.size = Pt(font_size); r.font.bold = bold or (i%2==1)
+        r.font.size = Pt(font_size); r.font.bold = bold or (i % 2 == 1)
         r.font.italic = italic; r.font.name = face
         if color: r.font.color.rgb = _c(color)
     return bx
@@ -341,7 +630,10 @@ def _bullets(slide, points, x, y, w, h, size=16, icon="▸",
              ic=None, tc=None, face="Calibri", maxp=6):
     if not points: return
     ic = ic or _BASE["s"]; tc = tc or _BASE["td"]
-    pts = [_safe_str(p) for p in points if _safe_str(p)]
+    icon = _sanitize_icon_marker(icon)
+    # ── ICON LEAK FIX: clean every bullet at the last mile ──────────────────
+    pts = [_clean_bullet_text(_safe_str(p)) for p in points if _safe_str(p)]
+    pts = [p for p in pts if p]          # drop empties after cleaning
     if not pts: return
     maxp = maxp or len(pts)
     pts = pts[:maxp]
@@ -365,9 +657,10 @@ def _bullets(slide, points, x, y, w, h, size=16, icon="▸",
         ir = p.add_run(); ir.text = f"{icon}  "
         ir.font.size=Pt(_font_pt(size-1)); ir.font.bold=True
         ir.font.name=face; ir.font.color.rgb=_c(ic)
-        for i,part in enumerate(pt.split("**")):
+        # Split on ** only after the text is already clean
+        for i, part in enumerate(pt.split("**")):
             if not part: continue
-            r=p.add_run(); r.text=part
+            r = p.add_run(); r.text = part
             r.font.size=Pt(_font_pt(size)); r.font.bold=(i%2==1)
             r.font.name=face; r.font.color.rgb=_c(tc)
 
@@ -401,7 +694,6 @@ def _draw_header(slide, title, subtitle, num, theme, profile):
     W = SW; H = HEADER_H
     tx, ty, th = 0.45, 0.18, 0.76
     title_fill = theme["dk"]
-
     if mode == "sidebar":
         _rect(slide, 0, 0, 0.42, H, theme["p"])
         title_fill = _mix(theme["dk"],theme["p"],0.18)
@@ -417,7 +709,6 @@ def _draw_header(slide, title, subtitle, num, theme, profile):
     else:
         _rect(slide, 0, 0, W, H, theme["dk"])
         title_fill = theme["dk"]
-
     logo_space = 1.40 if _LOGO_PATH else 0.50
     title_w = W - tx - logo_space
     tsize = max(22, 32 - max(0, len(title)-42)//8*4)
@@ -475,14 +766,13 @@ def _accents(theme, n=4):
     return [base[i % len(base)] for i in range(n)]
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LAYOUT RENDERERS (all original, preserved)
+#  LAYOUT RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_title_cover(slide, spec, num, theme, profile, logo_path=None):
     W, H = SW, SH
     mode = profile["cover"]
     _slide_bg(slide, theme["bg"])
-
     if mode == "dark_full":
         _slide_bg(slide, theme["dk"])
         _rect(slide, 0, 0, 0.35, H, theme["s"])
@@ -508,21 +798,18 @@ def render_title_cover(slide, spec, num, theme, profile, logo_path=None):
         _rect(slide, 0, 1.25, W, 0.08, theme["s"])
         _rect(slide, 0, H-0.18, W, 0.18, _mix(theme["p"],theme["s"],0.55))
         tc, sc = _contrast_text(theme["bg"]), _contrast_text(theme["bg"])
-
     title_x = 2.40 if mode == "sidebar" else 0.70
     title_w  = W - title_x - 0.40
     title    = _safe_str(spec.get("title", "Presentation"))
     tsize    = max(40, 58 - max(0, len(title)-30)//6*4)
     _tb(slide, title, title_x, 1.95, title_w, 2.20, tsize,
         bold=True, color=tc, face=theme["hf"], align=PP_ALIGN.LEFT, shrink=True)
-
     subtitle = _safe_str(spec.get("subtitle",""))
     if subtitle:
         ssize = max(15, 20 - max(0, len(subtitle)-60)//20)
         _tb(slide, subtitle, title_x+0.02, 4.15, title_w, 0.82, ssize,
             italic=True, color=sc, face=theme["bf"], shrink=True)
-
-    points = [p for p in _safe_list(spec.get("content",[])) if p][:5]
+    points = [p for p in _validate_and_clean_content(_safe_list(spec.get("content",[]))) if p][:5]
     if points:
         accs   = _accents(theme, 3)
         card_w = max(2.0, (title_w - 0.18*(len(points)-1)) / len(points))
@@ -539,11 +826,10 @@ def render_section_index(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title","Contents"), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-    sections = _safe_list(spec.get("sections", spec.get("content",[])))
+    sections = _validate_and_clean_content(_safe_list(spec.get("sections", spec.get("content",[]))))
     if not sections:
         _tb(slide, "No sections available.", ix, iy, iw, ih, 15, color=theme["muted"])
         _add_page_number(slide, num, theme, profile["footer"]); return
-
     sections = sections[:6]
     cols = 2 if len(sections) > 3 else 1
     gap  = 0.18
@@ -551,7 +837,6 @@ def render_section_index(slide, spec, num, theme, profile, logo_path=None):
     cw   = (iw - gap*(cols-1)) / cols
     ch   = min(1.08, max(0.72, (ih - gap*(rows-1)) / max(1,rows)))
     accs = _accents(theme, 4)
-
     for i, sec in enumerate(sections):
         col = i % cols; row = i // cols
         cx  = ix + col*(cw+gap)
@@ -572,47 +857,39 @@ def render_bullets(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-    clean_content = _flatten_to_strings(spec.get("content", []))
+    clean_content = _validate_and_clean_content(_flatten_to_strings(spec.get("content", [])))
     _bullets(slide, clean_content, ix, iy, iw, ih,
              size=16, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=6)
+             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
-
-
 
 def render_two_column(slide, spec, num, theme, profile, logo_path=None):
     _slide_bg(slide, theme["bg"])
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     gap = 0.20; cw = (iw-gap)/2
     lt = _safe_str(spec.get("left_title","Left"))
     rt = _safe_str(spec.get("right_title","Right"))
-    lp = _safe_list(spec.get("left_points",[]))
-    rp = _safe_list(spec.get("right_points",[]))
-
+    lp = _validate_and_clean_content(_safe_list(spec.get("left_points",[])))
+    rp = _validate_and_clean_content(_safe_list(spec.get("right_points",[])))
     if not lp and not rp:
-        content = _safe_list(spec.get("content",[]))
+        content = _validate_and_clean_content(_safe_list(spec.get("content",[])))
         mid = max(1, len(content)//2)
         lp, rp = content[:mid], content[mid:]
-
     icon = spec.get("icon","▸")
     hh   = 0.46
-
     _rect(slide, ix, iy, cw, hh, theme["p"])
     _tb(slide, lt, ix+0.10, iy+0.08, cw-0.20, hh-0.12, 15,
         bold=True, color=_contrast_text(theme["p"]), face=theme["hf"])
     _bullets(slide, lp, ix+0.10, iy+hh+0.10, cw-0.20, ih-hh-0.16,
-             size=15, icon=icon, ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=6)
-
+             size=15, icon=icon, ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
     rx = ix+cw+gap
     _rect(slide, rx, iy, cw, hh, theme["a2"])
     _tb(slide, rt, rx+0.10, iy+0.08, cw-0.20, hh-0.12, 15,
         bold=True, color=_contrast_text(theme["a2"]), face=theme["hf"])
-    # FIX: remove the extra 'rp' that was passed as a positional argument
     _bullets(slide, rp, rx+0.10, iy+hh+0.10, cw-0.20, ih-hh-0.16,
-             size=15, icon=icon, ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=6)
+             size=15, icon=icon, ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
@@ -620,13 +897,11 @@ def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     pw     = 3.70
     stat   = _safe_str(spec.get("stat","—"))
     label  = _safe_str(spec.get("stat_label",""))
     source = _safe_str(spec.get("stat_source",""))
-    pts    = _safe_list(spec.get("content",[]))
-
+    pts    = _validate_and_clean_content(_safe_list(spec.get("content",[])))
     sfont = 72 if len(stat)<=4 else 54
     _rect(slide, ix, iy, pw, ih, theme["p"])
     _rect(slide, ix, iy, pw, 0.07, theme["a2"])
@@ -644,11 +919,10 @@ def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
             _rect(slide, ix+bmar, bar_y, bw, bh, (255,255,255))
             _rect(slide, ix+bmar, bar_y, bw*(pct/100), bh, theme["a2"])
     except: pass
-
     bx = ix+pw+0.22; bw2 = iw-pw-0.22
     _bullets(slide, pts, bx, iy+0.10, bw2, ih-0.20,
              size=14, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=6)
+             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_timeline(slide, spec, num, theme, profile, logo_path=None):
@@ -656,18 +930,15 @@ def render_timeline(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     steps = [s for s in (spec.get("steps") or [])
              if isinstance(s,dict) and _safe_str(s.get("label")) and _safe_str(s.get("detail"))]
     if not steps:
         _tb(slide, "No timeline steps provided.", ix, iy, iw, ih, 14, color=theme["muted"])
         _add_page_number(slide, num, theme); return
-
     n = len(steps); sw = iw/n
     tl_y = iy + ih*0.47
     DR, dr = 0.28, 0.14
     accs = _accents(theme, n)
-
     _rect(slide, ix, tl_y, iw, 0.06, theme["s"])
     for i, step in enumerate(steps):
         cx = ix + i*sw + sw/2
@@ -701,18 +972,15 @@ def render_icon_grid(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     items = [g for g in (spec.get("grid_items") or [])
              if isinstance(g,dict) and _safe_str(g.get("title"))][:4]
     if not items:
         _tb(slide, "No grid items provided.", ix, iy, iw, ih, 14, color=theme["muted"])
         _add_page_number(slide, num, theme, profile["footer"]); return
-
     cols = 2; gap = 0.16
     cw_  = (iw-gap)/cols; ch_ = (ih-gap)/2
     accs = _accents(theme, 4)
     IR   = 0.38
-
     for i, gi in enumerate(items):
         col = i%cols; row = i//cols
         cx  = ix + col*(cw_+gap)
@@ -727,9 +995,9 @@ def render_icon_grid(slide, spec, num, theme, profile, logo_path=None):
         _tb(slide, ch1, iox+0.04, ioy+0.08, IR*2-0.08, IR*1.6, 17,
             bold=True, color=_contrast_text(ac), face=theme["hf"], align=PP_ALIGN.CENTER)
         tx = iox+IR*2+0.16; tw = cw_-(iox-cx)-IR*2-0.22
-        _tb(slide, _safe_str(gi.get("title","")), tx, cy+0.12, tw, 0.46, 16,
+        _tb(slide, _clean_bullet_text(_safe_str(gi.get("title",""))), tx, cy+0.12, tw, 0.46, 16,
             bold=True, color=_contrast_text(theme["card"]), face=theme["hf"])
-        _tb(slide, _safe_str(gi.get("detail","")), tx, cy+0.60, tw, ch_-0.72, 14,
+        _tb(slide, _clean_bullet_text(_safe_str(gi.get("detail",""))), tx, cy+0.60, tw, ch_-0.72, 14,
             color=_contrast_text(theme["card"]), face=theme["bf"])
     _add_page_number(slide, num, theme, profile["footer"])
 
@@ -738,13 +1006,11 @@ def render_case_study(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     company = _safe_str(spec.get("company","Organisation"))
     result  = _safe_str(spec.get("result",""))
     metrics = [m for m in (spec.get("metrics") or []) if isinstance(m,dict)]
-    pts     = _safe_list(spec.get("content",[]))
+    pts     = _validate_and_clean_content(_safe_list(spec.get("content",[])))
     icon    = spec.get("icon","▸")
-
     bh = 0.52; rh = 0.48; mh = 0.50
     _rect(slide, ix, iy, iw, bh, theme["p"])
     _tb(slide, f"  {company}", ix+0.18, iy+0.10, iw-0.36, bh-0.16, 17,
@@ -755,7 +1021,6 @@ def render_case_study(slide, spec, num, theme, profile, logo_path=None):
         _tb(slide, f"  {result}", ix+0.14, cur_y+0.10, iw-0.28, rh-0.16, 13,
             bold=True, color=_contrast_text(theme["a2"]), face=theme["bf"])
         cur_y += rh+0.06
-
     metric_labels = []
     metrics_used  = 0
     for i, m in enumerate(metrics[:3]):
@@ -776,7 +1041,6 @@ def render_case_study(slide, spec, num, theme, profile, logo_path=None):
         _tb(slide, f"{val}", label_x, my+0.01, label_w, 0.22, 11,
             bold=True, color=_contrast_text(theme["card"]))
         metrics_used = (i+1)*mh
-
     if metric_labels:
         filtered = []
         for p in pts:
@@ -785,7 +1049,6 @@ def render_case_study(slide, spec, num, theme, profile, logo_path=None):
                 continue
             filtered.append(p)
         pts = filtered
-
     bul_y = cur_y + (metrics_used if metrics else 0) + 0.10
     bul_h = ih-(bul_y-iy)-0.10
     if bul_h > 0.30 and pts:
@@ -800,26 +1063,21 @@ def render_table(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     cols = _safe_list(spec.get("table_columns",[]))[:5]
     rows = [r for r in (spec.get("table_rows") or []) if isinstance(r,list)][:6]
-
     if not cols or not rows:
         _tb(slide, "No table data provided.", ix, iy, iw, ih, 14, color=theme["muted"])
         _add_page_number(slide, num, theme, profile["footer"]); return
-
     nc    = len(cols)
     hh    = 0.55; cg = 0.02; pad = 0.06
     col_w = (iw-(nc-1)*cg)/nc
     row_h = min(0.65, max(0.38, (ih-hh-0.08)/len(rows)))
-
     for ci, col in enumerate(cols):
         cx = ix + ci*(col_w+cg)
         _rect(slide, cx, iy, col_w, hh, theme["p"], line=theme["s"], lw=0.8)
         _tb(slide, col, cx+pad, iy+pad, col_w-pad*2, hh-pad*2, 13,
             bold=True, color=_contrast_text(theme["p"]), face=theme["hf"],
             align=PP_ALIGN.CENTER, shrink=True)
-
     for ri, row in enumerate(rows):
         ry   = iy+hh+ri*row_h
         fill = theme["card"] if ri%2==0 else _mix(theme["card"],theme["s"],0.35)
@@ -838,43 +1096,47 @@ def render_chart(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     chart_data = [x for x in (spec.get("chart_data") or [])
                   if isinstance(x,dict) and _safe_str(x.get("label"))][:5]
     if not chart_data:
         _tb(slide, "No chart data provided.", ix, iy, iw, ih, 14, color=theme["muted"])
         _add_page_number(slide, num, theme, profile["footer"]); return
-
     ct = _safe_str(spec.get("chart_title", spec.get("title","")))
-    _tb(slide, ct, ix+0.02, iy+0.02, iw-0.04, 0.46, 15,
-        bold=True, color=_contrast_text(theme["card"]), face=theme["hf"])
-
+    content = _validate_and_clean_content(_flatten_to_strings(spec.get("content", [])))[:4]
+    _tb(slide, ct, ix+0.02, iy+0.00, iw-0.04, 0.56, 18,
+        bold=True, color=_contrast_text(theme["card"]), face=theme["hf"], shrink=True)
     values = [max(1,_parse_int(d.get("value",0),default=1,lo=1,hi=100)) for d in chart_data]
     vmax   = max(values)
-    lw     = max(1.95, iw*0.28); bar_x = ix+lw+0.16; bar_w = iw-lw-0.66
-    row_h  = 0.24; row_gap = 0.18
-    avail_h = ih - 0.56 - 0.28
+    lw     = max(2.20, iw*0.30); bar_x = ix+lw+0.18; bar_w = iw-lw-0.72
+    row_h  = 0.30; row_gap = 0.18
+    chart_top = iy + 0.62
+    avail_h = ih - 0.62 - (1.65 if content else 0.28)
     needed  = len(chart_data)*row_h + (len(chart_data)-1)*row_gap
     if needed > avail_h and len(chart_data)>1:
         sc = avail_h/needed; row_h *= sc; row_gap *= sc
-
     accs = _accents(theme, len(chart_data))
     for i, item in enumerate(chart_data):
-        y   = iy+0.54 + i*(row_h+row_gap)
+        y   = chart_top + i*(row_h+row_gap)
         lbl = _safe_str(item.get("label",""))[:40]
         val = max(1, _parse_int(item.get("value",0),default=1,lo=1,hi=100))
         pct = val/vmax
-        _tb(slide, lbl, ix+0.02, y+0.01, lw-0.08, row_h-0.02, 13,
+        _tb(slide, lbl, ix+0.02, y+0.01, lw-0.10, row_h-0.02, 15,
             color=_contrast_text(theme["card"]), face=theme["bf"], shrink=True)
         _rect(slide, bar_x, y, bar_w, row_h, _mix(theme["card"],theme["s"],0.90))
         _rect(slide, bar_x, y, bar_w*pct, row_h, accs[i])
-        _tb(slide, str(val), bar_x+bar_w+0.08, y-0.01, 0.52, row_h+0.04, 12,
+        _tb(slide, str(val), bar_x+bar_w+0.08, y-0.01, 0.58, row_h+0.04, 13,
             bold=True, color=_contrast_text(theme["card"]), align=PP_ALIGN.LEFT)
-
     src = _safe_str(spec.get("chart_source",""))
     if src:
         _tb(slide, src, ix+0.02, iy+ih-0.24, iw-0.04, 0.18, 10,
             italic=True, color=theme["muted"], face=theme["bf"])
+    if content:
+        take_y = max(iy + 1.95, chart_top + needed + 0.18)
+        if take_y + 0.55 < iy + ih - 0.26:
+            _tb(slide, "Key Takeaways", ix+0.02, take_y, iw-0.04, 0.26, 13,
+                bold=True, color=_contrast_text(theme["card"]), face=theme["hf"])
+            _bullets(slide, content, ix+0.00, take_y+0.20, iw-0.04, max(0.30, iy+ih-take_y-0.40),
+                     size=13, icon="▸", ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=4)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
@@ -882,11 +1144,9 @@ def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
     _draw_header(slide, spec.get("title",""), spec.get("subtitle",""), num, theme, profile)
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
-
     lw    = iw*0.43; gap = 0.20; rw = iw-lw-gap; rx = ix+lw+gap
     stat  = _safe_str(spec.get("stat","—"))
     label = _safe_str(spec.get("stat_label","Key Indicator"))
-
     left_fill = _mix(theme["card"],theme["s"],0.86)
     _rect(slide, ix, iy, lw, ih, left_fill, line=theme["s"], lw=1.0)
     sfont = 52 if len(stat)<=4 else 42
@@ -894,7 +1154,6 @@ def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
         bold=True, color=_contrast_text(left_fill), face=theme["hf"], align=PP_ALIGN.CENTER)
     _tb(slide, label, ix+0.12, iy+1.45, lw-0.24, 0.42, 13,
         color=_contrast_text(left_fill), face=theme["bf"], align=PP_ALIGN.CENTER)
-
     chart = [r for r in (spec.get("chart_data") or []) if isinstance(r,dict)][:3]
     if chart:
         vmax = max(max(1,_parse_int(r.get("value",1),default=1,lo=1,hi=100)) for r in chart)
@@ -916,11 +1175,11 @@ def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
                 vlabel_x = bar_x + 0.04
             _tb(slide, str(v), vlabel_x, y-0.01, vlabel_w, row_h, 10,
                 bold=True, color=_contrast_text(left_fill), align=PP_ALIGN.RIGHT, shrink=True)
-
     _rect(slide, rx, iy, rw, ih, theme["card"], line=theme["p"], lw=1.0)
-    _bullets(slide, spec.get("content",[]), rx+0.10, iy+0.10, rw-0.20, ih-0.20,
+    clean_content = _validate_and_clean_content(_flatten_to_strings(spec.get("content",[])))
+    _bullets(slide, clean_content, rx+0.10, iy+0.10, rw-0.20, ih-0.20,
              size=14, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=6)
+             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -992,29 +1251,32 @@ def _needs_repair(slide: dict) -> bool:
 _REPAIR_PROMPT = {
     "two_column": """
 Return ONLY valid JSON for a two_column slide about "{title}".
-Fields required: left_title, right_title, left_points (list of 4 strings), right_points (list of 4 strings).
+Fields required: left_title, right_title, left_points (list of 4 plain English strings), right_points (list of 4 plain English strings).
+IMPORTANT: No icon names, no markdown bold, no bullet symbols in any string.
 Topic context: {context}
 """,
     "timeline": """
 Return ONLY valid JSON for a timeline slide about "{title}".
-Fields required: steps — list of 4 objects each with "label" (short phase name) and "detail" (1-sentence description).
+Fields required: steps — list of 4 objects each with "label" (short phase name) and "detail" (1-sentence plain English description).
+IMPORTANT: No icon names, no markdown, no symbols in any string.
 Topic context: {context}
 """,
     "icon_grid": """
 Return ONLY valid JSON for an icon_grid slide about "{title}".
-Fields required: grid_items — list of 4 objects each with "icon" (single char), "title" (2-4 words), "detail" (1-sentence).
+Fields required: grid_items — list of 4 objects each with "icon" (single letter A-Z), "title" (2-4 plain English words), "detail" (1 plain English sentence).
+IMPORTANT: No icon names, no markdown, no symbols in title or detail.
 Topic context: {context}
 """,
     "case_study": """
 Return ONLY valid JSON for a case_study slide about "{title}".
-Fields required: company (real org name), result (1-sentence outcome),
+Fields required: company (real org name), result (1 plain English sentence),
 metrics (list of 3 objects with "label" and "value" 1-99),
-content (list of 4 supporting bullets).
+content (list of 4 plain English bullet strings, no icon names).
 Topic context: {context}
 """,
     "table": """
 Return ONLY valid JSON for a table slide about "{title}".
-Fields required: table_columns (list of 3-5 column names), table_rows (list of 4-5 rows, each a list of strings).
+Fields required: table_columns (list of 3-5 column names), table_rows (list of 4-5 rows, each a list of plain strings).
 Topic context: {context}
 """,
     "chart": """
@@ -1026,14 +1288,14 @@ Topic context: {context}
     "big_stat": """
 Return ONLY valid JSON for a big_stat slide about "{title}".
 Fields required: stat (e.g. "42%"), stat_label (short descriptor), stat_source (source/year),
-content (list of 4 supporting bullets).
+content (list of 4 plain English bullet strings, no icon names, no markdown).
 Topic context: {context}
 """,
     "hybrid_insight": """
 Return ONLY valid JSON for a hybrid_insight slide about "{title}".
 Fields required: stat (e.g. "3.2x"), stat_label (short descriptor),
 chart_data (list of 3 objects with "label" and "value" 1-100),
-content (list of 4 supporting bullets).
+content (list of 4 plain English bullet strings, no icon names, no markdown).
 Topic context: {context}
 """,
 }
@@ -1048,7 +1310,16 @@ def _repair_slide(slide: dict, topic: str):
     try:
         resp  = _client.chat.completions.create(
             model=AZURE_DEPLOYMENT,
-            messages=[{"role":"user","content":prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You output ONLY valid JSON. Every text value must be plain English. "
+                        "Never include icon names like check-circle, star, arrow, or any markdown syntax."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
             temperature=0.7,
             max_tokens=900,
         )
@@ -1089,17 +1360,15 @@ def _seq_icon(idx: int) -> str:
 def _normalize_icon_grid_items(slide: dict) -> list:
     items = slide.get("grid_items", [])
     if not isinstance(items, list): items = []
-
     cleaned = []
     for i, g in enumerate(items):
         if not isinstance(g, dict): continue
-        t = _safe_str(g.get("title", ""))
-        d = _safe_str(g.get("detail", g.get("description", "")))
+        t = _clean_bullet_text(_safe_str(g.get("title", "")))
+        d = _clean_bullet_text(_safe_str(g.get("detail", g.get("description", ""))))
         if not t: continue
         icon = _safe_str(g.get("icon", "")) or _seq_icon(i)
         cleaned.append({"icon": icon, "title": t, "detail": d})
     if cleaned: return cleaned[:4]
-
     content    = slide.get("content", [])
     raw_text   = "\n".join(str(x) for x in content) if isinstance(content, list) else _safe_str(content)
     parsed     = _parse_json(raw_text) if raw_text.strip() else {}
@@ -1108,29 +1377,26 @@ def _normalize_icon_grid_items(slide: dict) -> list:
         parsed_items = parsed.get("grid_items")
     elif isinstance(parsed, list):
         parsed_items = parsed
-
     if isinstance(parsed_items, list):
         for i, g in enumerate(parsed_items):
             if not isinstance(g, dict): continue
-            t = _safe_str(g.get("title", ""))
-            d = _safe_str(g.get("detail", g.get("description", "")))
+            t = _clean_bullet_text(_safe_str(g.get("title", "")))
+            d = _clean_bullet_text(_safe_str(g.get("detail", g.get("description", ""))))
             if not t: continue
             icon = _safe_str(g.get("icon", "")) or _seq_icon(i)
             cleaned.append({"icon": icon, "title": t, "detail": d})
         if cleaned: return cleaned[:4]
-
     lines = []
     if isinstance(content, list):
         lines = [_safe_str(x) for x in content if _safe_str(x)]
     elif raw_text.strip():
         lines = [_safe_str(x) for x in raw_text.splitlines() if _safe_str(x)]
-
     for i, line in enumerate(lines):
         if len(cleaned) >= 4: break
         parsed_line = _parse_json(line)
         if isinstance(parsed_line, dict):
-            t    = _safe_str(parsed_line.get("title", ""))
-            d    = _safe_str(parsed_line.get("detail", parsed_line.get("description", "")))
+            t    = _clean_bullet_text(_safe_str(parsed_line.get("title", "")))
+            d    = _clean_bullet_text(_safe_str(parsed_line.get("detail", parsed_line.get("description", ""))))
             icon = _safe_str(parsed_line.get("icon", "")) or _seq_icon(i)
             if t:
                 cleaned.append({"icon": icon, "title": t, "detail": d})
@@ -1138,8 +1404,8 @@ def _normalize_icon_grid_items(slide: dict) -> list:
         title, detail = line, ""
         if ":" in line:
             title, detail = [part.strip() for part in line.split(":", 1)]
-        title = _safe_str(title)
-        detail = _safe_str(detail)
+        title  = _clean_bullet_text(_safe_str(title))
+        detail = _clean_bullet_text(_safe_str(detail))
         if title:
             cleaned.append({"icon": _seq_icon(i), "title": title[:60], "detail": detail})
     return cleaned[:4]
@@ -1153,7 +1419,7 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
     slide.setdefault("title", f"Slide {idx}")
     slide.setdefault("subtitle", "")
     slide.setdefault("content", [])
-    slide.setdefault("icon", "▸")
+    slide["icon"] = _sanitize_icon_marker(slide.get("icon", "▸"))
     if not isinstance(slide.get("style"), dict): slide["style"] = {}
 
     layout = _canon(slide.get("layout","bullets"))
@@ -1173,26 +1439,26 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
             mid = max(1, len(c)//2)
             slide["left_points"]  = c[:mid]
             slide["right_points"] = c[mid:]
-
     elif layout == "big_stat":
         slide.setdefault("stat_label","Key Metric")
         slide.setdefault("stat_source","")
-
     elif layout == "timeline":
         steps = slide.get("steps",[])
         if not isinstance(steps, list): steps = []
         slide["steps"] = [
-            {"label":_safe_str(s.get("label")),"detail":_safe_str(s.get("detail"))}
-            for s in steps if isinstance(s,dict) and _safe_str(s.get("label")) and _safe_str(s.get("detail"))
+            {
+                "label":  _clean_bullet_text(_safe_str(s.get("label"))),
+                "detail": _clean_bullet_text(_safe_str(s.get("detail"))),
+            }
+            for s in steps
+            if isinstance(s,dict) and _safe_str(s.get("label")) and _safe_str(s.get("detail"))
         ][:5]
-
     elif layout == "icon_grid":
         slide["grid_items"] = _normalize_icon_grid_items(slide)
         slide["content"]    = [
             f"{item['title']}: {item['detail']}".rstrip(": ").strip()
             for item in slide["grid_items"]
         ]
-
     elif layout == "case_study":
         slide.setdefault("company","Organisation")
         slide.setdefault("result","")
@@ -1203,7 +1469,6 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
              "value":_parse_int(m.get("value",50),default=50,lo=1,hi=99)}
             for m in metrics if isinstance(m,dict)
         ][:3]
-
     elif layout == "table":
         cols = _safe_list(slide.get("table_columns",[]))[:5]
         rows = [r for r in (slide.get("table_rows") or []) if isinstance(r,list)][:6]
@@ -1213,7 +1478,6 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
             cells = [_safe_str(v) for v in row[:len(cols)]]
             while len(cells)<len(cols): cells.append("")
             if any(cells): slide["table_rows"].append(cells)
-
     elif layout == "chart":
         data = slide.get("chart_data",[])
         if not isinstance(data,list): data = []
@@ -1224,7 +1488,6 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
         ][:5]
         slide.setdefault("chart_title", slide["title"])
         slide.setdefault("chart_source","")
-
     elif layout == "hybrid_insight":
         slide.setdefault("stat_label","Key Indicator")
         data = slide.get("chart_data",[])
@@ -1234,39 +1497,93 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
              "value":_parse_int(d.get("value",50),default=50,lo=1,hi=100)}
             for d in data if isinstance(d,dict) and _safe_str(d.get("label",""))
         ][:3]
-
     elif layout == "section_index":
         secs = _safe_list(slide.get("sections", slide.get("content",[])))
         slide["sections"] = secs[:6]
         slide["content"]  = secs[:6]
-    
-    slide["content"] = _flatten_to_strings(slide.get("content", []))
+
+    # ── Final content cleaning gate (all fields) ─────────────────────────────
+    slide["content"] = _validate_and_clean_content(_flatten_to_strings(slide.get("content", [])))
+
     if slide.get("layout") == "two_column":
-        slide["left_points"] = _flatten_to_strings(slide.get("left_points", []))
-        slide["right_points"] = _flatten_to_strings(slide.get("right_points", []))
+        slide["left_points"]  = _validate_and_clean_content(_flatten_to_strings(slide.get("left_points", [])))
+        slide["right_points"] = _validate_and_clean_content(_flatten_to_strings(slide.get("right_points", [])))
+
+    if slide.get("layout") == "section_index":
+        slide["sections"] = _validate_and_clean_content(slide.get("sections", []))
+        slide["content"]  = slide["sections"]
+
     if slide.get("layout") == "timeline" and "steps" in slide:
         for step in slide["steps"]:
             if isinstance(step, dict):
-                step["label"] = str(step.get("label", ""))
-                step["detail"] = str(step.get("detail", ""))
+                step["label"]  = _clean_bullet_text(str(step.get("label", "")))
+                step["detail"] = _clean_bullet_text(str(step.get("detail", "")))
+
+    if slide.get("layout") == "icon_grid" and "grid_items" in slide:
+        for item in slide["grid_items"]:
+            if isinstance(item, dict):
+                item["title"]  = _clean_bullet_text(str(item.get("title", "")))
+                item["detail"] = _clean_bullet_text(str(item.get("detail", "")))
 
     return slide
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  MAIN CONTENT GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 
+COLOR_HEX_MAP = {
+    "red": "#E53935", "blue": "#1565C0", "green": "#2E7D32",
+    "yellow": "#F9A825", "orange": "#E65100", "purple": "#6A1B9A",
+    "pink": "#AD1457", "cyan": "#00838F", "teal": "#00695C",
+    "white": "#FFFFFF", "black": "#212121", "gray": "#546E7A",
+    "grey": "#546E7A", "navy": "#0D1B4B", "gold": "#F59E0B",
+    "silver": "#9E9E9E", "brown": "#5D4037", "indigo": "#283593",
+    "violet": "#4527A0", "magenta": "#AD1457", "lime": "#558B2F",
+    "dark blue": "#0D2B6B", "light blue": "#42A5F5",
+    "dark green": "#1B5E20", "light green": "#66BB6A",
+    "dark red": "#B71C1C", "light red": "#EF9A9A",
+}
+
 def generate_slide_content(topic: str, num_slides: int = 6,
-                           tone: str = "Professional") -> dict:
+                           tone: str = "Professional", theme_colors: dict = None) -> dict:
     target       = max(3, int(num_slides or 6))
     palette_name = random.choice(list(PALETTES.keys()))
+
+    def _resolve_color_hex(name: str) -> str:
+        if not name: return ""
+        name_stripped = name.strip()
+        if re.fullmatch(r"#?[0-9A-Fa-f]{6}", name_stripped):
+            return name_stripped if name_stripped.startswith("#") else f"#{name_stripped}"
+        return COLOR_HEX_MAP.get(name_stripped.lower(), "")
+
+    color_hint = ""
+    if theme_colors and isinstance(theme_colors, dict):
+        primary_name   = theme_colors.get('primary', '')
+        secondary_name = theme_colors.get('secondary', '')
+        primary_hex    = _resolve_color_hex(primary_name)
+        secondary_hex  = _resolve_color_hex(secondary_name)
+        primary_str    = primary_hex or primary_name or '(not specified)'
+        secondary_str  = secondary_hex or secondary_name or '(not specified)'
+        if primary_name or secondary_name:
+            color_hint = f"""
+=== CUSTOM COLOR THEME ===
+Primary color: {primary_str}  (name: {primary_name})
+Secondary color: {secondary_str}  (name: {secondary_name})
+Rules:
+1. Set "primary" in design_system.theme to {primary_str if primary_hex else 'an appropriate hex for "' + primary_name + '"'}.
+2. Set "secondary" in design_system.theme to {secondary_str if secondary_hex else 'an appropriate hex for "' + secondary_name + '"'}.
+3. Derive "accent", "accent2", and "bg_dark" from the primary color.
+4. Ensure text contrast is readable on all backgrounds.
+"""
 
     prompt = f"""
 You are an expert presentation strategist.
 Create a {tone} PowerPoint deck on: "{topic}".
 Return ONLY valid JSON. No markdown fences. No commentary.
-
 Generate exactly {target} slides.
+
+{color_hint}
 
 === REQUIRED TOP-LEVEL STRUCTURE ===
 {{
@@ -1290,20 +1607,17 @@ Generate exactly {target} slides.
 
 === SLIDE RULES ===
 Slide 1: layout = "title_cover"
-Slide 2: layout = "section_index" (agenda/contents)
-Slides 3-N: choose the BEST layout for each section's content type.
-  - Avoid repeating the same layout in consecutive slides.
-  - Use concrete facts, real companies, real numbers — no generic filler.
-  - Generate smart, presentation-ready slide titles.
-  - Never copy the user's raw prompt/topic verbatim as a slide title.
-  - For the cover slide, write a polished executive title inspired by the topic.
-  - For content slides, each title must be a concise section heading.
+Slide 2: layout = "section_index"
+Slides 3-N: choose the BEST layout for each content type.
+- Avoid repeating the same layout in consecutive slides.
+- Use concrete facts, real companies, real numbers.
+- Generate smart, concise slide titles. Never copy the user's raw prompt verbatim.
 
 === EVERY SLIDE MUST HAVE ===
-title, subtitle, layout, icon (single char like ▸ ◆ ✓), content (list of strings), style object.
+title, subtitle, layout, icon (single char ▸ ◆ ✓), content (list of strings), style object.
 
 style object fields (all required):
-  pattern_name, surface ("light" or "tint"),
+  pattern_name, surface ("light"|"tint"),
   header_variant ("solid"|"split"|"banded"),
   card_variant ("outline"|"soft"|"banded"),
   footer_variant ("solid"|"line"),
@@ -1316,65 +1630,91 @@ style object fields (all required):
   content: [2-3 short highlight strings]
 
 "section_index":
-  sections: [4-7 short section title strings matching the deck flow]
+  sections: [4-7 short section title strings]
   content: same as sections
 
 "bullets":
-  content: [5-6 substantive bullet strings, use **bold** for key terms]
+  content: [5-6 substantive bullet strings]
 
 "two_column":
-  left_title: "string"
-  right_title: "string"
-  left_points: ["4 substantive bullet strings"]
-  right_points: ["4 substantive bullet strings"]
-  content: []
+  left_title, right_title,
+  left_points: [4 strings], right_points: [4 strings], content: []
 
 "big_stat":
-  stat: "real metric e.g. 87%, $4.2B, 3.1x"
-  stat_label: "short descriptor"
-  stat_source: "Source, Year"
-  content: ["4-5 supporting bullet strings"]
+  stat, stat_label, stat_source,
+  content: [4-5 supporting strings]
 
 "timeline":
-  steps: [{{"label":"Phase/Year","detail":"1-sentence description"}}, ...4 items]
+  steps: [{{"label":"Phase","detail":"1-sentence description"}}, ...4 items]
   content: []
 
 "icon_grid":
-  grid_items: [{{"icon":"▸","title":"2-3 word title","detail":"1-sentence description"}}, ...4 items]
+  grid_items: [{{"icon":"A","title":"2-3 words","detail":"1 sentence"}}, ...4 items]
   content: []
 
 "case_study":
-  company: "Real organisation name"
-  result: "One-sentence outcome"
-  metrics: [{{"label":"metric name","value":75}}, ...2-3 items, value 1-99]
-  content: ["Exactly 3 short supporting bullet strings with no duplicates"]
+  company, result,
+  metrics: [{{"label":"name","value":75}}, ...2-3 items],
+  content: [3 strings]
 
 "table":
-  table_columns: ["Col1","Col2","Col3","Col4"]
-  table_rows: [["v1","v2","v3","v4"], ...4-5 rows]
-  content: []
+  table_columns: [3-5 strings], table_rows: [[...], ...4-5 rows], content: []
 
 "chart":
-  chart_title: "string"
-  chart_data: [{{"label":"name","value":75}}, ...4-5 items, value 1-100]
-  chart_source: "optional source"
-  content: []
+  chart_title, chart_data: [{{"label":"name","value":75}}, ...4-5 items],
+  chart_source, content: []
 
 "hybrid_insight":
-  stat: "e.g. 2.4x"
-  stat_label: "descriptor"
-  chart_data: [{{"label":"name","value":75}}, ...3 items]
-  content: ["4-5 bullet strings"]
+  stat, stat_label,
+  chart_data: [{{"label":"name","value":75}}, ...3 items],
+  content: [4-5 strings]
+
+=== CONTENT FORMAT — ABSOLUTE RULES ===
+Every string in content, left_points, right_points, sections, step details MUST be:
+- Plain English only. Start with a capital letter or digit.
+- 5 to 20 words long.
+- NO icon names of any kind: never write check-circle, check_circle, star, arrow,
+  bullet, circle, heart, flag, check, trending_up, handshake, thank_you, or ANY
+  other icon/UI keyword — not even as a prefix.
+- NO markdown syntax: no **bold**, no *italic*, no `code`.
+- NO bullet prefixes: no •, -, –, →, ✓, ▸ at the start of strings.
+- NO emoji characters.
+
+BAD (never generate):
+  "**check-circle** AI is transforming industries"
+  "check-circle AI continues to transform..."
+  "• Strategic investment is key"
+  "arrow Collaboration drives growth"
+
+GOOD (always generate):
+  "AI is transforming industries with unprecedented speed and impact."
+  "Strategic investment in AI technologies is crucial for competitive advantage."
+  "Collaboration across sectors will drive sustainable growth."
 
 === FORMATTING SAFETY RULES ===
-- Keep all text concise enough to fit cleanly on a slide.
+- Keep text concise enough to fit on a slide.
 - Never generate duplicate bullets.
-- Keep metric labels short.
-- Keep value strings like "25%" or "+98%" on one line.
+- Keep metric labels 2-4 words max.
+- Output ONLY valid JSON. No markdown fences. No commentary. No extra keys.
 """
-    resp        = _client.chat.completions.create(
+
+    resp = _client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
-        messages=[{"role":"user","content":prompt}],
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a JSON-only presentation content generator. "
+                    "You output ONLY valid JSON — no markdown, no fences, no commentary. "
+                    "Every text value must be plain English prose starting with a capital letter. "
+                    "You MUST NEVER include icon names (check-circle, check_circle, star, arrow, "
+                    "trending_up, handshake, thank_you, bullet, circle, heart, flag, etc.) "
+                    "or markdown (**bold**, *italic*) anywhere in your output. "
+                    "No emoji. No bullet symbol prefixes."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.6,
         max_tokens=7000,
     )
@@ -1385,6 +1725,23 @@ style object fields (all required):
     if not isinstance(data, dict): data = {}
     data.setdefault("design_system", {})
     data.setdefault("slides", [])
+
+    # Override theme colors (highest priority)
+    if theme_colors and isinstance(theme_colors, dict):
+        design = data["design_system"].setdefault("theme", {})
+        for key, field in [('primary', 'primary'), ('secondary', 'secondary')]:
+            name = theme_colors.get(key, '')
+            if name:
+                hex_val = _resolve_color_hex(name)
+                if hex_val:
+                    design[field] = hex_val
+                    if field == 'primary':
+                        design['accent'] = hex_val
+                    else:
+                        design['accent2'] = hex_val
+        if theme_colors.get('secondary') == "white" or theme_colors.get('primary') == "white":
+            design["bg_light"] = "#FFFFFF"
+            design["card_bg"]  = "#FFFFFF"
 
     slides     = [s for s in data["slides"] if isinstance(s,dict)]
     normalized = []
@@ -1407,7 +1764,32 @@ style object fields (all required):
         normalized[1]["sections"] = secs
         normalized[1]["content"]  = secs
 
+    # Clean thank-you slide
+    if normalized and normalized[-1].get("title", "").lower() in ["thank you", "thanks", "q&a"]:
+        normalized[-1] = {
+            "title": "Thank You", "subtitle": "Questions?",
+            "layout": "title_cover", "icon": "▸",
+            "content": [], "style": {}
+        }
     normalized = normalized[:target]
+
+    for i, slide in enumerate(normalized):
+        if any(w in slide.get("title", "").lower() for w in ["thank", "thanks", "q&a", "questions"]):
+            slide.update({"title": "Thank You", "subtitle": "Questions?",
+                          "layout": "title_cover", "content": []})
+            break
+
+    # Convert temporal trend bullets → chart
+    for slide in normalized:
+        if slide.get("layout") == "bullets":
+            content = slide.get("content", [])
+            pattern = re.compile(r'^\s*(\d{4})\s*[:：]\s*(\d+(?:\.\d+)?)%?\s*$')
+            matches = [(m.group(1), m.group(2)) for line in content for m in [pattern.match(line.strip())] if m]
+            if len(matches) >= 3:
+                slide["layout"]      = "chart"
+                slide["chart_title"] = slide.get("title", "Trend Over Years")
+                slide["chart_data"]  = [{"label": y, "value": int(float(v))} for y, v in matches]
+                slide["content"]     = []
 
     repaired = []
     for s in normalized:
@@ -1463,8 +1845,7 @@ def create_ppt(slide_data, topic, logo_path=None, tone="Professional", content_i
             "content": [f"No slide data was returned for: {topic}. Please try again."],
         }, 1, theme, profile, logo_path)
 
-    safe = re.sub(r"[^\w\-]","_", topic)[:60]
-    os.makedirs("generated", exist_ok=True)
-    path = f"generated/{safe}.pptx"
-    prs.save(path)
-    return path
+    buffer = BytesIO()
+    prs.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
