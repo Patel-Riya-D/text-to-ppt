@@ -335,6 +335,33 @@ def _font_pt(size, role="body"):
     if role == "title":    return max(size, round(size * 1.08, 1))
     if role == "subtitle": return max(size, round(size * 1.10, 1))
     return max(size, round(size * 1.09, 1))
+
+def _fit_big_stat_font(stat: str) -> int:
+    """
+    Size the large metric text so multi-line values do not collide.
+    """
+    text = _safe_str(stat)
+    if not text:
+        return 48
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        lines = [text]
+    line_count = len(lines)
+    longest = max(len(line) for line in lines)
+
+    if line_count >= 4:
+        return 28
+    if line_count == 3:
+        return 32 if longest <= 10 else 28
+    if line_count == 2:
+        return 40 if longest <= 12 else 36
+    if len(text) <= 4:
+        return 72
+    if len(text) <= 8:
+        return 60
+    if len(text) <= 14:
+        return 52
+    return 44
 def _is_neutral(c, thr=0.16):
     r,g,b = [v/255 for v in c]
     _,s,_ = colorsys.rgb_to_hsv(r,g,b)
@@ -569,11 +596,17 @@ def _build_theme(palette_name: str, design_system: dict, logo_path: str = None) 
         hf=pal["hf"], bf=pal["bf"],
     )
     raw = design_system.get("theme", {}) if isinstance(design_system, dict) else {}
+    def _theme_color_value(value, fallback):
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in COLOR_HEX_MAP:
+                value = COLOR_HEX_MAP[token]
+        return _parse_color(value, fallback)
     for key, tkey in [("primary","p"),("secondary","s"),("accent","a"),("accent2","a2"),
                       ("bg_dark","dk"),("bg_light","bg"),("text_dark","td"),
                       ("text_light","tl"),("text_muted","muted"),("card_bg","card")]:
         if key in raw:
-            theme[tkey] = _parse_color(raw[key], theme[tkey])
+            theme[tkey] = _theme_color_value(raw[key], theme[tkey])
     for fkey in ("header_font","body_font"):
         tkey = "hf" if fkey=="header_font" else "bf"
         if fkey in raw and isinstance(raw[fkey], str) and raw[fkey].strip():
@@ -629,7 +662,8 @@ def _tb(slide, text, x, y, w, h, size, bold=False, italic=False,
 def _bullets(slide, points, x, y, w, h, size=16, icon="▸",
              ic=None, tc=None, face="Calibri", maxp=6):
     if not points: return
-    ic = ic or _BASE["s"]; tc = tc or _BASE["td"]
+    ic = ic or _BASE["a"]; tc = tc or _BASE["td"]
+
     icon = _sanitize_icon_marker(icon)
     # ── ICON LEAK FIX: clean every bullet at the last mile ──────────────────
     pts = [_clean_bullet_text(_safe_str(p)) for p in points if _safe_str(p)]
@@ -648,15 +682,16 @@ def _bullets(slide, points, x, y, w, h, size=16, icon="▸",
     tf = bx.text_frame; tf.word_wrap = True
     tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE if n<=3 else MSO_ANCHOR.TOP
-    first = True
+    first = False
     sp = 13 if n<=3 else (6 if n>=7 else 8)
     for pt in pts:
         p = tf.paragraphs[0] if first else tf.add_paragraph()
         first = False
         p.space_before = Pt(sp); p.space_after = Pt(sp)
         ir = p.add_run(); ir.text = f"{icon}  "
-        ir.font.size=Pt(_font_pt(size-1)); ir.font.bold=True
-        ir.font.name=face; ir.font.color.rgb=_c(ic)
+        ir.font.size = Pt(_font_pt(size + 1)); ir.font.bold = True
+        ir.font.name = "Segoe UI Symbol"
+        ir.font.color.rgb = _c(ic)
         # Split on ** only after the text is already clean
         for i, part in enumerate(pt.split("**")):
             if not part: continue
@@ -860,7 +895,7 @@ def render_bullets(slide, spec, num, theme, profile, logo_path=None):
     clean_content = _validate_and_clean_content(_flatten_to_strings(spec.get("content", [])))
     _bullets(slide, clean_content, ix, iy, iw, ih,
              size=16, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
+             ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_two_column(slide, spec, num, theme, profile, logo_path=None):
@@ -878,18 +913,23 @@ def render_two_column(slide, spec, num, theme, profile, logo_path=None):
         mid = max(1, len(content)//2)
         lp, rp = content[:mid], content[mid:]
     icon = spec.get("icon","▸")
+    # Use the stronger accent for the bullet glyph in two-column layouts.
+    # The lighter secondary accent can disappear against the white card in some
+    # themes / export paths, which makes the bullets look missing even though
+    # the text is present.
+    bullet_ic = theme["a"]
     hh   = 0.46
     _rect(slide, ix, iy, cw, hh, theme["p"])
     _tb(slide, lt, ix+0.10, iy+0.08, cw-0.20, hh-0.12, 15,
         bold=True, color=_contrast_text(theme["p"]), face=theme["hf"])
     _bullets(slide, lp, ix+0.10, iy+hh+0.10, cw-0.20, ih-hh-0.16,
-             size=15, icon=icon, ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
+             size=15, icon=icon, ic=bullet_ic, tc=theme["td"], face=theme["bf"], maxp=20)
     rx = ix+cw+gap
     _rect(slide, rx, iy, cw, hh, theme["a2"])
     _tb(slide, rt, rx+0.10, iy+0.08, cw-0.20, hh-0.12, 15,
         bold=True, color=_contrast_text(theme["a2"]), face=theme["hf"])
     _bullets(slide, rp, rx+0.10, iy+hh+0.10, cw-0.20, ih-hh-0.16,
-             size=15, icon=icon, ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=20)
+             size=15, icon=icon, ic=bullet_ic, tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
@@ -902,16 +942,20 @@ def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
     label  = _safe_str(spec.get("stat_label",""))
     source = _safe_str(spec.get("stat_source",""))
     pts    = _validate_and_clean_content(_safe_list(spec.get("content",[])))
-    sfont = 72 if len(stat)<=4 else 54
+    stat_lines = [line.strip() for line in stat.splitlines() if line.strip()] or [stat]
+    sfont = _fit_big_stat_font(stat)
+    stat_box_h = 1.90 if len(stat_lines) == 1 else 2.05 if len(stat_lines) == 2 else 2.25
     _rect(slide, ix, iy, pw, ih, theme["p"])
     _rect(slide, ix, iy, pw, 0.07, theme["a2"])
-    _tb(slide, stat, ix+0.10, iy+0.38, pw-0.20, 1.80, sfont,
-        bold=True, color=_contrast_text(theme["p"]), face=theme["hf"], align=PP_ALIGN.CENTER)
-    _tb(slide, label, ix+0.10, iy+2.25, pw-0.20, 0.75, 15,
-        color=_contrast_text(theme["p"]), face=theme["bf"], align=PP_ALIGN.CENTER)
+    _tb(slide, stat, ix+0.10, iy+0.28, pw-0.20, stat_box_h, sfont,
+        bold=True, color=_contrast_text(theme["p"]), face=theme["hf"], align=PP_ALIGN.CENTER, shrink=True)
+    label_y = iy + (2.15 if len(stat_lines) == 1 else 2.38 if len(stat_lines) == 2 else 2.62)
+    _tb(slide, label, ix+0.10, label_y, pw-0.20, 0.62, 14,
+        color=_contrast_text(theme["p"]), face=theme["bf"], align=PP_ALIGN.CENTER, shrink=True)
     if source:
-        _tb(slide, source, ix+0.10, iy+3.05, pw-0.20, 0.50, 11,
-            italic=True, color=_contrast_text(theme["p"]), face=theme["bf"], align=PP_ALIGN.CENTER)
+        source_y = label_y + 0.62
+        _tb(slide, source, ix+0.10, source_y, pw-0.20, 0.46, 10,
+            italic=True, color=_contrast_text(theme["p"]), face=theme["bf"], align=PP_ALIGN.CENTER, shrink=True)
     try:
         pct = float(stat.replace("%","").replace("+","").strip())
         if 0 < pct < 100:
@@ -922,7 +966,7 @@ def render_big_stat(slide, spec, num, theme, profile, logo_path=None):
     bx = ix+pw+0.22; bw2 = iw-pw-0.22
     _bullets(slide, pts, bx, iy+0.10, bw2, ih-0.20,
              size=14, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
+             ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_timeline(slide, spec, num, theme, profile, logo_path=None):
@@ -1054,7 +1098,7 @@ def render_case_study(slide, spec, num, theme, profile, logo_path=None):
     if bul_h > 0.30 and pts:
         max_bullets = min(4, max(1, int(bul_h / 0.36)))
         _bullets(slide, pts, ix+0.10, bul_y, iw-0.20, bul_h,
-                 size=14, icon=icon, ic=theme["s"], tc=theme["td"],
+                 size=14, icon=icon, ic=theme["a"], tc=theme["td"],
                  face=theme["bf"], maxp=max_bullets)
     _add_page_number(slide, num, theme, profile["footer"])
 
@@ -1136,7 +1180,7 @@ def render_chart(slide, spec, num, theme, profile, logo_path=None):
             _tb(slide, "Key Takeaways", ix+0.02, take_y, iw-0.04, 0.26, 13,
                 bold=True, color=_contrast_text(theme["card"]), face=theme["hf"])
             _bullets(slide, content, ix+0.00, take_y+0.20, iw-0.04, max(0.30, iy+ih-take_y-0.40),
-                     size=13, icon="▸", ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=4)
+                     size=13, icon="▸", ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=4)
     _add_page_number(slide, num, theme, profile["footer"])
 
 def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
@@ -1147,17 +1191,31 @@ def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
     lw    = iw*0.43; gap = 0.20; rw = iw-lw-gap; rx = ix+lw+gap
     stat  = _safe_str(spec.get("stat","—"))
     label = _safe_str(spec.get("stat_label","Key Indicator"))
+    source = _safe_str(spec.get("stat_source",""))
     left_fill = _mix(theme["card"],theme["s"],0.86)
     _rect(slide, ix, iy, lw, ih, left_fill, line=theme["s"], lw=1.0)
-    sfont = 52 if len(stat)<=4 else 42
-    _tb(slide, stat, ix+0.12, iy+0.30, lw-0.24, 1.15, sfont,
+    # Break long stat strings into cleaner lines so the KPI never collides
+    # with the label or source text.
+    stat_lines = stat.replace("  ", " ").strip()
+    if " " in stat_lines and "\n" not in stat_lines:
+        parts = stat_lines.split()
+        if len(parts) >= 3:
+            stat_lines = f"{parts[0]}\n{' '.join(parts[1:-1])}\n{parts[-1]}"
+        elif len(parts) == 2:
+            stat_lines = f"{parts[0]}\n{parts[1]}"
+    stat_height = 1.55 if "\n" in stat_lines else 1.20
+    sfont = 40 if len(stat_lines) <= 8 else 34
+    _tb(slide, stat_lines, ix+0.12, iy+0.22, lw-0.24, stat_height, sfont,
         bold=True, color=_contrast_text(left_fill), face=theme["hf"], align=PP_ALIGN.CENTER)
-    _tb(slide, label, ix+0.12, iy+1.45, lw-0.24, 0.42, 13,
+    _tb(slide, label, ix+0.12, iy+1.86, lw-0.24, 0.34, 12,
         color=_contrast_text(left_fill), face=theme["bf"], align=PP_ALIGN.CENTER)
+    if source:
+        _tb(slide, source, ix+0.10, iy+2.24, lw-0.20, 0.30, 9,
+            italic=True, color=_contrast_text(left_fill), face=theme["bf"], align=PP_ALIGN.CENTER)
     chart = [r for r in (spec.get("chart_data") or []) if isinstance(r,dict)][:3]
     if chart:
         vmax = max(max(1,_parse_int(r.get("value",1),default=1,lo=1,hi=100)) for r in chart)
-        by   = iy+2.05; row_h = 0.26; row_gap = 0.16
+        by   = iy+2.68; row_h = 0.26; row_gap = 0.16
         for i, row in enumerate(chart):
             y   = by + i*(row_h+row_gap)
             v   = max(1, _parse_int(row.get("value",1),default=1,lo=1,hi=100))
@@ -1179,7 +1237,7 @@ def render_hybrid_insight(slide, spec, num, theme, profile, logo_path=None):
     clean_content = _validate_and_clean_content(_flatten_to_strings(spec.get("content",[])))
     _bullets(slide, clean_content, rx+0.10, iy+0.10, rw-0.20, ih-0.20,
              size=14, icon=spec.get("icon","▸"),
-             ic=theme["s"], tc=theme["td"], face=theme["bf"], maxp=20)
+             ic=theme["a"], tc=theme["td"], face=theme["bf"], maxp=20)
     _add_page_number(slide, num, theme, profile["footer"])
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1545,34 +1603,74 @@ COLOR_HEX_MAP = {
     "dark red": "#B71C1C", "light red": "#EF9A9A",
 }
 
+def _hex_to_rgb(hex_color: str):
+    s = str(hex_color or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", s):
+        return None
+    return tuple(int(s[i:i+2], 16) for i in (0, 2, 4))
+
+def _rgb_to_hex(rgb):
+    return "#{:02X}{:02X}{:02X}".format(*[max(0, min(255, int(v))) for v in rgb])
+
+def _mix_hex(hex_a: str, hex_b: str, t: float) -> str:
+    rgb_a = _hex_to_rgb(hex_a)
+    rgb_b = _hex_to_rgb(hex_b)
+    if not rgb_a or not rgb_b:
+        return hex_a or hex_b or "#000000"
+    t = max(0.0, min(1.0, float(t)))
+    mixed = tuple(int(rgb_a[i] + (rgb_b[i] - rgb_a[i]) * t) for i in range(3))
+    return _rgb_to_hex(mixed)
+
+def _resolve_theme_color(name: str):
+    token = str(name or "").strip().lower()
+    if not token:
+        return ""
+    if token in COLOR_HEX_MAP:
+        return COLOR_HEX_MAP[token]
+    if re.fullmatch(r"#?[0-9A-Fa-f]{6}", token):
+        return token if token.startswith("#") else f"#{token}"
+    return ""
+
+def _prioritize_user_theme(primary_name: str, secondary_name: str):
+    """
+    Prefer a vivid color as the primary theme color.
+
+    Requests such as "white and green" should render as a white background
+    with green accents, not a gray-first palette.
+    """
+    neutral = {"white", "black", "gray", "grey", "silver"}
+    p = str(primary_name or "").strip().lower()
+    s = str(secondary_name or "").strip().lower()
+    if p in neutral and s and s not in neutral:
+        return secondary_name, primary_name
+    return primary_name, secondary_name
+
 def generate_slide_content(topic: str, num_slides: int = 6,
                            tone: str = "Professional", theme_colors: dict = None) -> dict:
     target       = max(3, int(num_slides or 6))
     palette_name = random.choice(list(PALETTES.keys()))
 
-    def _resolve_color_hex(name: str) -> str:
-        if not name: return ""
-        name_stripped = name.strip()
-        if re.fullmatch(r"#?[0-9A-Fa-f]{6}", name_stripped):
-            return name_stripped if name_stripped.startswith("#") else f"#{name_stripped}"
-        return COLOR_HEX_MAP.get(name_stripped.lower(), "")
-
     color_hint = ""
     if theme_colors and isinstance(theme_colors, dict):
-        primary_name   = theme_colors.get('primary', '')
-        secondary_name = theme_colors.get('secondary', '')
-        primary_hex    = _resolve_color_hex(primary_name)
-        secondary_hex  = _resolve_color_hex(secondary_name)
+        primary_name   = str(theme_colors.get('primary', '') or '').strip()
+        secondary_name = str(theme_colors.get('secondary', '') or '').strip()
+        primary_name, secondary_name = _prioritize_user_theme(primary_name, secondary_name)
+        primary_hex    = _resolve_theme_color(primary_name)
+        secondary_hex  = _resolve_theme_color(secondary_name)
+        extra_names    = theme_colors.get("accent_candidates", []) if isinstance(theme_colors.get("accent_candidates", []), list) else []
+        primary_name   = str(theme_colors.get("primary", "") or "").strip()
+        secondary_name = str(theme_colors.get("secondary", "") or "").strip()
+        primary_name, secondary_name = _prioritize_user_theme(primary_name, secondary_name)
         primary_str    = primary_hex or primary_name or '(not specified)'
         secondary_str  = secondary_hex or secondary_name or '(not specified)'
-        if primary_name or secondary_name:
+        if primary_hex or secondary_hex:
             color_hint = f"""
 === CUSTOM COLOR THEME ===
 Primary color: {primary_str}  (name: {primary_name})
 Secondary color: {secondary_str}  (name: {secondary_name})
 Rules:
-1. Set "primary" in design_system.theme to {primary_str if primary_hex else 'an appropriate hex for "' + primary_name + '"'}.
-2. Set "secondary" in design_system.theme to {secondary_str if secondary_hex else 'an appropriate hex for "' + secondary_name + '"'}.
+1. Set "primary" in design_system.theme to {primary_str}.
+2. Set "secondary" in design_system.theme to {secondary_str}.
 3. Derive "accent", "accent2", and "bg_dark" from the primary color.
 4. Ensure text contrast is readable on all backgrounds.
 """
@@ -1729,19 +1827,31 @@ GOOD (always generate):
     # Override theme colors (highest priority)
     if theme_colors and isinstance(theme_colors, dict):
         design = data["design_system"].setdefault("theme", {})
-        for key, field in [('primary', 'primary'), ('secondary', 'secondary')]:
-            name = theme_colors.get(key, '')
-            if name:
-                hex_val = _resolve_color_hex(name)
-                if hex_val:
-                    design[field] = hex_val
-                    if field == 'primary':
-                        design['accent'] = hex_val
-                    else:
-                        design['accent2'] = hex_val
-        if theme_colors.get('secondary') == "white" or theme_colors.get('primary') == "white":
+        data["design_system"]["theme_meta"] = {"source": "user"}
+        primary_name   = str(theme_colors.get("primary", "") or "").strip()
+        secondary_name = str(theme_colors.get("secondary", "") or "").strip()
+        primary_hex    = _resolve_theme_color(primary_name)
+        secondary_hex  = _resolve_theme_color(secondary_name)
+
+        if primary_hex:
+            design["primary"] = primary_hex
+            design["accent"] = _mix_hex(primary_hex, "#000000", 0.16)
+            design["bg_dark"] = _mix_hex(primary_hex, "#000000", 0.45)
+        if secondary_hex:
+            design["secondary"] = secondary_hex
+            design["accent2"] = _mix_hex(secondary_hex, "#FFFFFF", 0.20)
+        elif primary_hex:
+            design["secondary"] = _mix_hex(primary_hex, "#FFFFFF", 0.28)
+            design["accent2"] = _mix_hex(primary_hex, "#FFFFFF", 0.18)
+
+        if secondary_name.lower() in ("white", "light") or primary_name.lower() in ("white", "light"):
             design["bg_light"] = "#FFFFFF"
-            design["card_bg"]  = "#FFFFFF"
+            design["card_bg"] = "#FFFFFF"
+        if extra_names:
+            design["accent_candidates"] = [
+                _resolve_theme_color(name) for name in extra_names
+                if _resolve_theme_color(name)
+            ][:3]
 
     slides     = [s for s in data["slides"] if isinstance(s,dict)]
     normalized = []
@@ -1821,7 +1931,11 @@ def create_ppt(slide_data, topic, logo_path=None, tone="Professional", content_i
     global _LOGO_PATH
     _LOGO_PATH = logo_path
 
-    palette_name = random.choice(list(PALETTES.keys()))
+    theme_meta = design.get("theme_meta", {}) if isinstance(design, dict) else {}
+    if isinstance(theme_meta, dict) and theme_meta.get("source") == "user":
+        palette_name = "classic"
+    else:
+        palette_name = random.choice(list(PALETTES.keys()))
     theme        = _build_theme(palette_name, design, logo_path)
     profile      = PROFILES[palette_name]
 

@@ -1,144 +1,3 @@
-"""
-app.py
-======
-
-Frontend conversational interface for the AI PPT Generator system.
-
-Built using Streamlit, this module provides a fully interactive,
-chat-based experience for creating, editing, and managing presentations.
-
-──────────────────────────────────────────────────────────────
-
-💬 Core Features
-
-1. Conversational PPT Creation
-
-   * Users can create presentations using natural language
-   * Example: "Create a PPT on Generative AI with 5 slides"
-
-2. Multi-Turn Chat Intelligence
-
-   * Maintains session memory
-   * Supports follow-up edits:
-
-     * "Edit slide 3"
-     * "Add more points"
-     * "Change tone to formal"
-
-3. Slot-Filling Workflow
-
-   * Dynamically collects required inputs:
-
-     * topic
-     * number of slides
-     * tone
-   * Avoids hardcoded flows
-
-4. Live PPT Preview
-
-   * Displays slides inside chat UI
-   * Shows structured content before final generation
-
-5. PPT Editing System
-
-   * Users can modify:
-
-     * slide titles
-     * bullet points
-     * layouts (chart, timeline, etc.)
-   * Changes reflected instantly
-
-6. PPT History & Switching
-
-   * Maintains multiple generated presentations
-   * Allows switching between them using semantic search
-
-──────────────────────────────────────────────────────────────
-
-🧹 Content Cleaning Layer
-
-To ensure clean output:
-
-* Removes icon tokens (check-circle, handshake, etc.)
-* Strips markdown and emojis
-* Ensures only plain text is displayed in UI
-
-Functions:
-
-* clean_icon_tokens()
-* flatten_slide_content()
-
-──────────────────────────────────────────────────────────────
-
-🔗 Backend Integration
-
-Communicates with FastAPI backend:
-
-* /generate-outline → Generates slide structure
-* /build-ppt       → Generates final PPT file
-
-Handles:
-
-* API requests
-* Response parsing
-* Error handling
-
-──────────────────────────────────────────────────────────────
-
-📦 Session State Management
-
-Uses Streamlit session_state to manage:
-
-* chat history
-* current presentation
-* slide data
-* token usage
-* user inputs
-
-──────────────────────────────────────────────────────────────
-
-🎯 Design Principle
-
-The UI follows a strict conversational model:
-
-```
-User Input → Intent Detection → Slot Filling → API Call → Preview → Edit → Download
-```
-
-No static flows — everything is dynamic and context-aware.
-
-──────────────────────────────────────────────────────────────
-
-🚀 Key Functions
-
-* init_state()
-  Initializes session variables
-
-* flatten_slide_content()
-  Converts structured content into displayable bullets
-
-* render_inline_preview()
-  Displays slides in chat interface
-
-* save_editor_content()
-  Handles user edits to slides
-
-──────────────────────────────────────────────────────────────
-
-🎯 Goal
-
-To provide a seamless, intelligent, and interactive experience for:
-
-* creating presentations
-* editing slides
-* previewing content
-* downloading final PPT
-
-All through natural conversation.
-
-──────────────────────────────────────────────────────────────
-"""
-
 import base64
 import copy
 import os
@@ -207,6 +66,13 @@ def clean_bullet_icon(icon: str, fallback: str = "▸") -> str:
         return token
     return fallback
 
+
+def _norm_text(v):
+    """Normalize text for fuzzy PPT/topic matching."""
+    s = str(v or "").casefold()
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return s
+
 # ------------------------------------------------------------------------------
 #  COLOR EXTRACTION UTILITIES
 # ------------------------------------------------------------------------------
@@ -218,38 +84,82 @@ _COLOR_NAMES = {
     "dark red", "light red", "mint", "lavender", "coral"
 }
 
+_COLOR_NAMES_ORDERED = sorted(_COLOR_NAMES, key=len, reverse=True)
+_COLOR_NAME_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in _COLOR_NAMES_ORDERED) + r")\b",
+    re.IGNORECASE,
+)
+_NEUTRAL_THEME_COLORS = {"white", "black", "gray", "grey", "silver"}
+
+def _prioritize_theme_colors(colors: list[str]) -> list[str]:
+    """
+    Prefer a vivid color as the primary theme color.
+
+    This keeps requests like "white and green" from turning the deck into
+    a gray-first palette, which would make headers and accents feel dull.
+    """
+    if len(colors) < 2:
+        return colors
+    primary = str(colors[0]).strip().lower()
+    secondary = str(colors[1]).strip().lower()
+    if primary in _NEUTRAL_THEME_COLORS and secondary not in _NEUTRAL_THEME_COLORS:
+        reordered = [colors[1], colors[0]]
+        if len(colors) > 2:
+            reordered.extend(colors[2:])
+        return reordered
+    return colors
+
+
 def extract_theme_colors(text: str) -> dict:
     """Extract primary/secondary color names from natural language."""
     if not text:
         return {}
+
     lower = text.lower()
-    colors = {}
-    # Pattern: "X and Y theme/color"
-    m = re.search(
-        r'(\b(?:dark|light)?\s*\w+)\s+and\s+(\b(?:dark|light)?\s*\w+)\s*(?:theme|color|colors|palette)',
-        lower
-    )
-    if m:
-        c1, c2 = m.group(1).strip(), m.group(2).strip()
-        if c1 in _COLOR_NAMES:
-            colors["primary"] = c1
-        if c2 in _COLOR_NAMES:
-            colors["secondary"] = c2
-    if not colors:
-        m = re.search(r'(\b(?:dark|light)?\s*\w+)\s+(?:theme|color|colors)', lower)
+    colors = []   # ✅ FIX: initialize
+
+    # 🎯 Detect "blue and white" type patterns
+    paired_patterns = [
+        r"(?P<first>" + _COLOR_NAME_PATTERN.pattern[2:-2] + r")\s+and\s+(?P<second>" + _COLOR_NAME_PATTERN.pattern[2:-2] + r")",
+    ]
+
+    for pat in paired_patterns:
+        m = re.search(pat, lower, re.IGNORECASE)
         if m:
-            c = m.group(1).strip()
-            if c in _COLOR_NAMES:
-                colors["primary"] = c
+            first = m.group("first").strip().lower()
+            second = m.group("second").strip().lower()
+            for c in (first, second):
+                if c in _COLOR_NAMES and c not in colors:
+                    colors.append(c)
+            break
+
+    # 🎯 fallback: detect any color words
     if not colors:
-        m = re.search(r'with\s+(\w+)\s+and\s+(\w+)', lower)
-        if m:
-            c1, c2 = m.group(1), m.group(2)
-            if c1 in _COLOR_NAMES:
-                colors["primary"] = c1
-            if c2 in _COLOR_NAMES:
-                colors["secondary"] = c2
-    return colors
+        for m in _COLOR_NAME_PATTERN.finditer(lower):
+            c = m.group(1).strip().lower()
+            if c not in colors:
+                colors.append(c)
+
+    if not colors:
+        return {}
+
+    colors = _prioritize_theme_colors(colors)
+
+    result = {"primary": colors[0]}
+    if len(colors) > 1:
+        result["secondary"] = colors[1]
+
+    return result   # ✅ IMPORTANT
+
+def extract_theme_colors_from_messages(messages: list) -> dict:
+    """Find the first user message that explicitly mentions theme colors."""
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        colors = extract_theme_colors(msg.get("content", ""))
+        if colors:
+            return colors
+    return {}
 
 # ------------------------------------------------------------------------------
 #  JSON CONTENT FLATTENING WITH CLEANING
@@ -373,9 +283,24 @@ def init_state():
         "session_id":      uuid4().hex,
         "last_question":   None,
         "pending_intent":  None,
+        "pending_new_ppt": None,
         "active_slide_index": None,
+        "last_slide_index": None,
+        "last_action_type": None,
+        "last_ppt_id": None,
         "last_build_error": None,
         "session_memory":  {"ppts": [], "current_ppt": None},
+        "active_edit_context": None,
+        "conversation_state": {
+            "active_ppt_id": None,
+            "active_slide_index": None,
+            "last_topic": "",
+            "last_action_type": None,
+            "last_action_text": "",
+            "pending_create": None,
+            "pending_edit": None,
+            "turn_summary": "",
+        },
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -386,6 +311,80 @@ init_state()
 # ------------------------------------------------------------------------------
 #  HELPER FUNCTIONS (slide utilities, history, etc.)
 # ------------------------------------------------------------------------------
+def _conv_state() -> dict:
+    state = st.session_state.get("conversation_state")
+    if not isinstance(state, dict):
+        state = {}
+        st.session_state["conversation_state"] = state
+    state.setdefault("active_ppt_id", st.session_state.get("current_ppt_id"))
+    state.setdefault("active_slide_index", st.session_state.get("active_slide_index"))
+    state.setdefault("last_topic", st.session_state.get("topic", ""))
+    state.setdefault("last_action_type", st.session_state.get("last_action_type"))
+    state.setdefault("last_action_text", "")
+    state.setdefault("pending_create", st.session_state.get("pending_new_ppt"))
+    state.setdefault("pending_edit", st.session_state.get("pending_intent"))
+    state.setdefault("turn_summary", "")
+    return state
+
+def _set_conv_state(**kwargs):
+    state = _conv_state()
+    state.update(kwargs)
+    st.session_state["conversation_state"] = state
+    if "active_ppt_id" in kwargs:
+        st.session_state["last_ppt_id"] = kwargs["active_ppt_id"]
+    if "active_slide_index" in kwargs:
+        st.session_state["active_slide_index"] = kwargs["active_slide_index"]
+        st.session_state["last_slide_index"] = kwargs["active_slide_index"]
+    if "last_topic" in kwargs:
+        st.session_state["topic"] = kwargs["last_topic"]
+    if "last_action_type" in kwargs:
+        st.session_state["last_action_type"] = kwargs["last_action_type"]
+    if "pending_create" in kwargs:
+        st.session_state["pending_new_ppt"] = kwargs["pending_create"]
+    if "pending_edit" in kwargs:
+        st.session_state["pending_intent"] = kwargs["pending_edit"]
+
+def _clear_transient_conversation_state():
+    """
+    Clear turn-specific state after an action completes.
+
+    We keep the active PPT itself, but remove stale intent/slide context so the
+    next user message is evaluated as a fresh request unless it explicitly
+    continues the previous turn.
+    """
+    current_ppt_id = st.session_state.get("current_ppt_id")
+    current_topic = st.session_state.get("topic", "")
+    state = _conv_state()
+    state.update({
+        "active_ppt_id": current_ppt_id,
+        "active_slide_index": None,
+        "last_topic": current_topic,
+        "last_action_type": None,
+        "last_action_text": "",
+        "pending_create": None,
+        "pending_edit": None,
+        "turn_summary": "",
+    })
+    st.session_state["conversation_state"] = state
+    st.session_state["pending_intent"] = None
+    st.session_state["pending_new_ppt"] = None
+    st.session_state["active_edit_context"] = None
+    st.session_state["last_action_type"] = None
+    st.session_state["active_slide_index"] = None
+    st.session_state["last_slide_index"] = None
+    st.session_state["last_ppt_id"] = current_ppt_id
+
+def _build_context_badge() -> str:
+    state = _conv_state()
+    parts = []
+    if state.get("active_ppt_id"):
+        parts.append(_ppt_display_label(state["active_ppt_id"]))
+    if state.get("active_slide_index"):
+        parts.append(f"slide {state['active_slide_index']}")
+    if state.get("last_action_type"):
+        parts.append(state["last_action_type"].replace("_", " "))
+    return " | ".join(parts) if parts else "No active deck"
+
 def add_message(role, content):
     st.session_state.messages.append({"role": role, "content": content})
 
@@ -397,7 +396,7 @@ def add_message_with_preview(role: str, text: str, preview_slides: list = None,
         "content": text,
     }
     if preview_slides:
-        entry["preview_slides"] = preview_slides
+        entry["preview_slides"] = copy.deepcopy(preview_slides)
         entry["ppt_label"] = ppt_label
     if ppt_bytes:
         entry["ppt_bytes"] = ppt_bytes
@@ -888,6 +887,14 @@ PPTs:
     return []
 
 def find_ppt_semantically(query: str, disambiguate: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    query = query or ""
+    if _is_deictic_ppt_reference(query):
+        item = get_ppt_by_id(st.session_state.get("current_ppt_id"))
+        if item and item.get("id"):
+            return item["id"], None
+    direct = _resolve_ppt_history_item(query)
+    if direct and direct.get("id"):
+        return direct["id"], None
     ranked = semantic_search_ppts(query)
     if not ranked:
         return None, None
@@ -906,6 +913,106 @@ def find_ppt_semantically(query: str, disambiguate: bool = False) -> Tuple[Optio
             return None, question
     return high_conf[0]["id"], None
 
+def _is_deictic_ppt_reference(ref: str) -> bool:
+    text = _norm_text(ref)
+    return text in {
+        "this", "it", "that", "current", "selected", "active", "current ppt",
+        "this ppt", "current presentation", "current deck", "active ppt",
+        "active presentation", "active deck", "the current", "the current ppt",
+    }
+
+def _resolve_deictic_ppt_ref() -> Optional[dict]:
+    current_id = st.session_state.get("current_ppt_id")
+    if current_id:
+        item = get_ppt_by_id(current_id)
+        if item:
+            return item
+    history = st.session_state.get("ppt_history", [])
+    if len(history) == 1:
+        return history[0]
+    return None
+
+def _match_ppt_by_topic_text(query: str) -> Optional[dict]:
+    text = _norm_text(query)
+    if not text:
+        return None
+    history = st.session_state.get("ppt_history", [])
+    generic_words = {
+        "add", "edit", "delete", "remove", "update", "change", "modify",
+        "preview", "download", "insert", "slide", "ppt", "presentation",
+        "deck", "open", "show", "go", "to", "this", "that", "it", "current",
+    }
+    text_keywords = [w for w in text.split() if w and w not in generic_words]
+    if not text_keywords:
+        return None
+
+    exact_matches = []
+    partial_matches = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        topic = _norm_text(item.get("topic", ""))
+        if not topic:
+            continue
+        topic_keywords = [w for w in topic.split() if w and w not in generic_words]
+        overlap = len(set(text_keywords) & set(topic_keywords))
+        if topic == text or text in topic or topic in text:
+            exact_matches.append((len(topic), item))
+        elif overlap >= 2:
+            partial_matches.append((overlap, item))
+    if exact_matches:
+        return sorted(exact_matches, key=lambda x: x[0], reverse=True)[0][1]
+    if partial_matches:
+        return sorted(partial_matches, key=lambda x: x[0], reverse=True)[0][1]
+    return None
+
+def _is_preview_request(user_input: str) -> bool:
+    text = user_input or ""
+    return bool(re.search(
+        r"\b(?:show|open|view|get|display|preview)\b.*\b(?:preview|ppt|presentation|deck)\b|"
+        r"\bpreview\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _extract_slide_navigation_target(user_input: str) -> Optional[int]:
+    text = user_input or ""
+    patterns = [
+        r"\b(?:go to|jump to|open|show|switch to|focus on)\s+slide\s+(\d+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+def _extract_deck_refinement_request(user_input: str) -> Optional[dict]:
+    text = (user_input or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+    tone = None
+    style_hints = []
+    if re.search(r"\b(?:more\s+)?professional\b|\bformal\b", lower):
+        tone = "Professional"
+        style_hints.append("Make the deck more polished, businesslike, and concise.")
+    if re.search(r"\bcasual\b|\bfriendly\b|\bconversational\b", lower):
+        tone = "Creative"
+        style_hints.append("Make the deck feel casual, friendly, and conversational.")
+    if re.search(r"\b(?:shorter|less text|concise|clean|clearer|simpler|important points only|key points only|remove fluff)\b", lower):
+        style_hints.append("Use shorter slides with only the most important points.")
+    if re.search(r"\bremove everything\b", lower):
+        style_hints.append("Remove extra text and leave only the core content.")
+    if not style_hints and not tone:
+        return None
+    return {
+        "tone": tone,
+        "style_hint": " ".join(style_hints).strip(),
+    }
+
 def switch_active_ppt(ppt_id: str) -> bool:
     item = get_ppt_by_id(ppt_id)
     if not item:
@@ -921,9 +1028,31 @@ def switch_active_ppt(ppt_id: str) -> bool:
     if item.get("outline_payload"):
         sync_all_editor_widgets(item["outline_payload"].get("slides", []))
     st.session_state.pending_intent = None
+    st.session_state.last_ppt_id = ppt_id
+    st.session_state.last_slide_index = None
+    st.session_state.last_action_type = None
+    st.session_state.active_slide_index = None
+    _set_conv_state(
+        active_ppt_id=ppt_id,
+        active_slide_index=None,
+        last_topic=item.get("topic", ""),
+        last_action_type=None,
+        pending_create=None,
+        pending_edit=None,
+        turn_summary=f"Switched to {_ppt_display_label(ppt_id)}",
+    )
     return True
 
 def resolve_ppt_reference(user_input: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    explicit_ref = _extract_explicit_ppt_ref_from_text(user_input)
+    if explicit_ref:
+        item = _resolve_ppt_history_item(explicit_ref)
+        if item and item.get("id"):
+            new_id = item["id"]
+            if new_id != st.session_state.get("current_ppt_id"):
+                switch_active_ppt(new_id)
+            return True, new_id, None
+
     override_patterns = [
         r"(?:in|to|switch to|open)\s+(?:the\s+)?(?:ppt|presentation)?\s*['\"]?([^'\"]+)['\"]?",
         r"(?:do this in|apply to)\s+(\d+(?:st|nd|rd|th)?\s*ppt)",
@@ -961,6 +1090,425 @@ def resolve_ppt_reference(user_input: str) -> Tuple[bool, Optional[str], Optiona
             return False, None, "No previous presentation found."
     return False, None, None
 
+def _ppt_display_label(ppt_id: str) -> str:
+    if not ppt_id:
+        return "ppt"
+    m = re.search(r"ppt_(\d+)", str(ppt_id), re.IGNORECASE)
+    if m:
+        return f"ppt {m.group(1)}"
+    return str(ppt_id).replace("_", " ")
+
+def _resolve_ppt_history_item(ppt_ref) -> Optional[dict]:
+    """
+    Resolve a deck reference like "ppt 4", "4th ppt", or a semantic title.
+    Returns the matching history item or None.
+    """
+    if ppt_ref is None:
+        return None
+    ref = str(ppt_ref).strip()
+    if not ref:
+        return None
+
+    if _is_deictic_ppt_reference(ref):
+        return _resolve_deictic_ppt_ref()
+
+    num_match = re.search(r"\b(\d+)\b", ref)
+    if num_match:
+        idx = int(num_match.group(1)) - 1
+        history = st.session_state.get("ppt_history", [])
+        if 0 <= idx < len(history):
+            return history[idx]
+
+    named = _find_named_ppt_in_text(ref)
+    if named:
+        return named
+
+    topic_match = _match_ppt_by_topic_text(ref)
+    if topic_match:
+        return topic_match
+    return None
+
+def _find_named_ppt_in_text(user_input: str) -> Optional[dict]:
+    """
+    Resolve a deck by name/topic mentioned in free-form text.
+    Prefers exact/substring matches against stored topics before semantic search.
+    """
+    text = _norm_text(user_input)
+    if not text:
+        return None
+    text_words = [w for w in text.split() if w]
+    if len(text_words) < 3:
+        return None
+    generic_words = {
+        "add", "edit", "delete", "remove", "update", "change", "modify",
+        "preview", "download", "insert", "slide", "ppt", "presentation",
+        "deck", "thank", "thanks", "you", "at", "the", "end", "new",
+    }
+    text_keywords = [w for w in text_words if w not in generic_words]
+    if len(text_keywords) < 2:
+        return None
+
+    history = st.session_state.get("ppt_history", [])
+    exact_matches = []
+    partial_matches = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        topic = _norm_text(item.get("topic", ""))
+        if not topic:
+            continue
+        topic_words = [w for w in topic.split() if w and w not in generic_words]
+        overlap = len(set(text_keywords) & set(topic_words))
+        if topic in text:
+            exact_matches.append((len(topic), item))
+        elif text in topic and overlap >= 2:
+            partial_matches.append((len(topic), item))
+        elif overlap >= 2:
+            partial_matches.append((overlap, item))
+    if exact_matches:
+        return sorted(exact_matches, key=lambda x: x[0], reverse=True)[0][1]
+    if partial_matches:
+        return sorted(partial_matches, key=lambda x: x[0], reverse=True)[0][1]
+    return None
+
+def resolve_named_ppt_context(user_input: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    If the user names a deck in a modification request, switch active context
+    to that deck before the action executes.
+    """
+    if not user_input:
+        return False, None, None
+    if not re.search(r"\b(add|edit|delete|remove|update|change|modify|preview|download|insert)\b", user_input, re.IGNORECASE):
+        return False, None, None
+    item = _find_named_ppt_in_text(user_input)
+    if item and item.get("id") != st.session_state.get("current_ppt_id"):
+        switch_active_ppt(item["id"])
+        return True, item["id"], None
+    return False, None, None
+
+def _is_slide_level_request(user_input: str) -> bool:
+    return bool(re.search(r"\bslide\s*\d+\b", user_input or "", re.IGNORECASE))
+
+def _is_deck_level_edit_request(user_input: str) -> bool:
+    text = user_input or ""
+    edit_verbs = r"(?:edit|change|update|modify|revise|adjust)"
+    deck_ref = r"(?:ppt|presentation|deck)\s*\d+"
+    return bool(
+        re.search(rf"\b{edit_verbs}\b.*\b{deck_ref}\b", text, re.IGNORECASE)
+        and not _is_slide_level_request(text)
+    )
+
+def _is_topic_ideas_request(user_input: str) -> bool:
+    text = user_input or ""
+    return bool(re.search(
+        r"\b("
+        r"topic ideas|topic idea|suggest topic|suggest topics|new topic|new topics|"
+        r"brainstorm topic|brainstorm topics|trending topic|trending topics|"
+        r"hot topic|hot topics|topic suggestions|presentation topics"
+        r")\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _is_ppt_topic_lookup_request(user_input: str) -> bool:
+    text = user_input or ""
+    if _is_topic_ideas_request(text):
+        return False
+    if not re.search(r"\b(topic|title|name)\b", text, re.IGNORECASE):
+        return False
+    return bool(re.search(
+        r"\b(?:give|show|tell|what|which|get|share|list)\b.*\btopic\b|"
+        r"\btopic of\b|"
+        r"\bwhat is(?: the)? topic\b|"
+        r"\bmy generated ppt\b|"
+        r"\bour generated ppt\b|"
+        r"\bcurrent ppt\b|"
+        r"\bthis ppt\b|"
+        r"\bthe ppt\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _extract_explicit_ppt_ref_from_text(user_input: str) -> Optional[str]:
+    text = user_input or ""
+    patterns = [
+        r"\b(?:ppt|presentation|deck)\s*(\d+)\b",
+        r"\b(\d+)(?:st|nd|rd|th)?\s*(?:ppt|presentation|deck)\b",
+        r"\b(?:ppt|presentation|deck)\s*#?(\d+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return f"ppt {m.group(1)}"
+    return None
+
+def _same_topic(a: str, b: str) -> bool:
+    left = _norm_text(a)
+    right = _norm_text(b)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_words = [w for w in left.split() if w]
+    right_words = [w for w in right.split() if w]
+    if not left_words or not right_words:
+        return False
+    # Short topics like "AI" should only match on exact equality.
+    if len(left_words) <= 2 or len(right_words) <= 2:
+        return False
+    stopwords = {"the", "a", "an", "of", "and", "in", "on", "for", "to", "with", "new", "ppt", "presentation", "deck"}
+    left_set = {w for w in left_words if w not in stopwords}
+    right_set = {w for w in right_words if w not in stopwords}
+    if not left_set or not right_set:
+        return False
+    overlap = len(left_set & right_set)
+    smaller = min(len(left_set), len(right_set))
+    return overlap >= max(2, int(smaller * 0.75))
+
+def _extract_create_ppt_topic(user_input: str) -> Optional[str]:
+    """
+    Extract a topic from requests like:
+    - make ppt on AI
+    - create presentation about blockchain
+    - generate deck for healthcare
+    """
+    text = (user_input or "").strip()
+    if not text:
+        return None
+
+    if not re.search(r"\b(?:make|create|generate|build)\b", text, re.IGNORECASE):
+        return None
+    if re.search(r"\b(?:add|edit|update|change|modify|delete|remove|continue)\b", text, re.IGNORECASE):
+        # Avoid hijacking edit flows like "add slide about AI"
+        if not re.search(r"\b(?:ppt|presentation|deck)\s+(?:on|about|for)\b", text, re.IGNORECASE):
+            return None
+
+    patterns = [
+        r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
+        r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:ppt|presentation|deck)\s+(.+)$",
+        r"\b(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
+    ]
+    topic = None
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            topic = m.group(1).strip()
+            break
+    if not topic:
+        return None
+
+    topic = re.sub(r"\bwith\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
+    topic = re.sub(r"\bfor\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
+    topic = re.sub(r"\b(?:including|containing)\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
+    topic = re.split(
+        r"(?i)\b(?:add\s+below\s+content|include\s+below\s+content|content\s*:|with\s+content|add\s+content|include\s+content)\b",
+        topic,
+        maxsplit=1,
+    )[0].strip()
+    topic = re.sub(r"[\.\!\?]+$", "", topic).strip()
+    topic = topic.strip(' "\'“”‘’')
+    topic = re.sub(r"\s+", " ", topic).strip()
+    return topic or None
+
+def _extract_create_sections_from_prompt(user_input: str) -> Optional[str]:
+    text = (user_input or "").strip()
+    if not text:
+        return None
+    markers = [
+        r"(?i)\badd below content\s*:\s*(.+)$",
+        r"(?i)\bcontent\s*:\s*(.+)$",
+        r"(?i)\binclude below content\s*:\s*(.+)$",
+    ]
+    for pat in markers:
+        m = re.search(pat, text, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            content = re.sub(r"\s+", " ", content).strip()
+            return content or None
+    return None
+
+def _is_explicit_create_request(user_input: str) -> bool:
+    text = user_input or ""
+    if not re.search(r"\b(?:make|create|generate|build)\b", text, re.IGNORECASE):
+        return False
+    return bool(re.search(r"\b(?:ppt|presentation|deck)\b", text, re.IGNORECASE))
+
+def _handle_create_request(prompt: str) -> bool:
+    """
+    Return True if the prompt was fully handled as a create-new-PPT request.
+    """
+    topic = _extract_create_ppt_topic(prompt)
+    if not topic:
+        return False
+    slide_count = _extract_slide_count_from_text(prompt)
+    theme_colors = extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(topic)
+    sections = _extract_create_sections_from_prompt(prompt)
+
+    st.session_state.pending_new_ppt = None
+    st.session_state.pending_intent = None
+    if slide_count:
+        generate_outline_and_reply(topic, slide_count, st.session_state.tone, sections, theme_colors)
+    else:
+        st.session_state.pending_new_ppt = {
+            "topic": topic,
+            "sections": sections,
+            "theme_colors": theme_colors,
+        }
+        _set_conv_state(pending_create=st.session_state.pending_new_ppt)
+        with st.chat_message("assistant"):
+            st.markdown("How many slides would you like the presentation to have?")
+        add_message("assistant", "How many slides would you like the presentation to have?")
+        st.rerun()
+    return True
+
+def _extract_slide_count_from_text(user_input: str) -> Optional[int]:
+    text = user_input or ""
+    patterns = [
+        r"\b(?:with|of|for)\s+(\d+)\s+slides?\b",
+        r"\b(\d+)\s+slides?\b",
+        r"\bslide\s+(\d+)\b",
+        r"\bslides?\s+of\s+(\d+)\b",
+        r"\b(\d+)\s+slide(?:s)?\b",
+        r"\b(\d+)\s+slide(?:s)?\s+(?:presentation|ppt|deck)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+    if re.fullmatch(r"\d+", text.strip()):
+        try:
+            return int(text.strip())
+        except ValueError:
+            return None
+    return None
+
+def _extract_explicit_slide_number_from_text(user_input: str) -> Optional[int]:
+    """
+    Extract the slide number only when the user explicitly names a slide.
+    This is used to override stale slide context from earlier turns.
+    """
+    text = user_input or ""
+    patterns = [
+        r"\bslide\s+(\d+)\b",
+        r"\bslide\s+#?(\d+)\b",
+        r"\b(\d+)(?:st|nd|rd|th)?\s+slide\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+def _has_explicit_slide_reference(user_input: str) -> bool:
+    text = user_input or ""
+    return bool(re.search(r"\bslide\s*\d+\b", text, re.IGNORECASE))
+
+def _is_ambiguous_add_followup(user_input: str) -> bool:
+    text = _norm_text(user_input)
+    if not text:
+        return False
+    if _has_explicit_slide_reference(text):
+        return False
+    if re.search(r"\b(?:ppt|presentation|deck)\s*\d+\b", text, re.IGNORECASE):
+        return False
+    # Only rewrite true bullet/point follow-ups here.
+    # Generic "add slide" requests should keep their own intent so they can ask
+    # the user for slide content or position instead of reusing the last edit.
+    return bool(re.search(
+        r"\b(?:add|another|one more|more|extra|continue)\b.*\b(?:point|bullet|bullets|points?)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _is_bare_add_slide_request(user_input: str) -> bool:
+    text = user_input or ""
+    if not text:
+        return False
+    lower = text.lower()
+    if not re.search(r"\b(?:add|insert|new)\b", lower):
+        return False
+    if not re.search(r"\bslide\b", lower):
+        return False
+    if re.search(r"\bslide\s+\d+\b", lower):
+        return False
+    if re.search(r"\b(?:point|points|bullet|bullets)\b", lower):
+        return False
+    return bool(re.search(
+        r"\b(?:add|insert)\s+(?:a\s+)?(?:new\s+|another\s+|one more\s+)?slide\b|"
+        r"\bnew\s+slide\b|"
+        r"\banother\s+slide\b|"
+        r"\bone more\s+slide\b",
+        lower,
+        re.IGNORECASE,
+    ))
+
+def _is_bare_edit_slide_request(user_input: str) -> bool:
+    text = user_input or ""
+    if not text:
+        return False
+    lower = text.lower()
+    if not re.search(r"\b(?:edit|change|update|modify|revise)\b", lower):
+        return False
+    if not re.search(r"\bslide\b", lower):
+        return False
+    if re.search(r"\bslide\s+\d+\b", lower):
+        return False
+    return True
+
+def _remember_action_context(action_type: str, slide_index: Optional[int] = None, ppt_id: Optional[str] = None, action_text: Optional[str] = None):
+    if action_type:
+        st.session_state.last_action_type = action_type
+    if slide_index is not None:
+        st.session_state.last_slide_index = slide_index
+        st.session_state.active_slide_index = slide_index
+    if ppt_id:
+        st.session_state.last_ppt_id = ppt_id
+    _set_conv_state(
+        last_action_type=action_type or st.session_state.get("last_action_type"),
+        active_slide_index=slide_index if slide_index is not None else st.session_state.get("active_slide_index"),
+        active_ppt_id=ppt_id or st.session_state.get("last_ppt_id") or st.session_state.get("current_ppt_id"),
+        last_action_text=action_text or _conv_state().get("last_action_text", ""),
+    )
+
+def _latest_slide_context() -> Optional[dict]:
+    slide_index = st.session_state.get("last_slide_index")
+    ppt_id = st.session_state.get("last_ppt_id") or st.session_state.get("current_ppt_id")
+    if not slide_index or not ppt_id:
+        return None
+    return {
+        "slide_index": slide_index,
+        "ppt_id": ppt_id,
+        "action_type": st.session_state.get("last_action_type"),
+    }
+
+def _should_start_new_ppt(user_input: str) -> Optional[str]:
+    topic = _extract_create_ppt_topic(user_input)
+    if not topic:
+        return None
+    current_topic = st.session_state.get("topic", "")
+    if not st.session_state.get("current_ppt_id"):
+        return topic
+    if not _same_topic(topic, current_topic):
+        return topic
+    return None
+
+def _resolve_vague_followup_prompt(prompt: str) -> str:
+    text = prompt or ""
+    if not _is_ambiguous_add_followup(text):
+        return prompt
+    ctx = _latest_slide_context()
+    if not ctx or not ctx.get("slide_index"):
+        return prompt
+    if ctx.get("ppt_id") and ctx.get("ppt_id") != st.session_state.get("current_ppt_id"):
+        switch_active_ppt(ctx["ppt_id"])
+    return f"add 1 point in slide {ctx['slide_index']}"
+
 # ------------------------------------------------------------------------------
 #  SLOT-FILLING CONVERSATIONAL AGENT
 # ------------------------------------------------------------------------------
@@ -974,6 +1522,7 @@ class ConversationalAgent:
         "preview_ppt": ["ppt_ref"],
         "ppt_info": ["info_type", "ppt_ref"],
         "suggest_topic": ["scope"],
+        "refine_ppt": ["tone", "style_hint"],
         "greeting": [],
         "smalltalk": [],
     }
@@ -1028,6 +1577,7 @@ class ConversationalAgent:
                 self.state["intent"] = new_intent
             self.state["slots"] = merged_slots
             self.state["missing_slots"] = missing
+            next_q = _polish_next_question(user_input, new_intent, merged_slots, missing, next_q)
             self.state["next_question"] = next_q
             self.state["action"] = action
             if action == "ask" and missing:
@@ -1052,6 +1602,8 @@ class ConversationalAgent:
         current_missing = self.state.get("missing_slots", [])
         slides_summary = summarize_slides_for_llm(context.get("slides", []))
         has_deck = context.get("has_deck", False)
+        active_edit_context = st.session_state.get("active_edit_context") or {}
+        conv = _conv_state()
         prompt = f"""
 You are a conversational AI assistant for building presentations. Your job is to fill in missing information (slots) for the user's intent.
 
@@ -1065,11 +1617,13 @@ User just said: "{user_input}"
 Context:
 - Does the user have an existing presentation? {has_deck}
 - Current slide titles (if any): {json.dumps([s.get('title') for s in slides_summary])}
+- Active edit context: {json.dumps(active_edit_context)}
+- Conversation memory: {json.dumps(conv)}
 
 Your task: Update the state based on the user's input. Return a JSON object with:
 
 {{
-  "intent": "one of: create_ppt, edit_slide, add_slide, delete_slide, download_ppt, preview_ppt, ppt_info, suggest_topic, greeting, smalltalk, unknown",
+  "intent": "one of: create_ppt, edit_slide, add_slide, delete_slide, download_ppt, preview_ppt, ppt_info, suggest_topic, refine_ppt, greeting, smalltalk, unknown",
   "slots": {{ ... }},
   "missing_slots": [...],
   "next_question": "string or null",
@@ -1079,22 +1633,42 @@ Your task: Update the state based on the user's input. Return a JSON object with
 Required slots for each intent:
 - create_ppt: topic (string), slide_count (integer), sections (string, optional)
 - edit_slide: slide_number (integer), change_content (string)
-- add_slide: slide_content (string), position (string or integer, optional)
+- add_slide: slide_content (string), position (string or integer)
 - delete_slide: slide_number (integer)
 - download_ppt: ppt_ref (string or integer, optional)
 - preview_ppt: ppt_ref (string or integer, optional)
 - ppt_info: info_type (string: "count", "list", "topic"), ppt_ref (optional)
 - suggest_topic: scope (string: "current", "new")
+- refine_ppt: tone (string, optional), style_hint (string, optional)
 - greeting / smalltalk / unknown: no slots
 
 Rules:
 - If the user's input indicates a new intent, reset slots and set intent accordingly.
 - If the user is continuing a previous intent, merge new information.
+- Intent priority: create_ppt > switch_ppt/reference lookup > edit_slide/add_slide > follow-up clarification.
+- If the user says "make/create/generate/build ppt/presentation/deck on <topic>", treat it as create_ppt even if extra content is included in the same message.
+- If the user says "add one more point", "add another bullet", or similar without a slide number, reuse the last edited slide from conversation memory.
+- If the user says "add slide" or "add a slide" without a slide number, classify it as add_slide and ask for the slide content or placement instead of reusing the last edited slide.
 - Only mark a slot as missing if it's required and not yet filled.
+- For add_slide, position is required. If missing, set missing_slots = ["position"].
 - For edit_slide, if user says "edit slide 3" without change content, set slide_number=3, change_content=null, missing_slots=["change_content"].
 - For edit_slide, if user says "add 2 points about AI to slide 3", set slide_number=3, change_content="add 2 points about AI", missing_slots=[].
+- If the user says "add one point" or "add a point" to a slide, set change_content="add 1 point" and let the editor generate the bullet automatically.
+- If the user says "edit slide" or "change slide" without an explicit slide number, do NOT reuse the previous slide. Set missing_slots=["slide_number"] and ask which slide they want to edit.
+- If active edit context is deck-level and the user does not explicitly mention a slide number, ask about the PPT deck, not a slide.
+- Only use slide-level wording when the user explicitly says "slide N".
+- For ppt_info:
+  - "how many ppts" => info_type="count"
+  - "which ppts" or "list ppts" => info_type="list"
+  - "topic of ppt 4" or "what is ppt 4" => info_type="topic", ppt_ref="ppt 4"
+  - If the user names a deck number, prefer ppt_ref over asking a clarification.
+- If the user asks for the topic/name/title of an existing or generated PPT, use ppt_info, not suggest_topic.
+- Use suggest_topic only when the user explicitly asks for new topic ideas, brainstorming, or suggestions.
+- Use refine_ppt for requests like "make it shorter", "make it cleaner", "make it more professional", "change tone to casual", or "add important points only" when the user is refining an existing deck.
+- If the user says "go to slide 3" or "open slide 3", use the slide number as context and do not treat it like a PPT lookup.
 - For add_slide, if user says "add a summary slide", set slide_content="summary", position=null, missing_slots=["position"].
 - For add_slide, if user says "add a summary slide at the end", set slide_content="summary", position="end", missing_slots=[].
+- If the user says "add slide" or "add a slide" without a slide number, classify it as add_slide, not edit_slide, and ask for the new slide content/position instead of reusing the last edited slide.
 - For create_ppt, if user says "make a ppt on AI", set topic="AI", slide_count=null, sections=null, missing_slots=["slide_count"].
 - For smalltalk like "thanks", "ok", "yes", "no", set intent="smalltalk".
 - For "hi", "hello" set intent="greeting".
@@ -1105,20 +1679,179 @@ Return ONLY valid JSON. No extra text.
 """
         return prompt
 
+def _polish_next_question(user_input: str, intent: Optional[str], slots: dict, missing: list, next_question: Optional[str]) -> str:
+    """
+    Make slot-filling follow-ups more specific and PPT-aware.
+    This keeps the assistant from asking generic wording like "What point?"
+    """
+    user_text = (user_input or "").lower()
+    q = (next_question or "").strip()
+    slide_num = slots.get("slide_number")
+    ppt_id = st.session_state.get("current_ppt_id") or slots.get("ppt_ref")
+    ppt_label = _ppt_display_label(str(ppt_id)) if ppt_id else "the current presentation"
+
+    if intent == "edit_slide":
+        if "slide_number" in (missing or []) or slide_num is None:
+            return f"Which slide would you like to edit in {ppt_label}?"
+        if "change_content" in (missing or []):
+            return f"What change would you like to make to slide {slide_num} in {ppt_label}?"
+
+    if intent == "add_slide" and "slide_content" in (missing or []):
+        return f"What content should the new slide cover in {ppt_label}?"
+
+    if q:
+        q = re.sub(r"(?i)\bwhat point\b", "What bullet point", q)
+        q = re.sub(r"(?i)\bwhat points\b", "What bullet points", q)
+        return q
+
+    return "Could you please provide more information?"
+
+def _parse_bullet_add_request(change_content: str) -> Optional[int]:
+    """
+    Detect requests like:
+    - add 3 points
+    - add one point
+    - add a point
+    Returns how many bullets should be generated, or None if this is not a bullet-add request.
+    """
+    text = (change_content or "").lower().strip()
+    if not text or "add" not in text:
+        return None
+    if not re.search(r"\b(point|points|bullet|bullets)\b", text):
+        return None
+
+    num_match = re.search(r"(\d+)\s*(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text)
+    if num_match:
+        try:
+            return max(1, int(num_match.group(1)))
+        except ValueError:
+            return 1
+
+    if re.search(r"\b(?:one|a|an)\s+(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text):
+        return 1
+
+    return 1
+
+def _generate_topic_suggestions(scope: str = "new", current_topic: str = "", history: Optional[list] = None) -> list[str]:
+    history = history or st.session_state.get("ppt_history", [])
+    recent_topics = [str(item.get("topic", "")).strip() for item in history[:6] if isinstance(item, dict) and str(item.get("topic", "")).strip()]
+    if scope == "current" and current_topic:
+        base = current_topic
+    else:
+        base = "presentation topics"
+    prompt = f"""
+You are an expert in trending presentation topics.
+
+Generate 6 highly relevant, modern, real-world trending presentation topics.
+
+Rules:
+- Must be specific (not generic)
+- Must reflect 2025+ trends
+- Avoid generic phrases like "roadmap", "overview"
+- Focus on real-world impact
+- Return only a JSON array of 6 strings
+- Do not include markdown, numbering, or commentary
+
+Avoid repeating these recent topics: {json.dumps(recent_topics)}
+
+Base topic or context: {base}
+User scope: {scope}
+
+If the scope is current, suggest adjacent follow-up ideas.
+If the scope is new, suggest fresh, broadly useful topics.
+"""
+    def _parse_topic_items(raw_text: str) -> list[str]:
+        raw_text = (raw_text or "").strip()
+        if not raw_text:
+            return []
+
+        candidates: list[str] = []
+
+        def _add_candidate(line: str) -> None:
+            line = clean_icon_tokens(line)
+            line = re.sub(r"^\s*(?:[-*•▪‣▶►]+\s*|\d+[.)]\s*)", "", line).strip()
+            line = line.strip(' "\'`')
+            line = re.sub(r"\s+", " ", line).strip()
+            if line and line not in candidates:
+                candidates.append(line)
+
+        # Try strict JSON first.
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str):
+                        _add_candidate(item)
+                if candidates:
+                    return candidates
+        except Exception:
+            pass
+
+        # Try to recover a JSON-ish array embedded in free text.
+        match = re.search(r"\[[\s\S]*\]", raw_text)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, str):
+                            _add_candidate(item)
+                    if candidates:
+                        return candidates
+            except Exception:
+                pass
+
+        # Fall back to one-item-per-line parsing.
+        for line in raw_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r"^\s*(?:Here are|Topics|Suggestions|Trending|1\.)", stripped, re.IGNORECASE) and ":" in stripped:
+                stripped = stripped.split(":", 1)[1].strip()
+            _add_candidate(stripped)
+
+        return candidates
+
+    try:
+        resp = _client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8,
+            max_tokens=250,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        cleaned = _parse_topic_items(raw)
+        if cleaned:
+            return cleaned[:5]
+    except Exception as e:
+        print("Topic generation error:", e)
+    fallback = [
+        "AI Agents in Enterprise Automation",
+        "Generative AI in Healthcare Transformation",
+        "AI Governance and Regulation Trends",
+        "Multimodal AI Applications",
+        "AI in Cybersecurity"
+    ]
+    if scope == "current" and current_topic:
+        return [f"{current_topic}: {x}" for x in fallback[:3]]
+    return fallback[:5]
+
 # ------------------------------------------------------------------------------
 #  ACTION EXECUTORS
 # ------------------------------------------------------------------------------
 def commit_changes(updated_slides, success_msg):
-    st.session_state.outline_payload["slides"] = updated_slides
-    sync_all_editor_widgets(updated_slides)
+    frozen_slides = copy.deepcopy(updated_slides)
+    st.session_state.outline_payload["slides"] = frozen_slides
+    sync_all_editor_widgets(frozen_slides)
     ppt_bytes = rebuild_ppt_from_outline()
-    ppt_id = st.session_state.get("current_ppt_id", "")
-    topic = st.session_state.get("topic", "Presentation")
+    ppt_id = st.session_state.pop("action_target_ppt_id", None) or st.session_state.get("current_ppt_id", "")
+    item = get_ppt_by_id(ppt_id) if ppt_id else None
+    topic = (item.get("topic") if item else st.session_state.get("topic", "Presentation")) or "Presentation"
     label = f"Updated Preview — {topic} ({ppt_id})"
     add_message_with_preview(
         role="assistant",
         text=success_msg,
-        preview_slides=updated_slides,
+        preview_slides=frozen_slides,
         ppt_label=label,
         ppt_bytes=ppt_bytes,
         ppt_filename=st.session_state.get("ppt_filename", "presentation.pptx"),
@@ -1126,7 +1859,7 @@ def commit_changes(updated_slides, success_msg):
     st.rerun()
 
 def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
-    if intent in ("edit_slide", "add_slide", "delete_slide", "preview_ppt", "download_ppt"):
+    if intent in ("edit_slide", "add_slide", "delete_slide", "preview_ppt", "download_ppt", "refine_ppt"):
         if not st.session_state.get("current_ppt_id"):
             return "No presentation is currently active. Please create or switch to a presentation first.", False
         if not st.session_state.get("outline_payload"):
@@ -1143,10 +1876,10 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         except (ValueError, TypeError):
             return "Slide count must be a number. Please provide a valid number.", False
 
-        # Extract colors from the full original user message
+        # Extract colors from the full conversation so we don't lose
+        # "blue and white theme" after the slide-count follow-up.
         all_messages = st.session_state.get("messages", [])
-        last_user_msg = next((m["content"] for m in reversed(all_messages) if m["role"] == "user"), "")
-        theme_colors = extract_theme_colors(last_user_msg) or extract_theme_colors(topic)
+        theme_colors = extract_theme_colors_from_messages(all_messages) or extract_theme_colors(topic)
 
         # Remove color phrases from topic to avoid duplication in slide titles
         color_pattern = r'\b(?:in\s+)?(?:dark\s+|light\s+)?(?:' + '|'.join(_COLOR_NAMES) + r')\s*(?:and\s+(?:dark\s+|light\s+)?(?:' + '|'.join(_COLOR_NAMES) + r'))?\s*(?:theme|color|colors|palette|scheme)?\b'
@@ -1159,6 +1892,19 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     elif intent == "edit_slide":
         slide_num = slots.get("slide_number")
         change_content = slots.get("change_content")
+        # Always let an explicit slide reference in the latest message override
+        # any stale slide number that may have been carried over from context.
+        if change_content:
+            explicit_slide_num = _extract_explicit_slide_number_from_text(change_content)
+            if explicit_slide_num is not None:
+                slide_num = explicit_slide_num
+                slots["slide_number"] = slide_num
+        # If slide_number is still missing, try a final recovery from change_content.
+        if slide_num is None and change_content:
+            fallback_slide_num = _extract_explicit_slide_number_from_text(change_content)
+            if fallback_slide_num is not None:
+                slide_num = fallback_slide_num
+                slots["slide_number"] = slide_num
         try:
             slide_num = int(slide_num)
         except (ValueError, TypeError):
@@ -1168,10 +1914,9 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         if slide_num < 1 or slide_num > len(slides):
             return f"Slide {slide_num} doesn't exist. Deck has {len(slides)} slides.", False
 
-        # SPECIAL HANDLE: "add bullet points" - use direct fallback, skip LLM
-        if "add" in change_content.lower() and re.search(r'\d+\s*points?', change_content.lower()):
-            num_match = re.search(r'(\d+)\s*points?', change_content.lower())
-            num = int(num_match.group(1)) if num_match else 2
+        # SPECIAL HANDLE: "add point(s)" - generate bullets directly, skip the edit LLM.
+        num = _parse_bullet_add_request(change_content)
+        if num is not None:
             slide = slides[slide_num - 1]
             if slide.get("layout") != "bullets":
                 slide["layout"] = "bullets"
@@ -1197,8 +1942,10 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                         existing.append(pt)
                 slide["content"] = existing
                 updated_slides = refresh_section_index_slide(slides)
-                commit_changes(updated_slides, f"✅ Added {num} bullet points to slide {slide_num}.")
-                return f"Added {num} bullet points to slide {slide_num}.", True
+                _remember_action_context("add_points", slide_num, st.session_state.get("current_ppt_id"), f"Added {len(new_points)} bullet point(s) to slide {slide_num}")
+                commit_changes(updated_slides, f"✅ Added {len(new_points)} bullet point(s) to slide {slide_num}.")
+                _clear_transient_conversation_state()
+                return f"Added {len(new_points)} bullet point(s) to slide {slide_num}.", True
             else:
                 return "Failed to generate bullet points. Please try again.", False
 
@@ -1222,12 +1969,13 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                         s["right_points"] = [clean_icon_tokens(p) for p in s["right_points"] if clean_icon_tokens(p)]
                 cleaned = [ensure_editor_id(s) for s in raw_slides]
                 updated_slides = refresh_section_index_slide(cleaned)
+                _remember_action_context("edit_slide", slide_num, st.session_state.get("current_ppt_id"), f"Updated slide {slide_num}")
                 commit_changes(updated_slides, f"✅ Slide {slide_num} updated.")
+                _clear_transient_conversation_state()
                 return f"Slide {slide_num} updated.", True
             else:
-                if "add" in change_content.lower() and re.search(r'\d+\s*points?', change_content.lower()):
-                    num_match = re.search(r'(\d+)\s*points?', change_content.lower())
-                    num = int(num_match.group(1)) if num_match else 2
+                num = _parse_bullet_add_request(change_content)
+                if num is not None:
                     slide = slides[slide_num - 1]
                     prompt = f"Generate {num} short bullet points about: {slide.get('title')}. Return only as JSON list of strings."
                     resp = _client.chat.completions.create(
@@ -1246,22 +1994,24 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                         new_points = [clean_icon_tokens(pt) for pt in new_points if clean_icon_tokens(pt)]
                         slide['content'].extend(new_points)
                         updated_slides = refresh_section_index_slide(slides)
-                        commit_changes(updated_slides, f"✅ Added {num} bullet points to slide {slide_num}.")
-                        return f"Added {num} bullet points to slide {slide_num}.", True
+                        _remember_action_context("add_points", slide_num, st.session_state.get("current_ppt_id"), f"Added {len(new_points)} bullet point(s) to slide {slide_num}")
+                        commit_changes(updated_slides, f"✅ Added {len(new_points)} bullet point(s) to slide {slide_num}.")
+                        _clear_transient_conversation_state()
+                        return f"Added {len(new_points)} bullet point(s) to slide {slide_num}.", True
                 return result.get("question", "Edit failed. Please rephrase."), False
         except Exception as e:
             return f"Edit failed: {e}", False
 
     elif intent == "add_slide":
         slide_content = slots.get("slide_content")
-        position = slots.get("position", "end")
+        position = slots.get("position")
         if not slide_content:
             return "Missing slide content.", False
+        if not position:
+            return f"Where should I add the slide about '{slide_content}' in {_ppt_display_label(st.session_state.get('current_ppt_id'))}?", False
         try:
             new_slide_data = draft_slide_from_request(slide_content, slides)
             new_slide_data = normalize_slide(new_slide_data)
-            if position is None:
-                position = "end"
             if isinstance(position, str):
                 pos_lower = position.lower()
                 if pos_lower in ("start", "first", "top"):
@@ -1285,7 +2035,9 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             updated_slides = list(slides)
             updated_slides.insert(idx - 1, new_slide_data)
             updated_slides = refresh_section_index_slide(updated_slides)
+            _remember_action_context("add_slide", idx, st.session_state.get("current_ppt_id"), f"Added new slide at position {idx}")
             commit_changes(updated_slides, f"✅ New slide added at position {idx}.")
+            _clear_transient_conversation_state()
             return f"Slide added at position {idx}.", True
         except Exception as e:
             return f"Add slide failed: {e}", False
@@ -1299,7 +2051,9 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         if 1 <= slide_num <= len(slides):
             updated_slides = [s for i, s in enumerate(slides, start=1) if i != slide_num]
             updated_slides = refresh_section_index_slide(updated_slides)
+            _remember_action_context("delete_slide", slide_num, st.session_state.get("current_ppt_id"), f"Removed slide {slide_num}")
             commit_changes(updated_slides, f"✅ Slide {slide_num} removed.")
+            _clear_transient_conversation_state()
             return f"Slide {slide_num} removed.", True
         else:
             return f"Slide {slide_num} does not exist. The deck has {len(slides)} slide(s).", False
@@ -1373,23 +2127,66 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             history = st.session_state.get("ppt_history", [])
             if not history:
                 return "You haven't created any presentations yet.", True
-            lines = ["Here are all your presentations:"]
+            lines = ["Here are your generated presentations:"]
             for i, p in enumerate(history, 1):
                 topic = p.get("topic", f"PPT {i}")
-                slide_count = p.get("slide_count", "?")
                 ppt_id = p.get("id", f"ppt_{i}")
-                lines.append(f"**{i}.** {ppt_id}: {slide_count} slides — {topic}")
+                lines.append(f"ppt {i}: {topic}")
             return "\n".join(lines), True
+        elif info_type == "topic":
+            ppt_ref = slots.get("ppt_ref")
+            if ppt_ref:
+                item = _resolve_ppt_history_item(ppt_ref)
+                if item:
+                    topic = item.get("topic", "").strip() or "Untitled presentation"
+                    ppt_id = item.get("id", "ppt")
+                    label = _ppt_display_label(ppt_id)
+                    return f"The topic for {label} is: {topic}.", True
+                return "I couldn't find that presentation. Try 'ppt 1', 'ppt 2', or the presentation title.", False
+            current_id = st.session_state.get("current_ppt_id")
+            if current_id:
+                item = get_ppt_by_id(current_id)
+                if item:
+                    topic = item.get("topic", "").strip() or "Untitled presentation"
+                    label = _ppt_display_label(current_id)
+                    return f"The topic for {label} is: {topic}.", True
+            return "Please specify which PPT you want the topic for.", False
         else:
-            return "I can tell you how many PPTs you have or list them. What would you like?", False
+            return "I can tell you how many PPTs you have, list them, or give the topic of a specific PPT. What would you like?", False
 
     elif intent == "suggest_topic":
         scope = slots.get("scope")
-        if scope == "new":
-            suggestions = ["Responsible AI adoption in enterprises", "AI copilots and productivity", "Cybersecurity risks in the age of AI"]
-        else:
-            suggestions = ["Next-gen use cases and ROI", "Governance, safety, and compliance", "Roadmap and implementation plan"]
+        current_topic = st.session_state.get("topic", "")
+        suggestions = _generate_topic_suggestions(scope or "new", current_topic=current_topic)
         return "Here are a few topic ideas:\n\n" + "\n".join(f"- {s}" for s in suggestions), True
+
+    elif intent == "refine_ppt":
+        current_id = st.session_state.get("current_ppt_id")
+        if not current_id or not st.session_state.get("outline_payload"):
+            return "No presentation is currently active. Please open a PPT first.", False
+        item = get_ppt_by_id(current_id) or {}
+        topic = item.get("topic") or st.session_state.get("topic", "Presentation")
+        slide_count = len(slides) if slides else int(st.session_state.get("slide_count") or st.session_state.get("num_slides") or 6)
+        tone_raw = str(slots.get("tone") or st.session_state.get("tone", "Professional")).strip()
+        tone_map = {
+            "casual": "Creative",
+            "friendly": "Creative",
+            "conversational": "Creative",
+            "professional": "Professional",
+            "formal": "Professional",
+            "educational": "Educational",
+            "creative": "Creative",
+        }
+        tone = tone_map.get(tone_raw.lower(), tone_raw if tone_raw in ("Professional", "Creative", "Educational") else st.session_state.get("tone", "Professional"))
+        style_hint = (slots.get("style_hint") or "").strip()
+        sections = st.session_state.get("sections") or ""
+        if style_hint:
+            sections = f"{sections}. {style_hint}".strip(". ")
+        if tone == "Creative" and "casual" not in style_hint.lower():
+            sections = f"{sections}. Make the language a little more conversational.".strip(". ")
+        st.session_state.tone = tone if tone in ["Professional", "Creative", "Educational"] else st.session_state.tone
+        generate_outline_and_reply(topic, slide_count, st.session_state.tone, sections or None, theme_colors=extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(topic), ppt_id=current_id)
+        return "Refreshing the current presentation...", True
 
     elif intent == "greeting":
         return "👋 Hello! I'm your PPT assistant. You can ask me to create a new presentation, edit slides, add content, or switch between decks. What would you like to do?", True
@@ -1589,20 +2386,32 @@ def enforce_slide_count(slides, required_count, topic, tone, theme_colors=None):
         attempts += 1
     return slides[:required_count]
 
-def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None, theme_colors=None):
+def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None, theme_colors=None, ppt_id: Optional[str] = None):
     with st.spinner(f"✍️ Building {count}-slide deck on '{topic}'…"):
         try:
             payload = request_outline(topic, count, tone, sections, theme_colors)
             payload["slides"] = payload.get("slides", [])[:count]
             st.session_state.outline_payload = payload
             st.session_state.topic = topic
+            existing_id = ppt_id
+            is_update = bool(existing_id and get_ppt_by_id(existing_id))
+            deck_id = existing_id if is_update else next_ppt_id()
+            _set_conv_state(
+                last_topic=topic,
+                active_slide_index=None,
+                last_action_type="refine_ppt" if is_update else "create_ppt",
+                pending_create=None,
+                pending_edit=None,
+                turn_summary=f"{'Updated' if is_update else 'Created'} {count}-slide deck on {topic}",
+            )
             st.session_state.sections = sections or ""
             st.session_state.num_slides = count
             st.session_state.slide_count = count
-            ppt_id = next_ppt_id()
-            st.session_state.current_ppt_id = ppt_id
+            st.session_state.current_ppt_id = deck_id
+            _remember_action_context("refine_ppt" if is_update else "create_ppt", None, deck_id, f"{'Updated' if is_update else 'Created'} {count}-slide deck on {topic}")
+            _set_conv_state(active_ppt_id=deck_id, last_topic=topic)
             _upsert_ppt_history(
-                ppt_id,
+                deck_id,
                 topic=topic,
                 slide_count=count,
                 sections=sections or "",
@@ -1614,8 +2423,11 @@ def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None,
             sync_all_editor_widgets(payload.get("slides", []))
             ppt_bytes = rebuild_ppt_from_outline()
             reply_text = summarize_outline(payload.get("slides", []))
+            if is_update:
+                reply_text = f"✅ Updated the deck on {topic}.\n\n{reply_text}"
             slides_for_preview = payload.get("slides", [])
-            label = f"Preview — {topic} ({ppt_id})"
+            label = f"Preview — {topic} ({deck_id})"
+            _clear_transient_conversation_state()
             add_message_with_preview(
                 role="assistant",
                 text=reply_text,
@@ -1804,6 +2616,7 @@ def apply_add_action(old_slides, slide, position):
 # ------------------------------------------------------------------------------
 st.title("💬 AI PPT Chat Builder")
 st.caption("Describe your deck, then edit it in chat and download.")
+st.caption(f"Active context: {_build_context_badge()}")
 
 # Sidebar settings
 st.sidebar.title("⚙️ Settings")
@@ -1896,6 +2709,10 @@ if files:
         if logo_bytes != st.session_state.get("logo_bytes"):
             st.session_state.logo_bytes = logo_bytes
             st.session_state.logo_name = uploaded_logo.name
+            logo_notice = f"Logo uploaded: **{uploaded_logo.name}**"
+            with st.chat_message("assistant"):
+                st.markdown(logo_notice)
+            add_message("assistant", logo_notice)
             if st.session_state.get("outline_payload"):
                 rebuild_ppt_from_outline()
 
@@ -1913,27 +2730,251 @@ if prompt is not None:
     with st.chat_message("user"):
         st.markdown(prompt)
     add_message("user", prompt)
+    st.session_state.action_target_ppt_id = None
+
+    # Highest-priority route: any explicit create request should start a new deck,
+    # even if the user included content in the same message.
+    if _is_explicit_create_request(prompt):
+        st.session_state.pending_new_ppt = None
+        handled = _handle_create_request(prompt)
+        if handled:
+            st.stop()
+
+    # If we're waiting for the slide count of a newly requested deck, keep
+    # that flow pinned until the user answers or cancels.
+    pending_new_ppt = st.session_state.get("pending_new_ppt")
+    if pending_new_ppt:
+        pending_topic = pending_new_ppt.get("topic", "")
+        slide_count = _extract_slide_count_from_text(prompt)
+        if slide_count:
+            all_messages = st.session_state.get("messages", [])
+            theme_colors = (
+                pending_new_ppt.get("theme_colors")
+                or extract_theme_colors_from_messages(all_messages)
+                or extract_theme_colors(pending_topic)
+            )
+            st.session_state.pending_new_ppt = None
+            st.session_state.pending_intent = None
+            generate_outline_and_reply(
+                pending_topic,
+                slide_count,
+                st.session_state.tone,
+                pending_new_ppt.get("sections"),
+                theme_colors,
+            )
+            st.stop()
+        if re.search(r"\b(?:cancel|stop|never mind|nevermind)\b", prompt, re.IGNORECASE):
+            st.session_state.pending_new_ppt = None
+            with st.chat_message("assistant"):
+                st.markdown("Okay, I cancelled the new presentation request.")
+            add_message("assistant", "Okay, I cancelled the new presentation request.")
+            st.rerun()
+        with st.chat_message("assistant"):
+            st.markdown("How many slides would you like the presentation to have?")
+        add_message("assistant", "How many slides would you like the presentation to have?")
+        st.rerun()
+
+    routing_prompt = prompt
+    if _is_explicit_create_request(prompt):
+        routing_prompt = prompt
+    else:
+        routing_prompt = _resolve_vague_followup_prompt(prompt)
+
+    outline_payload = st.session_state.outline_payload
+    slides = outline_payload.get("slides", []) if outline_payload else []
+    pending_state = st.session_state.get("pending_intent") or {}
+    if _is_bare_edit_slide_request(routing_prompt):
+        st.session_state.pending_intent = None
+        st.session_state.active_edit_context = None
+        st.session_state.last_slide_index = None
+        st.session_state.active_slide_index = None
+        if "agent" in st.session_state:
+            st.session_state.agent.clear_state()
+        followup = f"Which slide would you like to edit in {_ppt_display_label(st.session_state.get('current_ppt_id'))}?"
+        with st.chat_message("assistant"):
+            st.markdown(followup)
+        add_message("assistant", followup)
+        st.rerun()
+
+    if pending_state.get("intent") == "edit_slide" and "change_content" in (pending_state.get("missing_slots") or []) and not _is_bare_add_slide_request(routing_prompt):
+        if re.search(r"\b(?:cancel|stop|never mind|nevermind)\b", routing_prompt, re.IGNORECASE):
+            agent = st.session_state.get("agent") if "agent" in st.session_state else None
+            if agent:
+                agent.clear_state()
+            st.session_state.pending_intent = None
+            with st.chat_message("assistant"):
+                st.markdown("Okay, I cancelled that edit request.")
+            add_message("assistant", "Okay, I cancelled that edit request.")
+            st.rerun()
+        if not _is_preview_request(routing_prompt) and not _is_topic_ideas_request(routing_prompt):
+            slots = dict(pending_state.get("slots", {}))
+            slots["change_content"] = prompt
+            result_msg, success = execute_action("edit_slide", slots, slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            if "agent" in st.session_state:
+                st.session_state.agent.clear_state()
+            st.rerun()
+
+    if _is_bare_add_slide_request(routing_prompt):
+        st.session_state.pending_intent = None
+        st.session_state.active_edit_context = None
+        if "agent" in st.session_state:
+            st.session_state.agent.clear_state()
+        followup = "What content should the new slide cover, and where should I place it?"
+        with st.chat_message("assistant"):
+            st.markdown(followup)
+        add_message("assistant", followup)
+        st.rerun()
+
+    # If the user names a deck in an action request, make it the active context first.
+    named_changed, named_ppt_id, named_clarification = resolve_named_ppt_context(routing_prompt)
+    if named_clarification:
+        with st.chat_message("assistant"):
+            st.markdown(named_clarification)
+        add_message("assistant", named_clarification)
+        st.rerun()
 
     # 1. Resolve PPT reference (possibly switch active PPT)
     def should_resolve_ppt(user_input: str) -> bool:
         return bool(re.search(r"(ppt|presentation|deck)\s*\d+|switch|open|go to|previous ppt", user_input.lower()))
-    if should_resolve_ppt(prompt):
-        changed, new_ppt_id, clarification = resolve_ppt_reference(prompt)
+    if should_resolve_ppt(routing_prompt):
+        changed, new_ppt_id, clarification = resolve_ppt_reference(routing_prompt)
     else:
         changed, new_ppt_id, clarification = False, None, None
+    if named_changed:
+        changed = True
+        new_ppt_id = named_ppt_id
     if clarification:
         with st.chat_message("assistant"):
             st.markdown(clarification)
         add_message("assistant", clarification)
         st.rerun()
     if changed:
+        st.session_state.action_target_ppt_id = new_ppt_id
         with st.chat_message("assistant"):
             st.markdown(f"✅ Switched to presentation **{new_ppt_id}**. How can I help?")
         add_message("assistant", f"Switched to {new_ppt_id}.")
 
+    if changed and _is_deck_level_edit_request(prompt):
+        st.session_state.active_edit_context = {
+            "level": "ppt",
+            "ppt_id": new_ppt_id,
+        }
+        ppt_label = _ppt_display_label(new_ppt_id)
+        followup = f"What changes would you like to make in {ppt_label}?"
+        with st.chat_message("assistant"):
+            st.markdown(followup)
+        add_message("assistant", followup)
+        st.rerun()
+    elif changed:
+        st.session_state.active_edit_context = None
+
+    # Directly answer topic lookup requests so they do not fall into suggest_topic.
+    if _is_ppt_topic_lookup_request(routing_prompt):
+        history = st.session_state.get("ppt_history", [])
+        explicit_ref = _extract_explicit_ppt_ref_from_text(routing_prompt)
+        resolved_item = None
+        if explicit_ref:
+            resolved_item = _resolve_ppt_history_item(explicit_ref)
+        elif len(history) == 1:
+            resolved_item = history[0]
+
+        if resolved_item:
+            topic = resolved_item.get("topic", "").strip() or "Untitled presentation"
+            ppt_id = resolved_item.get("id", "ppt")
+            reply = f"The topic for {_ppt_display_label(ppt_id)} is: {topic}."
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+
+        if len(history) > 1:
+            topics = [
+                f"**{i}.** {item.get('id', f'ppt_{i}')}: {item.get('topic', 'Untitled presentation')}"
+                for i, item in enumerate(history, start=1)
+            ]
+            reply = "Here are the topics of your generated presentations:\n\n" + "\n".join(topics)
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+
+    if _is_preview_request(routing_prompt):
+        current_id = st.session_state.get("current_ppt_id")
+        current_item = get_ppt_by_id(current_id) if current_id else None
+        if current_item and current_item.get("outline_payload"):
+            preview_slides = current_item["outline_payload"].get("slides", [])
+            topic = current_item.get("topic", "Presentation")
+            label = f"Preview — {topic} ({current_id})"
+            add_message_with_preview(
+                role="assistant",
+                text=f"Showing preview for **{current_id}** — {topic}.",
+                preview_slides=preview_slides,
+                ppt_label=label,
+                ppt_bytes=current_item.get("ppt_bytes"),
+                ppt_filename=current_item.get("ppt_filename", "presentation.pptx"),
+            )
+            st.rerun()
+
+    slide_target = _extract_slide_navigation_target(routing_prompt)
+    if slide_target and st.session_state.get("outline_payload"):
+        slides = st.session_state.outline_payload.get("slides", [])
+        if 1 <= slide_target <= len(slides):
+            slide = slides[slide_target - 1] if isinstance(slides[slide_target - 1], dict) else {}
+            slide_title = str(slide.get("title", f"Slide {slide_target}")).strip() or f"Slide {slide_target}"
+            _remember_action_context("focus_slide", slide_target, st.session_state.get("current_ppt_id"), f"Focused on slide {slide_target}")
+            reply = f"Focused on slide {slide_target}: {slide_title}."
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+
+    refinement = _extract_deck_refinement_request(routing_prompt)
+    if refinement and st.session_state.get("outline_payload") and not _is_slide_level_request(routing_prompt):
+        current_id = st.session_state.get("current_ppt_id")
+        current_item = get_ppt_by_id(current_id) if current_id else None
+        if current_item:
+            current_topic = current_item.get("topic") or st.session_state.get("topic", "Presentation")
+            current_count = len(current_item.get("outline_payload", {}).get("slides", []) or []) or int(st.session_state.get("slide_count") or st.session_state.get("num_slides") or 6)
+            tone_hint = refinement.get("tone")
+            if tone_hint and tone_hint in ("Professional", "Creative", "Educational"):
+                st.session_state.tone = tone_hint
+            style_hint = refinement.get("style_hint") or ""
+            sections = st.session_state.get("sections") or ""
+            if style_hint:
+                sections = f"{sections}. {style_hint}".strip(". ")
+            if tone_hint == "Creative" and "conversational" not in style_hint.lower():
+                sections = f"{sections}. Make the language conversational and easy to read.".strip(". ")
+            generate_outline_and_reply(
+                current_topic,
+                current_count,
+                st.session_state.tone,
+                sections or None,
+                theme_colors=extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(current_topic),
+                ppt_id=current_id,
+            )
+            st.stop()
+
+    # 🔧 FIX 3: Override for "add point in slide X" – force edit_slide
+    if re.search(r"\b(add|insert)\s+\d*\s*(bullet|point|points)\b.*\bslide\s+\d+\b", routing_prompt, re.IGNORECASE):
+        slide_num_match = re.search(r"\bslide\s+(\d+)\b", routing_prompt, re.IGNORECASE)
+        if slide_num_match:
+            slide_num = int(slide_num_match.group(1))
+            # Clear any pending add_slide state
+            st.session_state.pending_intent = None
+            if "agent" in st.session_state:
+                st.session_state.agent.clear_state()
+            # Execute edit_slide directly
+            slots = {"slide_number": slide_num, "change_content": routing_prompt}
+            result_msg, success = execute_action("edit_slide", slots, slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            st.rerun()
+
     # Prepare context for the agent
-    outline_payload = st.session_state.outline_payload
-    slides = outline_payload.get("slides", []) if outline_payload else []
     context = {
         "has_deck": bool(outline_payload),
         "slides": slides,
@@ -1945,7 +2986,7 @@ if prompt is not None:
     agent = st.session_state.agent
 
     # Process with agent (intent detection + slot filling)
-    response_text, action_data, should_execute = agent.process(prompt, context)
+    response_text, action_data, should_execute = agent.process(routing_prompt, context)
 
     if should_execute and action_data:
         intent = action_data["intent"]
