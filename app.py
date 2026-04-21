@@ -73,6 +73,9 @@ def _norm_text(v):
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     return s
 
+def _safe_str(v, default=""):
+    return str(v).strip() if v is not None else default
+
 # ------------------------------------------------------------------------------
 #  COLOR EXTRACTION UTILITIES
 # ------------------------------------------------------------------------------
@@ -275,6 +278,7 @@ def init_state():
         "logo_name":       None,
         "sections":        "",
         "ppt_history":     [],
+        "ppt_store":       {},
         "current_ppt_id":  None,
         "current_step":    "topic",
         "asked_steps":     [],
@@ -810,21 +814,335 @@ def render_message(msg: dict, msg_index: int = 0):
 def next_ppt_id() -> str:
     return f"ppt_{len(st.session_state.get('ppt_history', [])) + 1}"
 
+def _ppt_store() -> dict:
+    store = st.session_state.setdefault("ppt_store", {})
+    if not isinstance(store, dict):
+        store = {}
+        st.session_state["ppt_store"] = store
+    return store
+
+def _deepcopy_value(value):
+    return copy.deepcopy(value) if value is not None else None
+
 def _upsert_ppt_history(ppt_id: str, **fields):
     history = st.session_state.setdefault("ppt_history", [])
     for item in history:
         if item.get("id") == ppt_id:
-            item.update(fields)
+            for key, value in fields.items():
+                item[key] = copy.deepcopy(value)
             return
     record = {"id": ppt_id}
-    record.update(fields)
+    for key, value in fields.items():
+        record[key] = copy.deepcopy(value)
     history.append(record)
 
 def get_ppt_by_id(ppt_id: str):
+    store_item = _ppt_store().get(ppt_id)
+    if store_item:
+        return store_item
     for item in st.session_state.get("ppt_history", []):
         if item.get("id") == ppt_id:
             return item
     return None
+
+def _current_ppt_item():
+    current_id = st.session_state.get("action_target_ppt_id") or st.session_state.get("current_ppt_id")
+    if not current_id:
+        return None
+    return get_ppt_by_id(current_id)
+
+def _current_outline_payload():
+    item = _current_ppt_item()
+    if item and item.get("outline_payload"):
+        return copy.deepcopy(item["outline_payload"])
+    outline = st.session_state.get("outline_payload")
+    return copy.deepcopy(outline) if outline else None
+
+def _slide_looks_like_thank_you(slide: dict) -> bool:
+    if not isinstance(slide, dict):
+        return False
+    text = " ".join([
+        _norm_text(slide.get("title", "")),
+        _norm_text(slide.get("subtitle", "")),
+    ]).strip()
+    if not text:
+        return False
+    return bool(re.search(r"\b(thank you|thanks|q and a|q a|questions)\b", text))
+
+def _slide_search_text(slide: dict) -> str:
+    if not isinstance(slide, dict):
+        return ""
+    parts = [
+        _safe_str(slide.get("title", "")),
+        _safe_str(slide.get("subtitle", "")),
+    ]
+    for item in flatten_slide_content(slide.get("content", []))[:3]:
+        parts.append(_safe_str(item))
+    return _norm_text(" ".join(parts))
+
+def _resolve_slide_reference_text(ref: str, slides: list) -> Optional[int]:
+    """
+    Resolve a slide reference like "slide 4", "conclusion slide", or "thank you".
+    Returns a 1-based slide index.
+    """
+    text = _norm_text(ref)
+    if not text:
+        return None
+
+    num_match = re.search(r"\b(?:slide\s*)?#?(\d+)\b", ref or "", re.IGNORECASE)
+    if num_match:
+        try:
+            idx = int(num_match.group(1))
+            if 1 <= idx <= len(slides):
+                return idx
+        except ValueError:
+            pass
+
+    candidates = []
+    for i, slide in enumerate(slides or [], start=1):
+        if not isinstance(slide, dict):
+            continue
+        hay = _slide_search_text(slide)
+        if not hay:
+            continue
+        if _slide_looks_like_thank_you(slide) and re.search(r"\b(thank you|thanks|q and a|q a|questions)\b", text):
+            candidates.append((100, i))
+            continue
+        if text == hay or text in hay or hay in text:
+            candidates.append((len(hay), i))
+            continue
+        words = [w for w in text.split() if w not in {"slide", "ppt", "presentation", "deck", "the", "a", "an", "of", "and", "to", "after", "before"}]
+        slide_words = [w for w in hay.split() if w not in {"slide", "ppt", "presentation", "deck", "the", "a", "an", "of", "and", "to", "after", "before"}]
+        overlap = len(set(words) & set(slide_words))
+        if overlap >= 1:
+            candidates.append((overlap, i))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return None
+
+def _compute_insert_index(source_idx: int, anchor_idx: int, relation: str) -> int:
+    relation = (relation or "").strip().lower()
+    if relation == "before":
+        return max(0, anchor_idx - 1 - (1 if source_idx < anchor_idx else 0))
+    if relation == "after":
+        return max(0, anchor_idx - (1 if source_idx < anchor_idx else 0))
+    return max(0, anchor_idx - 1)
+
+def _parse_move_swap_request(user_input: str, slides: list) -> Optional[dict]:
+    text = user_input or ""
+    lower = text.lower()
+    if not re.search(r"\b(move|reorder|re-arrange|rearrange|swap|switch positions|change position)\b", lower):
+        return None
+
+    slide_count = len(slides or [])
+    # Swap requests
+    if re.search(r"\b(swap|switch positions|change position of both|exchange)\b", lower):
+        refs = re.split(r"(?i)\b(?:swap|exchange|between)\b", text, maxsplit=1)
+        if len(refs) == 2:
+            tail = refs[1]
+            parts = re.split(r"(?i)\b(?:and|with|vs\.?|versus)\b", tail, maxsplit=1)
+            if len(parts) == 2:
+                a_ref = parts[0].strip(" ,.:;")
+                b_ref = parts[1].strip(" ,.:;")
+                a_idx = _resolve_slide_reference_text(a_ref, slides)
+                b_idx = _resolve_slide_reference_text(b_ref, slides)
+                if a_idx and b_idx and a_idx != b_idx:
+                    return {
+                        "intent": "swap_slides",
+                        "slots": {"slide_a": a_idx, "slide_b": b_idx},
+                        "missing_slots": [],
+                    }
+
+        refs = re.findall(r"\bslide\s+\d+\b", lower)
+        if len(refs) >= 2:
+            a_idx = _resolve_slide_reference_text(refs[0], slides)
+            b_idx = _resolve_slide_reference_text(refs[1], slides)
+            if a_idx and b_idx and a_idx != b_idx:
+                return {
+                    "intent": "swap_slides",
+                    "slots": {"slide_a": a_idx, "slide_b": b_idx},
+                    "missing_slots": [],
+                }
+        return {
+            "intent": "swap_slides",
+            "slots": {},
+            "missing_slots": ["slide_a", "slide_b"],
+        }
+
+    move_match = re.search(
+        r"(?i)\bmove\s+(?P<src>.+?)\s+(?:before|after|to\s+position|to)\s+(?P<dst>.+)$",
+        text,
+    )
+    if move_match:
+        src_ref = move_match.group("src").strip(" ,.:;")
+        dst_ref = move_match.group("dst").strip(" ,.:;")
+        relation = "before" if "before" in lower else "after" if "after" in lower else "position"
+        source_idx = _resolve_slide_reference_text(src_ref, slides)
+        if relation == "position":
+            pos_match = re.search(r"(?i)\bto\s+position\s+(\d+)\b|\bto\s+(\d+)\b", dst_ref)
+            if not pos_match:
+                pos_match = re.search(r"\b(\d+)\b", dst_ref)
+            if source_idx and pos_match:
+                try:
+                    position = int(next(g for g in pos_match.groups() if g))
+                except StopIteration:
+                    position = None
+                except ValueError:
+                    position = None
+                if position is not None:
+                    return {
+                        "intent": "move_slide",
+                        "slots": {"slide_number": source_idx, "position": position},
+                        "missing_slots": [],
+                    }
+        else:
+            anchor_idx = _resolve_slide_reference_text(dst_ref, slides)
+            if source_idx and anchor_idx:
+                return {
+                    "intent": "move_slide",
+                    "slots": {
+                        "slide_number": source_idx,
+                        "anchor_slide": anchor_idx,
+                        "relation": relation,
+                    },
+                    "missing_slots": [],
+                }
+
+        slots = {}
+        if source_idx:
+            slots["slide_number"] = source_idx
+        else:
+            slots["source_ref"] = src_ref
+        if relation == "position":
+            slots["position"] = dst_ref
+            missing = ["position"] if source_idx else ["slide_number", "position"]
+        else:
+            slots["anchor_ref"] = dst_ref
+            slots["relation"] = relation
+            missing = ["anchor_slide"] if source_idx else ["slide_number", "anchor_slide"]
+        return {
+            "intent": "move_slide",
+            "slots": slots,
+            "missing_slots": missing,
+        }
+
+    return None
+
+def _move_slide_in_list(slides: list, source_idx: int, relation: str, anchor_idx: Optional[int] = None, position: Optional[int] = None) -> list:
+    updated = [copy.deepcopy(s) for s in (slides or []) if isinstance(s, dict)]
+    if not (1 <= source_idx <= len(updated)):
+        return updated
+
+    slide = updated.pop(source_idx - 1)
+    relation = (relation or "").strip().lower()
+    if relation == "position" and position is not None:
+        insert_at = max(0, min(len(updated), int(position) - 1))
+    elif anchor_idx is not None:
+        insert_at = _compute_insert_index(source_idx, anchor_idx, relation)
+        insert_at = max(0, min(len(updated), insert_at))
+    else:
+        insert_at = len(updated)
+
+    updated.insert(insert_at, slide)
+    return updated
+
+def _resolve_move_swap_slots(intent_data: dict, slides: list) -> Optional[dict]:
+    intent = intent_data.get("intent")
+    slots = dict(intent_data.get("slots", {}))
+    missing = list(intent_data.get("missing_slots", []))
+
+    if intent == "move_slide":
+        if slots.get("slide_number") is None and slots.get("source_ref"):
+            idx = _resolve_slide_reference_text(slots["source_ref"], slides)
+            if idx:
+                slots["slide_number"] = idx
+        if slots.get("anchor_slide") is None and slots.get("anchor_ref"):
+            idx = _resolve_slide_reference_text(slots["anchor_ref"], slides)
+            if idx:
+                slots["anchor_slide"] = idx
+        if slots.get("position") is not None:
+            try:
+                slots["position"] = int(slots["position"])
+            except (ValueError, TypeError):
+                pass
+        if slots.get("slide_number") and (slots.get("anchor_slide") is not None or slots.get("position") is not None):
+            return {"intent": intent, "slots": slots, "missing_slots": []}
+        missing = []
+        if not slots.get("slide_number"):
+            missing.append("slide_number")
+        if slots.get("position") is None and slots.get("anchor_slide") is None:
+            missing.append("anchor_slide")
+        return {"intent": intent, "slots": slots, "missing_slots": missing}
+
+    if intent == "swap_slides":
+        if slots.get("slide_a") is None and slots.get("slide_a_ref"):
+            idx = _resolve_slide_reference_text(slots["slide_a_ref"], slides)
+            if idx:
+                slots["slide_a"] = idx
+        if slots.get("slide_b") is None and slots.get("slide_b_ref"):
+            idx = _resolve_slide_reference_text(slots["slide_b_ref"], slides)
+            if idx:
+                slots["slide_b"] = idx
+        if slots.get("slide_a") and slots.get("slide_b") and slots.get("slide_a") != slots.get("slide_b"):
+            return {"intent": intent, "slots": slots, "missing_slots": []}
+        missing = []
+        if not slots.get("slide_a"):
+            missing.append("slide_a")
+        if not slots.get("slide_b"):
+            missing.append("slide_b")
+        return {"intent": intent, "slots": slots, "missing_slots": missing}
+
+    return intent_data
+
+def _dedupe_thank_you_slides(slides: list) -> list:
+    cleaned = [copy.deepcopy(s) for s in (slides or []) if isinstance(s, dict)]
+    thank_you_indexes = [i for i, slide in enumerate(cleaned) if _slide_looks_like_thank_you(slide)]
+    if len(thank_you_indexes) <= 1:
+        return cleaned
+    last_index = thank_you_indexes[-1]
+    thank_you_slide = cleaned[last_index]
+    non_thank_you = [slide for i, slide in enumerate(cleaned) if i != last_index and not _slide_looks_like_thank_you(slide)]
+    return non_thank_you + [thank_you_slide]
+
+def _build_ppt_record(ppt_id: str, *, outline_payload=None, slides=None, topic=None, sections=None, slide_count=None, ppt_bytes=None, ppt_filename=None, file_path=None):
+    store = _ppt_store()
+    record = copy.deepcopy(store.get(ppt_id, {"id": ppt_id}))
+    if outline_payload is not None:
+        record["outline_payload"] = copy.deepcopy(outline_payload)
+    if slides is not None:
+        record["slides"] = copy.deepcopy(slides)
+    if record.get("outline_payload") is None and record.get("slides") is not None:
+        record["outline_payload"] = {"slides": copy.deepcopy(record["slides"])}
+    if record.get("slides") is None and isinstance(record.get("outline_payload"), dict):
+        record["slides"] = copy.deepcopy(record["outline_payload"].get("slides", []))
+    if topic is not None:
+        record["topic"] = topic
+    if sections is not None:
+        record["sections"] = sections
+    if slide_count is None:
+        slide_count = len(record.get("slides", []) or [])
+    record["slide_count"] = slide_count
+    if ppt_bytes is not None:
+        record["ppt_bytes"] = ppt_bytes
+    if ppt_filename is not None:
+        record["ppt_filename"] = ppt_filename
+    if file_path is not None:
+        record["file_path"] = file_path
+    store[ppt_id] = record
+    _upsert_ppt_history(
+        ppt_id,
+        topic=record.get("topic", ""),
+        slide_count=record.get("slide_count", 0),
+        sections=record.get("sections", ""),
+        outline_payload=record.get("outline_payload", {}),
+        slides=record.get("slides", []),
+        ppt_bytes=record.get("ppt_bytes"),
+        ppt_filename=record.get("ppt_filename"),
+        file_path=record.get("file_path"),
+    )
+    return record
 
 def ppt_sections_preview(item: dict):
     sections = (item or {}).get("sections") or ""
@@ -1017,21 +1335,41 @@ def switch_active_ppt(ppt_id: str) -> bool:
     item = get_ppt_by_id(ppt_id)
     if not item:
         return False
+    outline = copy.deepcopy(item.get("outline_payload") or {})
+    slides = copy.deepcopy(item.get("slides") or outline.get("slides", []))
+    if outline and "slides" not in outline:
+        outline["slides"] = copy.deepcopy(slides)
+    if slides:
+        slides = _dedupe_thank_you_slides(slides)
+        outline["slides"] = copy.deepcopy(slides)
+    elif outline.get("slides"):
+        outline["slides"] = _dedupe_thank_you_slides(outline.get("slides", []))
     st.session_state.current_ppt_id = ppt_id
-    st.session_state.outline_payload = item.get("outline_payload")
+    st.session_state.outline_payload = outline
     st.session_state.ppt_bytes = item.get("ppt_bytes")
     st.session_state.ppt_filename = item.get("ppt_filename")
     st.session_state.topic = item.get("topic", "")
     st.session_state.sections = item.get("sections", "")
     st.session_state.num_slides = item.get("slide_count", st.session_state.num_slides)
     st.session_state.slide_count = st.session_state.num_slides
-    if item.get("outline_payload"):
-        sync_all_editor_widgets(item["outline_payload"].get("slides", []))
+    if outline.get("slides"):
+        sync_all_editor_widgets(copy.deepcopy(outline.get("slides", [])))
     st.session_state.pending_intent = None
     st.session_state.last_ppt_id = ppt_id
     st.session_state.last_slide_index = None
     st.session_state.last_action_type = None
     st.session_state.active_slide_index = None
+    _build_ppt_record(
+        ppt_id,
+        outline_payload=outline,
+        slides=slides or outline.get("slides", []),
+        topic=st.session_state.topic,
+        sections=st.session_state.sections,
+        slide_count=len(slides or outline.get("slides", [])),
+        ppt_bytes=item.get("ppt_bytes"),
+        ppt_filename=item.get("ppt_filename"),
+        file_path=item.get("file_path"),
+    )
     _set_conv_state(
         active_ppt_id=ppt_id,
         active_slide_index=None,
@@ -1054,9 +1392,9 @@ def resolve_ppt_reference(user_input: str) -> Tuple[bool, Optional[str], Optiona
             return True, new_id, None
 
     override_patterns = [
-        r"(?:in|to|switch to|open)\s+(?:the\s+)?(?:ppt|presentation)?\s*['\"]?([^'\"]+)['\"]?",
-        r"(?:do this in|apply to)\s+(\d+(?:st|nd|rd|th)?\s*ppt)",
-        r"(?:go to|select)\s+ppt\s+(\d+)",
+        r"(?:in|to|switch to|open)\s+(?:the\s+)?(?:ppt|presentation|deck)[_\s-]*['\"]?([^'\"]+)['\"]?",
+        r"(?:do this in|apply to)\s+(\d+(?:st|nd|rd|th)?\s*(?:ppt|presentation|deck))",
+        r"(?:go to|select)\s+(?:ppt|presentation|deck)[_\s-]*(\d+)",
     ]
     for pat in override_patterns:
         m = re.search(pat, user_input, re.IGNORECASE)
@@ -1178,13 +1516,22 @@ def resolve_named_ppt_context(user_input: str) -> Tuple[bool, Optional[str], Opt
     """
     if not user_input:
         return False, None, None
-    if not re.search(r"\b(add|edit|delete|remove|update|change|modify|preview|download|insert)\b", user_input, re.IGNORECASE):
+    # Exact references like "ppt 2" should never be overridden by fuzzy deck matching.
+    if _extract_explicit_ppt_ref_from_text(user_input):
+        return False, None, None
+    if not re.search(r"\b(add|edit|delete|remove|update|change|modify|preview|download|insert|switch|open|go to|go back|show)\b", user_input, re.IGNORECASE):
         return False, None, None
     item = _find_named_ppt_in_text(user_input)
     if item and item.get("id") != st.session_state.get("current_ppt_id"):
         switch_active_ppt(item["id"])
         return True, item["id"], None
     return False, None, None
+
+def _is_thank_you_slide_request(user_text: str) -> bool:
+    text = _norm_text(user_text)
+    if not text:
+        return False
+    return bool(re.search(r"\b(thank you|thanks|thank you slide|q and a|q a|questions)\b", text))
 
 def _is_slide_level_request(user_input: str) -> bool:
     return bool(re.search(r"\bslide\s*\d+\b", user_input or "", re.IGNORECASE))
@@ -1230,17 +1577,53 @@ def _is_ppt_topic_lookup_request(user_input: str) -> bool:
     ))
 
 def _extract_explicit_ppt_ref_from_text(user_input: str) -> Optional[str]:
+    """
+    Extract the most likely PPT reference from free-form text.
+
+    Handles forms like:
+    - ppt 1
+    - ppt_1
+    - ppt-1
+    - ppt1
+    - 1st ppt
+    """
     text = user_input or ""
-    patterns = [
-        r"\b(?:ppt|presentation|deck)\s*(\d+)\b",
+    if not text:
+        return None
+
+    ref_patterns = [
+        r"\b(?:ppt|presentation|deck)[_\s-]*#?(\d+)\b",
         r"\b(\d+)(?:st|nd|rd|th)?\s*(?:ppt|presentation|deck)\b",
-        r"\b(?:ppt|presentation|deck)\s*#?(\d+)\b",
     ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return f"ppt {m.group(1)}"
-    return None
+
+    matches = []
+    for pat in ref_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            matches.append((m.start(), f"ppt {m.group(1)}"))
+
+    if not matches:
+        return None
+
+    action_patterns = [
+        r"\badd\b", r"\binsert\b", r"\bedit\b", r"\bchange\b", r"\bupdate\b",
+        r"\bmodify\b", r"\brevise\b", r"\bpreview\b", r"\bdownload\b",
+        r"\bswitch\b", r"\bopen\b", r"\bgo to\b", r"\bgo back\b", r"\bshow\b",
+    ]
+    action_matches = []
+    for pat in action_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            action_matches.append(m.start())
+
+    if action_matches:
+        pivot = max(action_matches)
+        after = [item for item in matches if item[0] >= pivot]
+        if after:
+            return after[0][1]
+        before = [item for item in matches if item[0] < pivot]
+        if before:
+            return before[-1][1]
+
+    return matches[-1][1]
 
 def _same_topic(a: str, b: str) -> bool:
     left = _norm_text(a)
@@ -1517,6 +1900,8 @@ class ConversationalAgent:
         "create_ppt": ["topic", "slide_count", "sections"],
         "edit_slide": ["slide_number", "change_content"],
         "add_slide": ["slide_content", "position"],
+        "move_slide": ["slide_number", "anchor_slide", "relation", "position"],
+        "swap_slides": ["slide_a", "slide_b"],
         "delete_slide": ["slide_number"],
         "download_ppt": ["ppt_ref"],
         "preview_ppt": ["ppt_ref"],
@@ -1623,7 +2008,7 @@ Context:
 Your task: Update the state based on the user's input. Return a JSON object with:
 
 {{
-  "intent": "one of: create_ppt, edit_slide, add_slide, delete_slide, download_ppt, preview_ppt, ppt_info, suggest_topic, refine_ppt, greeting, smalltalk, unknown",
+  "intent": "one of: create_ppt, edit_slide, add_slide, move_slide, swap_slides, delete_slide, download_ppt, preview_ppt, ppt_info, suggest_topic, refine_ppt, greeting, smalltalk, unknown",
   "slots": {{ ... }},
   "missing_slots": [...],
   "next_question": "string or null",
@@ -1634,6 +2019,8 @@ Required slots for each intent:
 - create_ppt: topic (string), slide_count (integer), sections (string, optional)
 - edit_slide: slide_number (integer), change_content (string)
 - add_slide: slide_content (string), position (string or integer)
+- move_slide: slide_number (integer), anchor_slide (integer or string), relation (before/after/position), position (integer, optional)
+- swap_slides: slide_a (integer or string), slide_b (integer or string)
 - delete_slide: slide_number (integer)
 - download_ppt: ppt_ref (string or integer, optional)
 - preview_ppt: ppt_ref (string or integer, optional)
@@ -1645,10 +2032,13 @@ Required slots for each intent:
 Rules:
 - If the user's input indicates a new intent, reset slots and set intent accordingly.
 - If the user is continuing a previous intent, merge new information.
-- Intent priority: create_ppt > switch_ppt/reference lookup > edit_slide/add_slide > follow-up clarification.
+- Intent priority: create_ppt > switch_ppt/reference lookup > move_slide/swap_slides > edit_slide/add_slide > follow-up clarification.
 - If the user says "make/create/generate/build ppt/presentation/deck on <topic>", treat it as create_ppt even if extra content is included in the same message.
 - If the user says "add one more point", "add another bullet", or similar without a slide number, reuse the last edited slide from conversation memory.
 - If the user says "add slide" or "add a slide" without a slide number, classify it as add_slide and ask for the slide content or placement instead of reusing the last edited slide.
+- If the user says "move slide 5 before slide 4", classify it as move_slide.
+- If the user says "move conclusion slide after slide 4", classify it as move_slide and use the slide title as the source slide reference.
+- If the user says "swap slide 2 and slide 4" or "change position of both", classify it as swap_slides.
 - Only mark a slot as missing if it's required and not yet filled.
 - For add_slide, position is required. If missing, set missing_slots = ["position"].
 - For edit_slide, if user says "edit slide 3" without change content, set slide_number=3, change_content=null, missing_slots=["change_content"].
@@ -1669,6 +2059,9 @@ Rules:
 - For add_slide, if user says "add a summary slide", set slide_content="summary", position=null, missing_slots=["position"].
 - For add_slide, if user says "add a summary slide at the end", set slide_content="summary", position="end", missing_slots=[].
 - If the user says "add slide" or "add a slide" without a slide number, classify it as add_slide, not edit_slide, and ask for the new slide content/position instead of reusing the last edited slide.
+- For move_slide, "before slide N" means place the slide immediately before N and "after slide N" means place it immediately after N.
+- For move_slide, if the user names only the source slide but not the destination, ask for the destination.
+- For swap_slides, ask for the second slide if only one slide is named.
 - For create_ppt, if user says "make a ppt on AI", set topic="AI", slide_count=null, sections=null, missing_slots=["slide_count"].
 - For smalltalk like "thanks", "ok", "yes", "no", set intent="smalltalk".
 - For "hi", "hello" set intent="greeting".
@@ -1698,6 +2091,20 @@ def _polish_next_question(user_input: str, intent: Optional[str], slots: dict, m
 
     if intent == "add_slide" and "slide_content" in (missing or []):
         return f"What content should the new slide cover in {ppt_label}?"
+
+    if intent == "move_slide":
+        if "slide_number" in (missing or []) or slots.get("slide_number") is None:
+            return f"Which slide would you like to move in {ppt_label}?"
+        if "anchor_slide" in (missing or []) and "position" not in (missing or []):
+            return f"Where should slide {slots.get('slide_number')} go in {ppt_label}?"
+        if "position" in (missing or []):
+            return f"What position should slide {slots.get('slide_number')} move to in {ppt_label}?"
+
+    if intent == "swap_slides":
+        if "slide_a" in (missing or []) or slots.get("slide_a") is None:
+            return f"Which first slide should I swap in {ppt_label}?"
+        if "slide_b" in (missing or []) or slots.get("slide_b") is None:
+            return f"Which second slide should I swap with slide {slots.get('slide_a')} in {ppt_label}?"
 
     if q:
         q = re.sub(r"(?i)\bwhat point\b", "What bullet point", q)
@@ -1840,14 +2247,30 @@ If the scope is new, suggest fresh, broadly useful topics.
 #  ACTION EXECUTORS
 # ------------------------------------------------------------------------------
 def commit_changes(updated_slides, success_msg):
-    frozen_slides = copy.deepcopy(updated_slides)
-    st.session_state.outline_payload["slides"] = frozen_slides
-    sync_all_editor_widgets(frozen_slides)
-    ppt_bytes = rebuild_ppt_from_outline()
-    ppt_id = st.session_state.pop("action_target_ppt_id", None) or st.session_state.get("current_ppt_id", "")
-    item = get_ppt_by_id(ppt_id) if ppt_id else None
+    frozen_slides = _dedupe_thank_you_slides(updated_slides)
+    target_id = st.session_state.pop("action_target_ppt_id", None)
+    current_id = target_id or st.session_state.get("current_ppt_id")
+    if not current_id:
+        return
+    current_item = get_ppt_by_id(current_id) or {}
+    outline = copy.deepcopy(current_item.get("outline_payload") or st.session_state.get("outline_payload") or {})
+    outline["slides"] = copy.deepcopy(frozen_slides)
+    st.session_state.outline_payload = copy.deepcopy(outline)
+    sync_all_editor_widgets(copy.deepcopy(frozen_slides))
+    ppt_bytes = rebuild_ppt_from_outline(outline)
+    item = get_ppt_by_id(current_id) if current_id else None
     topic = (item.get("topic") if item else st.session_state.get("topic", "Presentation")) or "Presentation"
-    label = f"Updated Preview — {topic} ({ppt_id})"
+    label = f"Updated Preview — {topic} ({current_id})"
+    _build_ppt_record(
+        current_id,
+        outline_payload=outline,
+        slides=frozen_slides,
+        topic=topic,
+        sections=st.session_state.get("sections", ""),
+        slide_count=len(frozen_slides),
+        ppt_bytes=ppt_bytes,
+        ppt_filename=st.session_state.get("ppt_filename", "presentation.pptx"),
+    )
     add_message_with_preview(
         role="assistant",
         text=success_msg,
@@ -1859,10 +2282,16 @@ def commit_changes(updated_slides, success_msg):
     st.rerun()
 
 def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
-    if intent in ("edit_slide", "add_slide", "delete_slide", "preview_ppt", "download_ppt", "refine_ppt"):
+    action_ppt_id = st.session_state.get("action_target_ppt_id") or st.session_state.get("current_ppt_id")
+    if action_ppt_id and action_ppt_id != st.session_state.get("current_ppt_id"):
+        switch_active_ppt(action_ppt_id)
+    current_outline = _current_outline_payload()
+    if current_outline and current_outline.get("slides") is not None:
+        slides = copy.deepcopy(current_outline.get("slides", []))
+    if intent in ("edit_slide", "add_slide", "move_slide", "swap_slides", "delete_slide", "preview_ppt", "download_ppt", "refine_ppt"):
         if not st.session_state.get("current_ppt_id"):
             return "No presentation is currently active. Please create or switch to a presentation first.", False
-        if not st.session_state.get("outline_payload"):
+        if not current_outline:
             return "The current presentation has no slides. Please create a presentation first.", False
 
     if intent == "create_ppt":
@@ -1888,6 +2317,86 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
 
         generate_outline_and_reply(topic_final, slide_count, st.session_state.tone, sections or None, theme_colors)
         return "Generating presentation...", True
+
+    elif intent == "move_slide":
+        slide_num = slots.get("slide_number")
+        anchor_slide = slots.get("anchor_slide")
+        relation = str(slots.get("relation") or "").strip().lower()
+        position = slots.get("position")
+        if slide_num is None and slots.get("source_ref"):
+            slide_num = _resolve_slide_reference_text(str(slots.get("source_ref")), slides)
+        if slide_num is None:
+            return "Which slide would you like to move?", False
+        try:
+            slide_num = int(slide_num)
+        except (ValueError, TypeError):
+            return "Please provide a valid slide number to move.", False
+        if not (1 <= slide_num <= len(slides)):
+            return f"Slide {slide_num} does not exist. The deck has {len(slides)} slide(s).", False
+
+        pos_lower = str(position).strip().lower() if position is not None else ""
+        if position is not None and (relation == "position" or pos_lower in ("start", "first", "top", "end", "last", "bottom") or pos_lower.isdigit()):
+            try:
+                if pos_lower in ("start", "first", "top"):
+                    position = 1
+                elif pos_lower in ("end", "last", "bottom"):
+                    position = len(slides)
+                else:
+                    position = int(position)
+            except (ValueError, TypeError):
+                return "Please provide a valid destination position.", False
+            updated_slides = _move_slide_in_list(slides, slide_num, "position", position=position)
+            updated_slides = _dedupe_thank_you_slides(updated_slides)
+            updated_slides = refresh_section_index_slide(updated_slides)
+            _remember_action_context("move_slide", position, st.session_state.get("current_ppt_id"), f"Moved slide {slide_num} to position {position}")
+            commit_changes(updated_slides, f"✅ Slide {slide_num} moved to position {position}.")
+            _clear_transient_conversation_state()
+            return f"Slide {slide_num} moved to position {position}.", True
+
+        if anchor_slide is None and slots.get("anchor_ref"):
+            anchor_slide = _resolve_slide_reference_text(str(slots.get("anchor_ref")), slides)
+        if anchor_slide is None:
+            return f"Where should I move slide {slide_num} in {_ppt_display_label(st.session_state.get('current_ppt_id'))}?", False
+        try:
+            anchor_slide = int(anchor_slide)
+        except (ValueError, TypeError):
+            return "Please provide a valid destination slide number.", False
+        if not (1 <= anchor_slide <= len(slides)):
+            return f"Destination slide {anchor_slide} does not exist. The deck has {len(slides)} slide(s).", False
+        if relation not in ("before", "after"):
+            relation = "before"
+        updated_slides = _move_slide_in_list(slides, slide_num, relation, anchor_idx=anchor_slide)
+        updated_slides = _dedupe_thank_you_slides(updated_slides)
+        updated_slides = refresh_section_index_slide(updated_slides)
+        _remember_action_context("move_slide", slide_num, st.session_state.get("current_ppt_id"), f"Moved slide {slide_num} {relation} slide {anchor_slide}")
+        commit_changes(updated_slides, f"✅ Slide {slide_num} moved {relation} slide {anchor_slide}.")
+        _clear_transient_conversation_state()
+        return f"Slide {slide_num} moved {relation} slide {anchor_slide}.", True
+
+    elif intent == "swap_slides":
+        slide_a = slots.get("slide_a")
+        slide_b = slots.get("slide_b")
+        if slide_a is None and slots.get("slide_a_ref"):
+            slide_a = _resolve_slide_reference_text(str(slots.get("slide_a_ref")), slides)
+        if slide_b is None and slots.get("slide_b_ref"):
+            slide_b = _resolve_slide_reference_text(str(slots.get("slide_b_ref")), slides)
+        try:
+            slide_a = int(slide_a)
+            slide_b = int(slide_b)
+        except (ValueError, TypeError):
+            return "Please provide two valid slide numbers to swap.", False
+        if not (1 <= slide_a <= len(slides)) or not (1 <= slide_b <= len(slides)):
+            return f"Both slides must exist in the deck. The deck has {len(slides)} slide(s).", False
+        if slide_a == slide_b:
+            return "Those two slides are already in the same position.", False
+        updated_slides = list(copy.deepcopy(slides))
+        updated_slides[slide_a - 1], updated_slides[slide_b - 1] = updated_slides[slide_b - 1], updated_slides[slide_a - 1]
+        updated_slides = _dedupe_thank_you_slides(updated_slides)
+        updated_slides = refresh_section_index_slide(updated_slides)
+        _remember_action_context("swap_slides", slide_a, st.session_state.get("current_ppt_id"), f"Swapped slide {slide_a} with slide {slide_b}")
+        commit_changes(updated_slides, f"✅ Slide {slide_a} swapped with slide {slide_b}.")
+        _clear_transient_conversation_state()
+        return f"Slide {slide_a} swapped with slide {slide_b}.", True
 
     elif intent == "edit_slide":
         slide_num = slots.get("slide_number")
@@ -2007,11 +2516,18 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         position = slots.get("position")
         if not slide_content:
             return "Missing slide content.", False
+        is_thank_you = _is_thank_you_slide_request(slide_content)
+        if is_thank_you and not position:
+            position = "end"
         if not position:
             return f"Where should I add the slide about '{slide_content}' in {_ppt_display_label(st.session_state.get('current_ppt_id'))}?", False
         try:
-            new_slide_data = draft_slide_from_request(slide_content, slides)
+            if is_thank_you:
+                new_slide_data = make_thank_you_slide({})
+            else:
+                new_slide_data = draft_slide_from_request(slide_content, slides)
             new_slide_data = normalize_slide(new_slide_data)
+            updated_slides = list(slides)
             if isinstance(position, str):
                 pos_lower = position.lower()
                 if pos_lower in ("start", "first", "top"):
@@ -2032,8 +2548,11 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                     idx = min(max(1, int(position)), len(slides) + 1)
                 except (ValueError, TypeError):
                     idx = len(slides) + 1
-            updated_slides = list(slides)
+            if is_thank_you:
+                updated_slides = [s for s in updated_slides if not _slide_looks_like_thank_you(s)]
+                idx = len(updated_slides) + 1
             updated_slides.insert(idx - 1, new_slide_data)
+            updated_slides = _dedupe_thank_you_slides(updated_slides)
             updated_slides = refresh_section_index_slide(updated_slides)
             _remember_action_context("add_slide", idx, st.session_state.get("current_ppt_id"), f"Added new slide at position {idx}")
             commit_changes(updated_slides, f"✅ New slide added at position {idx}.")
@@ -2085,7 +2604,7 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
                 switch_active_ppt(best_id)
                 item = get_ppt_by_id(best_id)
                 if item and item.get("outline_payload"):
-                    preview_slides = item["outline_payload"].get("slides", [])
+                    preview_slides = copy.deepcopy(item["outline_payload"].get("slides", []))
                     topic = item.get("topic", "Presentation")
                     label = f"Preview — {topic} ({best_id})"
                     add_message_with_preview(
@@ -2101,9 +2620,10 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             else:
                 return "I couldn't find that PPT.", False
         else:
-            outline = st.session_state.get("outline_payload")
+            current_item = get_ppt_by_id(st.session_state.get("current_ppt_id")) or {}
+            outline = copy.deepcopy(current_item.get("outline_payload") or st.session_state.get("outline_payload"))
             if outline and outline.get("slides"):
-                preview_slides = outline["slides"]
+                preview_slides = copy.deepcopy(outline["slides"])
                 ppt_id = st.session_state.get("current_ppt_id", "")
                 topic = st.session_state.get("topic", "Presentation")
                 label = f"Preview — {topic} ({ppt_id})"
@@ -2162,7 +2682,7 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
 
     elif intent == "refine_ppt":
         current_id = st.session_state.get("current_ppt_id")
-        if not current_id or not st.session_state.get("outline_payload"):
+        if not current_id or not _current_outline_payload():
             return "No presentation is currently active. Please open a PPT first.", False
         item = get_ppt_by_id(current_id) or {}
         topic = item.get("topic") or st.session_state.get("topic", "Presentation")
@@ -2391,6 +2911,7 @@ def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None,
         try:
             payload = request_outline(topic, count, tone, sections, theme_colors)
             payload["slides"] = payload.get("slides", [])[:count]
+            payload["slides"] = _dedupe_thank_you_slides(payload.get("slides", []))
             st.session_state.outline_payload = payload
             st.session_state.topic = topic
             existing_id = ppt_id
@@ -2410,12 +2931,13 @@ def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None,
             st.session_state.current_ppt_id = deck_id
             _remember_action_context("refine_ppt" if is_update else "create_ppt", None, deck_id, f"{'Updated' if is_update else 'Created'} {count}-slide deck on {topic}")
             _set_conv_state(active_ppt_id=deck_id, last_topic=topic)
-            _upsert_ppt_history(
+            _build_ppt_record(
                 deck_id,
                 topic=topic,
                 slide_count=count,
                 sections=sections or "",
                 outline_payload=payload,
+                slides=payload.get("slides", []),
                 ppt_bytes=None,
                 ppt_filename=None,
                 file_path=None,
@@ -2440,10 +2962,18 @@ def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None,
         except Exception as e:
             st.error(f"Outline generation failed: {e}")
 
-def rebuild_ppt_from_outline() -> bytes | None:
-    outline = st.session_state.outline_payload
+def rebuild_ppt_from_outline(outline_payload: Optional[dict] = None) -> bytes | None:
+    current_id = st.session_state.get("current_ppt_id")
+    current_item = get_ppt_by_id(current_id) if current_id else None
+    outline = copy.deepcopy(
+        outline_payload
+        or st.session_state.get("outline_payload")
+        or (current_item or {}).get("outline_payload")
+        or {}
+    )
     if not outline or not outline.get("slides"):
         return None
+    outline["slides"] = _dedupe_thank_you_slides(outline.get("slides", []))
     build_payload = sanitize_outline_for_build(copy.deepcopy(outline))
     files = None
     if st.session_state.get("logo_bytes"):
@@ -2480,7 +3010,8 @@ def rebuild_ppt_from_outline() -> bytes | None:
             st.session_state.ppt_filename = filename
             ppt_id = st.session_state.get("current_ppt_id")
             if ppt_id:
-                _upsert_ppt_history(
+                slides = outline.get("slides", [])
+                _build_ppt_record(
                     ppt_id,
                     ppt_bytes=ppt_bytes,
                     ppt_filename=filename,
@@ -2488,6 +3019,7 @@ def rebuild_ppt_from_outline() -> bytes | None:
                     outline_payload=outline,
                     topic=st.session_state.topic,
                     sections=st.session_state.sections,
+                    slides=slides,
                     slide_count=len(slides),
                 )
             return ppt_bytes
@@ -2499,11 +3031,12 @@ def rebuild_ppt_from_outline() -> bytes | None:
         return None
 
 def sanitize_outline_for_build(payload: dict) -> dict:
+    slides_source = payload.get("slides", []) if isinstance(payload, dict) else []
     safe = {
         "design_system": payload.get("design_system", {}) if isinstance(payload, dict) else {},
         "slides": [],
     }
-    for slide in (payload.get("slides", []) if isinstance(payload, dict) else []):
+    for slide in _dedupe_thank_you_slides(slides_source):
         if not isinstance(slide, dict):
             continue
         layout = str(slide.get("layout", "bullets")).strip() or "bullets"
@@ -2713,8 +3246,8 @@ if files:
             with st.chat_message("assistant"):
                 st.markdown(logo_notice)
             add_message("assistant", logo_notice)
-            if st.session_state.get("outline_payload"):
-                rebuild_ppt_from_outline()
+        if _current_outline_payload():
+            rebuild_ppt_from_outline()
 
 if prompt is not None:
     prompt = prompt.strip()
@@ -2780,9 +3313,119 @@ if prompt is not None:
     else:
         routing_prompt = _resolve_vague_followup_prompt(prompt)
 
-    outline_payload = st.session_state.outline_payload
+    # Resolve explicit deck references before any slide-level follow-up logic.
+    # This prevents "add slide in ppt 1" from asking a generic follow-up while
+    # still operating on whatever deck happened to be active previously.
+    if re.search(r"(ppt|presentation|deck)\s*\d+|ppt[_-]\d+|switch|open|go to|previous ppt", routing_prompt, re.IGNORECASE):
+        early_changed, early_ppt_id, early_clarification = resolve_ppt_reference(routing_prompt)
+        if early_clarification:
+            with st.chat_message("assistant"):
+                st.markdown(early_clarification)
+            add_message("assistant", early_clarification)
+            st.rerun()
+        if early_changed:
+            st.session_state.action_target_ppt_id = early_ppt_id
+
+    outline_payload = _current_outline_payload()
     slides = outline_payload.get("slides", []) if outline_payload else []
     pending_state = st.session_state.get("pending_intent") or {}
+
+    if pending_state.get("intent") in ("move_slide", "swap_slides") and (pending_state.get("missing_slots") or []):
+        if re.search(r"\b(?:cancel|stop|never mind|nevermind)\b", routing_prompt, re.IGNORECASE):
+            if "agent" in st.session_state:
+                st.session_state.agent.clear_state()
+            st.session_state.pending_intent = None
+            with st.chat_message("assistant"):
+                st.markdown("Okay, I cancelled that request.")
+            add_message("assistant", "Okay, I cancelled that request.")
+            st.rerun()
+
+        slots = dict(pending_state.get("slots", {}))
+        intent = pending_state.get("intent")
+
+        if intent == "move_slide":
+            if slots.get("slide_number") is None:
+                slide_idx = _extract_explicit_slide_number_from_text(prompt)
+                if slide_idx is not None:
+                    slots["slide_number"] = slide_idx
+                else:
+                    slide_idx = _resolve_slide_reference_text(prompt, slides)
+                    if slide_idx is not None:
+                        slots["slide_number"] = slide_idx
+            if slots.get("anchor_slide") is None and slots.get("position") is None:
+                pos_text = _norm_text(prompt)
+                if re.search(r"\b(end|last|bottom)\b", pos_text):
+                    slots["position"] = "end"
+                elif re.search(r"\b(start|first|top)\b", pos_text):
+                    slots["position"] = "start"
+                else:
+                    anchor_idx = _resolve_slide_reference_text(prompt, slides)
+                    if anchor_idx is not None:
+                        slots["anchor_slide"] = anchor_idx
+                    else:
+                        pos_idx = _extract_slide_count_from_text(prompt)
+                        if pos_idx is not None:
+                            slots["position"] = pos_idx
+            resolved_pending = _resolve_move_swap_slots({"intent": intent, "slots": slots, "missing_slots": []}, slides)
+            if resolved_pending and not resolved_pending.get("missing_slots"):
+                result_msg, success = execute_action(intent, resolved_pending.get("slots", {}), slides)
+                with st.chat_message("assistant"):
+                    st.markdown(result_msg)
+                add_message("assistant", result_msg)
+                if "agent" in st.session_state:
+                    st.session_state.agent.clear_state()
+                st.rerun()
+            question = _polish_next_question(prompt, intent, slots, resolved_pending.get("missing_slots", []) if resolved_pending else ["slide_number", "anchor_slide"], None)
+            st.session_state.pending_intent = {"intent": intent, "slots": slots, "missing_slots": resolved_pending.get("missing_slots", []) if resolved_pending else ["slide_number", "anchor_slide"], "next_question": question, "action": "ask"}
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+
+        if intent == "swap_slides":
+            if slots.get("slide_a") is None:
+                idx_a = _extract_explicit_slide_number_from_text(prompt) or _resolve_slide_reference_text(prompt, slides)
+                if idx_a is not None:
+                    slots["slide_a"] = idx_a
+            elif slots.get("slide_b") is None:
+                idx_b = _extract_explicit_slide_number_from_text(prompt) or _resolve_slide_reference_text(prompt, slides)
+                if idx_b is not None:
+                    slots["slide_b"] = idx_b
+            resolved_pending = _resolve_move_swap_slots({"intent": intent, "slots": slots, "missing_slots": []}, slides)
+            if resolved_pending and not resolved_pending.get("missing_slots"):
+                result_msg, success = execute_action(intent, resolved_pending.get("slots", {}), slides)
+                with st.chat_message("assistant"):
+                    st.markdown(result_msg)
+                add_message("assistant", result_msg)
+                if "agent" in st.session_state:
+                    st.session_state.agent.clear_state()
+                st.rerun()
+            question = _polish_next_question(prompt, intent, slots, resolved_pending.get("missing_slots", []) if resolved_pending else ["slide_a", "slide_b"], None)
+            st.session_state.pending_intent = {"intent": intent, "slots": slots, "missing_slots": resolved_pending.get("missing_slots", []) if resolved_pending else ["slide_a", "slide_b"], "next_question": question, "action": "ask"}
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+
+    move_swap_request = _parse_move_swap_request(routing_prompt, slides)
+    if move_swap_request:
+        resolved_move_swap = _resolve_move_swap_slots(move_swap_request, slides)
+        if resolved_move_swap and resolved_move_swap.get("missing_slots"):
+            st.session_state.pending_intent = resolved_move_swap
+            if "agent" in st.session_state:
+                st.session_state.agent.clear_state()
+            question = _polish_next_question(prompt, resolved_move_swap.get("intent"), resolved_move_swap.get("slots", {}), resolved_move_swap.get("missing_slots", []), None)
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+        if resolved_move_swap:
+            result_msg, success = execute_action(resolved_move_swap["intent"], resolved_move_swap.get("slots", {}), slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            st.rerun()
+
     if _is_bare_edit_slide_request(routing_prompt):
         st.session_state.pending_intent = None
         st.session_state.active_edit_context = None
@@ -2919,8 +3562,9 @@ if prompt is not None:
             st.rerun()
 
     slide_target = _extract_slide_navigation_target(routing_prompt)
-    if slide_target and st.session_state.get("outline_payload"):
-        slides = st.session_state.outline_payload.get("slides", [])
+    current_outline = _current_outline_payload()
+    if slide_target and current_outline:
+        slides = current_outline.get("slides", [])
         if 1 <= slide_target <= len(slides):
             slide = slides[slide_target - 1] if isinstance(slides[slide_target - 1], dict) else {}
             slide_title = str(slide.get("title", f"Slide {slide_target}")).strip() or f"Slide {slide_target}"
@@ -2932,7 +3576,7 @@ if prompt is not None:
             st.rerun()
 
     refinement = _extract_deck_refinement_request(routing_prompt)
-    if refinement and st.session_state.get("outline_payload") and not _is_slide_level_request(routing_prompt):
+    if refinement and current_outline and not _is_slide_level_request(routing_prompt):
         current_id = st.session_state.get("current_ppt_id")
         current_item = get_ppt_by_id(current_id) if current_id else None
         if current_item:
