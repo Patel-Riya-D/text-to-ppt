@@ -2009,6 +2009,29 @@ def _is_shortening_request(user_input: str) -> bool:
     text = _norm_text(user_input)
     return bool(re.search(r"\b(shorter|less text|concise|condense|trim|remove fluff|cut down|tighten)\b", text, re.IGNORECASE))
 
+def _is_generic_edit_request(user_input: str) -> bool:
+    text = _norm_text(user_input)
+    return bool(re.fullmatch(
+        r"(?:edit|change|update|modify|revise)\s+slide(?:\s+\d+)?"
+        r"|(?:edit|change|update|modify|revise)\s+slide\s+#?\d+"
+        r"|(?:edit|change|update|modify|revise)\s+it"
+        r"|(?:edit|change|update|modify|revise)\s+this",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _has_meaningful_edit_instruction(user_input: str) -> bool:
+    text = _safe_str(user_input)
+    if not text:
+        return False
+    if _extract_edit_change_content(text):
+        return True
+    if _is_transform_request(text) or _is_shortening_request(text):
+        return True
+    if re.search(r"\b(?:add|remove|replace|title|subtitle|content|bullet|point|layout|chart|table|timeline|grid|stat|summary|conclusion|thank you|questions?)\b", text, re.IGNORECASE):
+        return True
+    return False
+
 def _extract_view_slide_request(user_input: str) -> Optional[dict]:
     text = user_input or ""
     if not re.search(r"\b(show|view|preview|display)\b", text, re.IGNORECASE):
@@ -2465,6 +2488,9 @@ def _infer_agent_slots(intent: Optional[str], user_input: str, slots: dict, cont
         change = _extract_edit_change_content(text) or (_resolve_vague_followup_prompt(text) if _is_ambiguous_add_followup(text) else None)
         if change:
             updated["change_content"] = change
+    elif intent in {"edit_slide", "transform_content"} and updated.get("change_content") is not None:
+        if _is_generic_edit_request(text) and not _has_meaningful_edit_instruction(text):
+            updated.pop("change_content", None)
 
     if intent == "add_slide":
         content = _extract_add_slide_content(text)
@@ -2584,6 +2610,10 @@ class ConversationalAgent:
             computed_missing = [slot for slot in required_slots if _slot_missing(merged_slots.get(slot))]
             if new_intent in {"add_slide", "move_slide", "swap_slides", "create_ppt", "edit_slide", "transform_content", "delete_slide", "view_slide"}:
                 missing = computed_missing
+            if new_intent in {"edit_slide", "transform_content"} and not _has_meaningful_edit_instruction(user_input):
+                merged_slots.pop("change_content", None)
+                if "change_content" not in missing:
+                    missing = list(missing) + ["change_content"]
             self.state["slots"] = merged_slots
             self.state["missing_slots"] = missing
             next_q = _polish_next_question(user_input, new_intent, merged_slots, missing, next_q)
@@ -4665,6 +4695,27 @@ if prompt is not None:
     routing_prompt = _canonicalize_reasoned_prompt(routing_prompt, reasoned)
     direct_intent = reasoned.get("intent")
 
+    if _is_deck_level_edit_request(prompt):
+        target_ppt_ref = reasoned.get("ppt_id") or _extract_explicit_ppt_ref_from_text(routing_prompt) or routing_prompt
+        changed, new_ppt_id, clarification = resolve_ppt_reference(str(target_ppt_ref))
+        if clarification:
+            with st.chat_message("assistant"):
+                st.markdown(clarification)
+            add_message("assistant", clarification)
+            st.rerun()
+        if changed and new_ppt_id:
+            st.session_state.action_target_ppt_id = new_ppt_id
+            st.session_state.active_edit_context = {
+                "level": "ppt",
+                "ppt_id": new_ppt_id,
+            }
+            ppt_label = _ppt_display_label(new_ppt_id)
+            followup = f"What changes would you like to make in {ppt_label}?"
+            with st.chat_message("assistant"):
+                st.markdown(followup)
+            add_message("assistant", followup)
+            st.rerun()
+
     reasoned_ppt_ref = reasoned.get("ppt_id")
     if reasoned_ppt_ref:
         resolved_reasoned_ppt = _resolve_ppt_history_item(str(reasoned_ppt_ref))
@@ -4844,6 +4895,18 @@ if prompt is not None:
             st.rerun()
 
     if direct_intent == "edit_slide" and reasoned.get("slide_id") is not None:
+        if not _has_meaningful_edit_instruction(routing_prompt):
+            reply = _polish_next_question(
+                routing_prompt,
+                "edit_slide",
+                {"slide_number": reasoned.get("slide_id")},
+                ["change_content"],
+                None,
+            )
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
         if not _should_execute_directly(reasoned):
             reply = _polish_next_question(
                 routing_prompt,
@@ -5195,6 +5258,18 @@ if prompt is not None:
             st.markdown(clarification)
         add_message("assistant", clarification)
         st.rerun()
+    if changed and _is_deck_level_edit_request(prompt):
+        st.session_state.active_edit_context = {
+            "level": "ppt",
+            "ppt_id": new_ppt_id,
+        }
+        st.session_state.action_target_ppt_id = new_ppt_id
+        ppt_label = _ppt_display_label(new_ppt_id)
+        followup = f"What changes would you like to make in {ppt_label}?"
+        with st.chat_message("assistant"):
+            st.markdown(followup)
+        add_message("assistant", followup)
+        st.rerun()
     if changed:
         st.session_state.action_target_ppt_id = new_ppt_id
         if re.search(r"\b(?:open|switch to|go to|show)\b", routing_prompt, re.IGNORECASE):
@@ -5219,21 +5294,9 @@ if prompt is not None:
             message = f"✅ Active deck set to **{active_label}**."
             if active_topic:
                 message += f" Topic: {active_topic}."
-            message += " You can now say things like `edit slide 3`, `add a new slide at the end`, or `show preview`."
+                message += " You can now say things like `edit slide 3`, `add a new slide at the end`, or `show preview`."
             st.markdown(message)
         add_message("assistant", f"Active deck set to {active_label}.")
-
-    if changed and _is_deck_level_edit_request(prompt):
-        st.session_state.active_edit_context = {
-            "level": "ppt",
-            "ppt_id": new_ppt_id,
-        }
-        ppt_label = _ppt_display_label(new_ppt_id)
-        followup = f"What changes would you like to make in {ppt_label}?"
-        with st.chat_message("assistant"):
-            st.markdown(followup)
-        add_message("assistant", followup)
-        st.rerun()
     elif changed:
         st.session_state.active_edit_context = None
         if not _looks_like_change_instruction(prompt):
