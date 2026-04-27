@@ -1,8 +1,9 @@
 import os
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # =========================
 # 🔹 Azure OpenAI (LLM)

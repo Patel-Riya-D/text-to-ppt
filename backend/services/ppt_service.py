@@ -103,6 +103,7 @@ import ast
 import re
 import random
 import colorsys
+import copy
 from PIL import Image
 from openai import AzureOpenAI
 from pptx import Presentation
@@ -314,6 +315,23 @@ def _sanitize_icon_marker(icon: str, fallback: str = "▸") -> str:
         return token
     if len(token) == 1 and not token.isalnum() and not token.isspace():
         return token
+    return fallback
+
+def _derive_column_title(title_value: str, points: list, fallback: str) -> str:
+    title_text = _safe_str(title_value, "").strip()
+    if title_text and _canon(title_text) not in {"left", "right", "left title", "right title", "option a", "option b", "title"}:
+        return title_text
+    first_point = ""
+    for pt in _safe_list(points):
+        first_point = _clean_bullet_text(_safe_str(pt, ""))
+        if first_point:
+            break
+    first_point = re.sub(r"^\s*[-•▸►▶➤]+\s*", "", first_point).strip()
+    if first_point:
+        words = first_point.split()
+        derived = " ".join(words[:4]).strip()
+        if derived:
+            return derived[:42]
     return fallback
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -904,14 +922,14 @@ def render_two_column(slide, spec, num, theme, profile, logo_path=None):
     _draw_footer(slide, theme, profile)
     ix, iy, iw, ih = _draw_card(slide, theme, profile)
     gap = 0.20; cw = (iw-gap)/2
-    lt = _safe_str(spec.get("left_title","Left"))
-    rt = _safe_str(spec.get("right_title","Right"))
-    lp = _validate_and_clean_content(_safe_list(spec.get("left_points",[])))
-    rp = _validate_and_clean_content(_safe_list(spec.get("right_points",[])))
+    lp = _validate_and_clean_content(_safe_list(spec.get("left_points", spec.get("left", []))))
+    rp = _validate_and_clean_content(_safe_list(spec.get("right_points", spec.get("right", []))))
     if not lp and not rp:
         content = _validate_and_clean_content(_safe_list(spec.get("content",[])))
         mid = max(1, len(content)//2)
         lp, rp = content[:mid], content[mid:]
+    lt = _derive_column_title(spec.get("left_title",""), lp, "Key Points")
+    rt = _derive_column_title(spec.get("right_title",""), rp, "Supporting Points")
     icon = spec.get("icon","▸")
     # Use the stronger accent for the bullet glyph in two-column layouts.
     # The lighter secondary accent can disappear against the white card in some
@@ -1278,6 +1296,8 @@ def _canon(layout, default="bullets"):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _needs_repair(slide: dict) -> bool:
+    if isinstance(slide, dict) and slide.get("_user_modified"):
+        return False
     layout = _canon(slide.get("layout","bullets"))
     if layout == "two_column":
         lp = _safe_list(slide.get("left_points",[]))
@@ -1488,15 +1508,23 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
     for k in ("content","left_points","right_points","sections"):
         if k in slide:
             slide[k] = _safe_list(slide[k])
+    if "left" in slide and not slide.get("left_points"):
+        slide["left_points"] = _safe_list(slide.get("left", []))
+    if "right" in slide and not slide.get("right_points"):
+        slide["right_points"] = _safe_list(slide.get("right", []))
 
     if layout == "two_column":
-        if not slide.get("left_title"):  slide["left_title"]  = "Option A"
-        if not slide.get("right_title"): slide["right_title"] = "Option B"
         if not slide.get("left_points") and not slide.get("right_points"):
             c   = _safe_list(slide.get("content",[]))
             mid = max(1, len(c)//2)
             slide["left_points"]  = c[:mid]
             slide["right_points"] = c[mid:]
+        slide["left_title"] = _derive_column_title(slide.get("left_title", ""), slide.get("left_points", []), "Key Points")
+        slide["right_title"] = _derive_column_title(slide.get("right_title", ""), slide.get("right_points", []), "Supporting Points")
+        slide["left"] = copy.deepcopy(slide.get("left_points", []))
+        slide["right"] = copy.deepcopy(slide.get("right_points", []))
+        slide["left"] = copy.deepcopy(slide.get("left_points", []))
+        slide["right"] = copy.deepcopy(slide.get("right_points", []))
     elif layout == "big_stat":
         slide.setdefault("stat_label","Key Metric")
         slide.setdefault("stat_source","")
@@ -1584,6 +1612,109 @@ def _normalize_slide(slide: dict, idx: int, topic: str) -> dict:
                 item["detail"] = _clean_bullet_text(str(item.get("detail", "")))
 
     return slide
+
+
+def normalize_outline_payload(payload: dict, topic: str = "", tone: str = "Professional",
+                              target: int | None = None) -> dict:
+    """
+    Normalize outline payloads for both preview JSON and PPT rendering.
+
+    This keeps the returned slide data aligned with the PPT build path without
+    changing the existing render logic.
+    """
+    data = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    slides = [s for s in (data.get("slides", []) or []) if isinstance(s, dict)]
+
+    normalized = []
+    for i, slide in enumerate(slides, start=1):
+        normalized.append(_normalize_slide(slide, i, topic))
+
+    if normalized:
+        normalized[0]["layout"] = "title_cover"
+
+    if len(normalized) > 1 and _canon(normalized[1].get("layout", "")) != "section_index":
+        normalized.insert(1, {
+            "title": "Contents",
+            "subtitle": f"{tone} overview",
+            "layout": "section_index",
+            "icon": "▸",
+            "sections": [s.get("title", "") for s in normalized[2:] if s.get("title")][:6],
+            "content": [],
+            "style": {},
+        })
+
+    if len(normalized) > 1:
+        normalized[1]["layout"] = "section_index"
+        secs = [s.get("title", "") for s in normalized[2:] if _safe_str(s.get("title", ""))][:6]
+        normalized[1]["sections"] = secs
+        normalized[1]["content"] = secs
+
+    if normalized and _safe_str(normalized[-1].get("title", "")).lower() in ["thank you", "thanks", "q&a"]:
+        normalized[-1] = {
+            "title": "Thank You",
+            "subtitle": "Questions?",
+            "layout": "title_cover",
+            "icon": "▸",
+            "content": [],
+            "style": {},
+        }
+
+    if target is not None:
+        normalized = normalized[:target]
+
+    for slide in normalized:
+        if any(w in slide.get("title", "").lower() for w in ["thank", "thanks", "q&a", "questions"]):
+            slide.update({
+                "title": "Thank You",
+                "subtitle": "Questions?",
+                "layout": "title_cover",
+                "content": [],
+            })
+            break
+
+    # Convert temporal trend bullets → chart
+    for slide in normalized:
+        if slide.get("layout") == "bullets":
+            content = slide.get("content", [])
+            pattern = re.compile(r'^\s*(\d{4})\s*[:：]\s*(\d+(?:\.\d+)?)%?\s*$')
+            matches = [(m.group(1), m.group(2)) for line in content for m in [pattern.match(line.strip())] if m]
+            if len(matches) >= 3:
+                slide["layout"] = "chart"
+                slide["chart_title"] = slide.get("title", "Trend Over Years")
+                slide["chart_data"] = [{"label": y, "value": int(float(v))} for y, v in matches]
+                slide["content"] = []
+
+    repaired = []
+    last_layouts = []
+    for s in normalized:
+        if _needs_repair(s):
+            s, _repair_usage = _repair_slide(s, topic)
+            s = _normalize_slide(s, 0, topic)
+
+        layout = _canon(s.get("layout", "bullets"))
+        if len(last_layouts) >= 1 and layout == last_layouts[-1]:
+            if layout == "bullets":
+                content = _safe_list(s.get("content", []))
+                if len(content) >= 4:
+                    mid = max(1, len(content) // 2)
+                    s["layout"] = "two_column"
+                    s["left_title"] = _safe_str(s.get("left_title", "Left")) or "Left"
+                    s["right_title"] = _safe_str(s.get("right_title", "Right")) or "Right"
+                    s["left_points"] = content[:mid]
+                    s["right_points"] = content[mid:]
+                elif len(content) >= 2:
+                    s["layout"] = "bullets"
+            elif layout == "two_column":
+                merged = _safe_list(s.get("left_points", [])) + _safe_list(s.get("right_points", []))
+                if merged:
+                    s["layout"] = "bullets"
+                    s["content"] = merged
+        last_layouts.append(_canon(s.get("layout", "bullets")))
+        last_layouts = last_layouts[-2:]
+        repaired.append(s)
+
+    data["slides"] = repaired
+    return data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1853,63 +1984,7 @@ GOOD (always generate):
                 if _resolve_theme_color(name)
             ][:3]
 
-    slides     = [s for s in data["slides"] if isinstance(s,dict)]
-    normalized = []
-    for i, s in enumerate(slides, start=1):
-        ns = _normalize_slide(s, i, topic)
-        normalized.append(ns)
-
-    if normalized:
-        normalized[0]["layout"] = "title_cover"
-    if len(normalized) > 1 and _canon(normalized[1].get("layout","")) != "section_index":
-        normalized.insert(1, {
-            "title":"Contents","subtitle":f"{tone} overview",
-            "layout":"section_index","icon":"▸",
-            "sections":[s.get("title","") for s in normalized[2:] if s.get("title")][:6],
-            "content":[], "style":{}
-        })
-    if len(normalized) > 1:
-        normalized[1]["layout"]   = "section_index"
-        secs = [s.get("title","") for s in normalized[2:] if _safe_str(s.get("title",""))][:6]
-        normalized[1]["sections"] = secs
-        normalized[1]["content"]  = secs
-
-    # Clean thank-you slide
-    if normalized and normalized[-1].get("title", "").lower() in ["thank you", "thanks", "q&a"]:
-        normalized[-1] = {
-            "title": "Thank You", "subtitle": "Questions?",
-            "layout": "title_cover", "icon": "▸",
-            "content": [], "style": {}
-        }
-    normalized = normalized[:target]
-
-    for i, slide in enumerate(normalized):
-        if any(w in slide.get("title", "").lower() for w in ["thank", "thanks", "q&a", "questions"]):
-            slide.update({"title": "Thank You", "subtitle": "Questions?",
-                          "layout": "title_cover", "content": []})
-            break
-
-    # Convert temporal trend bullets → chart
-    for slide in normalized:
-        if slide.get("layout") == "bullets":
-            content = slide.get("content", [])
-            pattern = re.compile(r'^\s*(\d{4})\s*[:：]\s*(\d+(?:\.\d+)?)%?\s*$')
-            matches = [(m.group(1), m.group(2)) for line in content for m in [pattern.match(line.strip())] if m]
-            if len(matches) >= 3:
-                slide["layout"]      = "chart"
-                slide["chart_title"] = slide.get("title", "Trend Over Years")
-                slide["chart_data"]  = [{"label": y, "value": int(float(v))} for y, v in matches]
-                slide["content"]     = []
-
-    repaired = []
-    for s in normalized:
-        if _needs_repair(s):
-            s, repair_usage = _repair_slide(s, topic)
-            usage_total = _merge_usage(usage_total, repair_usage)
-            s = _normalize_slide(s, 0, topic)
-        repaired.append(s)
-
-    data["slides"] = repaired
+    data = normalize_outline_payload(data, topic=topic, tone=tone, target=target)
     data["usage"]  = usage_total
     return data
 

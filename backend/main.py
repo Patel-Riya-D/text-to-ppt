@@ -7,7 +7,12 @@ import os
 import asyncio
 from fastapi import File, UploadFile, Form
 import json
-from backend.services.ppt_service import generate_slide_content, create_ppt
+from backend.services.ppt_service import (
+    generate_slide_content,
+    create_ppt,
+    normalize_outline_payload,
+)
+from backend.services.intent_classifier import classify_ppt_intent
 from fastapi.responses import JSONResponse
 import base64
 import traceback
@@ -23,6 +28,11 @@ class PPTBuildRequest(BaseModel):
     topic: str
     tone: str = "Professional"
     slide_data: dict
+
+class IntentClassifyRequest(BaseModel):
+    message: str
+    ppt_id: str | None = None
+    slide_id: int | None = None
 
 @app.get("/")
 def home():
@@ -42,6 +52,7 @@ async def generate_outline(
             asyncio.to_thread(generate_slide_content, topic, num_slides, tone, theme_colors),
             timeout=150,
         )
+        slide_data = normalize_outline_payload(slide_data, topic=topic, tone=tone, target=num_slides)
         return JSONResponse(slide_data)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Slide generation timed out")
@@ -59,6 +70,7 @@ async def build_ppt(
 ):
     try:
         slide_data = json.loads(slides_json)
+        slide_data = normalize_outline_payload(slide_data, topic=topic, tone=tone)
 
         logo_path = None
         if logo:
@@ -90,3 +102,13 @@ async def build_ppt(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/classify-intent")
+async def classify_intent(payload: IntentClassifyRequest):
+    return JSONResponse(
+        classify_ppt_intent(
+            payload.message,
+            ppt_id=payload.ppt_id,
+            slide_id=payload.slide_id,
+        )
+    )
