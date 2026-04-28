@@ -50,6 +50,11 @@ _VIEW_SLIDE_RE = re.compile(
     r"|\bslide\b.*\b(show|view|preview|display)\b",
     re.IGNORECASE,
 )
+_CLEAR_SLIDE_RE = re.compile(
+    r"\b(remove everything|clear slide|clear all|erase all|wipe slide|wipe all|delete all content|remove all content|blank slide|make blank slide|empty slide)\b",
+    re.IGNORECASE,
+)
+_CANCEL_RE = re.compile(r"^(stop|cancel|nevermind|never mind|abort|quit)$", re.IGNORECASE)
 _MOVE_RE = re.compile(
     r"\b(move|swap|reorder|rearrange|re-arrange|re-order|"
     r"switch positions|change position)\b.*\bslide\b",
@@ -113,13 +118,18 @@ def _extract_content(text: str) -> Optional[str]:
     if not text:
         return None
     cleaned = re.sub(r"(?i)\b(?:sorry|no|actually|instead)\b", "", text)
-    cleaned = re.sub(r"(?i)\b(?:slide|ppt|presentation|deck)\s+#?\d+\b", "", cleaned)
+    # Remove phrases like 'in ppt 2', 'of presentation', 'in the deck 3'
+    cleaned = re.sub(r"(?i)\b(?:in|of|for|on|about)\s+(?:the\s+)?(?:ppt|presentation|deck)(?:\s*#?\d+)?\b", "", cleaned)
+    # Remove standalone slide/ppt words (they can appear without numbers)
+    cleaned = re.sub(r"(?i)\b(?:ppt|presentation|deck)\b", "", cleaned)
+    # Remove leading action verbs
     cleaned = re.sub(
         r"(?i)^\s*(?:add|insert|create|make|build|edit|change|update|modify|"
         r"revise|improve|enhance|refine|shorten|simplify|rewrite|fix)\s+",
         "",
         cleaned,
     )
+    # Remove generic point/bullet mentions
     cleaned = re.sub(r"(?i)\b(?:points?|bullets?)\b", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-")
     return cleaned or None
@@ -172,26 +182,32 @@ Valid intents (PRIORITY ORDER — pick highest applicable):
 1. transform_content  - improve, fix, shorten, rewrite, polish, make better/professional/concise/cleaner, condense, spice up, rephrase, clean up, tighten
 2. add_points         – add/append/insert bullet points or more points to a slide
 3. edit_slide         – structural edit to a slide (title, layout, content replacement/removal)
-4. add_slide          – insert a new slide
-5. delete_slide       – remove/delete a slide
-6. move_slide         – reposition or reorder a slide
-7. swap_slides        – swap two slides
-8. view_slide         – show/display/read a specific slide
-9. preview_ppt        – show full deck preview
-10. switch_ppt        – open or switch to a different deck
-11. download_ppt      – download the PPTX file
-12. create_ppt        – create a new presentation
-13. ppt_info          – how many ppts, list ppts, get topic of a ppt
-14. suggest_topic     – brainstorm new presentation topic ideas
-15. refine_ppt        – deck-level tone/style refresh
-16. greeting          – hi, hello, hey
-17. smalltalk         – ok, thanks, cool, got it, yes, no
-18. general_request   – anything else
+4. clear_slide        – remove everything from a slide after confirmation
+5. blank_slide        – clear a slide immediately without extra confirmation
+6. add_slide          – insert a new slide
+7. delete_slide       – remove/delete a slide
+8. move_slide         – reposition or reorder a slide
+9. swap_slides        – swap two slides
+10. view_slide        – show/display/read a specific slide
+11. preview_ppt       – show full deck preview
+12. switch_ppt       – open or switch to a different deck
+13. download_ppt      – download the PPTX file
+14. create_ppt        – create a new presentation
+15. ppt_info          – how many ppts, list ppts, get topic of a ppt
+16. suggest_topic     – brainstorm new presentation topic ideas
+17. refine_ppt        – deck-level tone/style refresh
+18. cancel            – stop/cancel/abort the current pending request
+19. greeting          – hi, hello, hey
+20. smalltalk         – ok, thanks, cool, got it, yes, no, nothing to add
+21. general_request   – anything else
 
 Key rules:
 - "improve", "fix", "shorten", "make it better", "make it professional",
   "rewrite", "polish", "condense", "simplify", "make it cleaner" → ALWAYS transform_content
 - "add X points/bullets" → add_points (NOT edit_slide)
+- "remove everything", "clear slide", "blank slide" → clear_slide or blank_slide
+- "stop", "cancel" → cancel
+- "add nothing", "nothing to add", "no change" → general_request or smalltalk
 - slide_id: extract from message if present, else null (caller supplies context)
 - ppt_id: extract "ppt N" style reference if present, else null
 - confidence: 0.95+ for clear requests, 0.7-0.9 for inferred, 0.5-0.7 for ambiguous
@@ -290,10 +306,22 @@ def classify_ppt_intent(
             result["ppt_id"] = explicit_ppt
         elif llm_ppt:
             result["ppt_id"] = llm_ppt
+        
+        # CONFIDENCE BOOST for view_slide with explicit slide number
+        if intent == "view_slide" and explicit_slide is not None:
+            result["confidence"] = 0.99
 
         return result
 
     # ── Regex fallback ────────────────────────────────────────────────────
+    # HIGHEST PRIORITY: Explicit slide requests always bypass other patterns
+    if _VIEW_SLIDE_RE.search(text):
+        result.update(intent="view_slide",   target="slide", operation="view",      confidence=0.98)
+        if _extract_slide_id(text):
+            result["slide_id"] = _extract_slide_id(text)
+            result["confidence"] = 0.99  # Explicit slide number = max confidence
+        return result
+
     if _SWITCH_PPT_RE.search(text):
         result.update(intent="switch_ppt",   target="ppt",   operation="switch",    confidence=0.96)
         return result
@@ -310,8 +338,16 @@ def classify_ppt_intent(
         result.update(intent="move_slide",   target="slide", operation="move",      confidence=0.94)
         return result
 
-    if _VIEW_SLIDE_RE.search(text):
-        result.update(intent="view_slide",   target="slide", operation="view",      confidence=0.93)
+    if _CLEAR_SLIDE_RE.search(text):
+        if re.search(r"\bmake blank slide|blank slide|empty slide\b", text, re.IGNORECASE):
+            result.update(intent="blank_slide", target="slide", operation="clear", confidence=0.96)
+        else:
+            result.update(intent="clear_slide", target="slide", operation="clear", confidence=0.96)
+        result["content"] = _extract_content(text)
+        return result
+
+    if _CANCEL_RE.search(text):
+        result.update(intent="cancel", target="meta", operation="cancel", confidence=0.99)
         return result
 
     # transform_content beats add_points

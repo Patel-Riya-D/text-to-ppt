@@ -132,6 +132,14 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         "content":    base.get("content"),
         "confidence": float(base.get("confidence", 0.35) or 0.35),
     }
+    text_raw = (user_input or "").strip()
+
+    # For add_slide, ensure content extraction handles the "[Topic] slide" pattern
+    if result["intent"] == "add_slide" and not result.get("content"):
+        topic_match = re.search(r"(?i)\b(?:add|insert|create|make|generate)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+|another\s+|one more\s+)?(.+?)\s+slide\b", text_raw)
+        if topic_match:
+            result["content"] = topic_match.group(1).strip()
+            result["confidence"] = max(result["confidence"], 0.92)
  
     def _override(intent, *, operation=None, slide_id=None,
                   ppt_id=None, content=None, confidence=0.92):
@@ -150,18 +158,30 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
     if explicit_slide is not None: result["slide_id"] = explicit_slide
  
     # ── Step 3: Hard semantic overrides (keyword patterns win) ───────────────
- 
-    # Correction messages: "no, I meant slide 3" → update slide, keep intent
+    
+    # VIEW SLIDE — HIGHEST PRIORITY (comes before TRANSFORM and ADD_POINTS)
     if re.search(
-        r"\b(?:sorry|no|nope|actually|wait|correction|instead|meant|i mean)\b",
+        r"\b(?:show|view|display|see|go\s+to|jump\s+to|navigate\s+to)\s+slide\s+#?(\d+)\b"
+        r"|\bslide\s+#?(\d+)\s+(?:show|view|display|see)\b",
         text, re.IGNORECASE,
     ):
-        if explicit_slide is not None:
-            result["slide_id"]  = explicit_slide
-            result["confidence"] = max(result["confidence"], 0.95)
-
-    # TRANSFORM — highest priority, always wins
-    _TRANSFORM_PATT = re.compile(
+        match = re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to|navigate\s+to)\s+slide\s+#?(\d+)\b|\bslide\s+#?(\d+)\s+(?:show|view|display|see)\b", text, re.IGNORECASE)
+        slide_num = None
+        if match:
+            for g in match.groups():
+                if g:
+                    slide_num = int(g)
+                    break
+        _override(
+            "view_slide",
+            operation="view",
+            slide_id=slide_num or explicit_slide,
+            content=text,
+            confidence=0.99 if slide_num else 0.95,
+        )
+ 
+    # TRANSFORM — highest priority after view_slide, always wins
+    elif re.search(
         r"\b(?:improve|enhance|refine|shorten|simplify|rewrite|reword|fix|polish|"
         r"condense|make it better|make it shorter|make it professional|"
         r"make it cleaner|make it clearer|make it concise|spice up|jazz up|"
@@ -170,8 +190,7 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         r"improve this|improve it|make this better|make it sound better|"
         r"make it engaging|make it impactful|make it punchy|make it snappy)\b",
         re.IGNORECASE,
-    )
-    if _TRANSFORM_PATT.search(text):
+    ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
         _override(
             "transform_content",
@@ -196,22 +215,9 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
             confidence=0.95,
         )
  
-    # VIEW SLIDE
-    elif re.search(
-        r"\b(?:show|view|display|see)\s+slide\s+\d+\b"
-        r"|\bslide\s+\d+\b.*\b(?:show|view|display)\b",
-        text, re.IGNORECASE,
-    ) and explicit_slide is not None:
-        _override(
-            "view_slide",
-            operation="view",
-            slide_id=explicit_slide,
-            content=text,
-            confidence=0.95,
-        )
- 
     # CONTEXT CONTINUATION — "more", "another", "add one more", "continue"
-    elif re.fullmatch(
+    # BUT: Skip if user is explicitly requesting to view/show a slide
+    elif not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE) and re.fullmatch(
         r"(?:add\s+)?(?:one\s+)?more|another|continue|carry\s+on|"
         r"add\s+one\s+more|keep\s+going|yes\s+more|one\s+more\s+point",
         lower,
@@ -228,7 +234,8 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         )
  
     # VAGUE FOLLOW-UP: "this", "it", "that" → continue last action
-    elif re.fullmatch(r"(?:this|it|that|here|go ahead|do it)", lower) \
+    # BUT: Skip if user is explicitly requesting to view/show a slide
+    elif not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE) and re.fullmatch(r"(?:this|it|that|here|go ahead|do it)", lower) \
             and last_intent and current_slide_id:
         _override(
             last_intent,
@@ -241,7 +248,7 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
     # ── Step 4: Scope resolution — fill in missing context ───────────────────
     _SLIDE_INTENTS = {
         "transform_content", "add_points", "edit_slide", "view_slide",
-        "delete_slide", "move_slide", "swap_slides",
+        "delete_slide", "move_slide", "swap_slides", "add_slide",
     }
     if (
         result["slide_id"] is None
@@ -315,6 +322,7 @@ def _polish_next_question(
     Never uses robotic phrasing like "What change would you like to make?".
     """
     slide_num = slots.get("slide_number")
+    slide_content = slots.get("slide_content")
     ppt_id    = st.session_state.get("current_ppt_id") or slots.get("ppt_ref")
     ppt_label = _ppt_display_label(str(ppt_id)) if ppt_id else "the presentation"
  
@@ -338,7 +346,14 @@ def _polish_next_question(
         if "change_content" in missing:
             return (f"What should I change in {_slide_title_or_ref(slide_num)}? "
                     f"(e.g. rewrite a bullet, update the title, add a point)")
- 
+
+    if intent in {"clear_slide", "blank_slide"}:
+        if "slide_number" in missing or slide_num is None:
+            return f"Which slide should I clear in {ppt_label}?"
+        if intent == "clear_slide":
+            return f"This will remove everything from slide {slide_num}. Do you want me to continue?"
+        return f"Should I make slide {slide_num} blank in {ppt_label}?"
+
     if intent == "transform_content":
         if "slide_number" in missing or slide_num is None:
             return f"Which slide should I improve in {ppt_label}?"
@@ -347,10 +362,19 @@ def _polish_next_question(
  
     if intent == "add_points":
         if "slide_number" in missing or slide_num is None:
+            count = None
+            try:
+                m = re.search(r"\b(\d+)\s*(?:more\s+)?(?:point|bullet)", user_input or "", re.IGNORECASE)
+                if m:
+                    count = int(m.group(1))
+            except Exception:
+                count = None
+            if count and count > 5:
+                return f"I can add up to 5 points total at a time. Which slide should I add them to in {ppt_label}?"
             return f"Which slide should I add points to in {ppt_label}?"
  
     if intent == "add_slide":
-        if "slide_content" in missing:
+        if "slide_content" in missing or slide_content is None:
             return f"What topic should the new slide cover?"
         if "position" in missing:
             return ("Where should I place the new slide? "
