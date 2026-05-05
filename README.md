@@ -34,6 +34,8 @@ The project has two parts:
 │   ├── main.py
 │   └── services
 │       └── ppt_service.py
+        └── intelligence_layer.py
+        └── intent_classifier.py
 ├── requirements.txt
 └── README.md
 ```

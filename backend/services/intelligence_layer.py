@@ -125,21 +125,48 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
     )
  
     result = {
-        "intent":     base.get("intent", "general_request"),
+        "intent":     base.get("intent", "unknown"),
         "slide_id":   base.get("slide_id"),
+        "slide_ids":  base.get("slide_ids", []),
         "ppt_id":     base.get("ppt_id"),
         "operation":  base.get("operation"),
         "content":    base.get("content"),
+        "action_type": base.get("action_type"),
+        "target":     base.get("target"),
+        "sub_intent": base.get("sub_intent"),
+        "missing_entities": base.get("missing_entities", []),
+        "clarification_question": base.get("clarification_question"),
+        "position":   base.get("position"),
+        "anchor_slide": base.get("anchor_slide"),
         "confidence": float(base.get("confidence", 0.35) or 0.35),
     }
     text_raw = (user_input or "").strip()
 
     # For add_slide, ensure content extraction handles the "[Topic] slide" pattern
-    if result["intent"] == "add_slide" and not result.get("content"):
+    if result["intent"] == "add_slide":
         topic_match = re.search(r"(?i)\b(?:add|insert|create|make|generate)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+|another\s+|one more\s+)?(.+?)\s+slide\b", text_raw)
         if topic_match:
             result["content"] = topic_match.group(1).strip()
             result["confidence"] = max(result["confidence"], 0.92)
+
+    if result["intent"] == "add_slide":
+        placement_match = re.search(
+            r"(?i)\b(after|before)\s+slide\s+#?(\d+)\b"
+            r"|\bat\s+the\s+(start|beginning|end)\b"
+            r"|\b(to|at)\s+position\s+(\d+)\b",
+            text_raw,
+        )
+        if placement_match:
+            if placement_match.group(1) and placement_match.group(2):
+                result["position"] = placement_match.group(1).lower()
+                result["anchor_slide"] = int(placement_match.group(2))
+            elif placement_match.group(3):
+                pos = placement_match.group(3).lower()
+                result["position"] = "start" if pos in {"start", "beginning"} else "end"
+            elif placement_match.group(5):
+                result["position"] = "position"
+                result["anchor_slide"] = int(placement_match.group(5))
+            result["confidence"] = max(result["confidence"], 0.95)
  
     def _override(intent, *, operation=None, slide_id=None,
                   ppt_id=None, content=None, confidence=0.92):
@@ -154,8 +181,16 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
     explicit_slide = _extract_explicit_slide_number_from_text(text)
     explicit_ppt   = _extract_explicit_ppt_ref_from_text(text)
  
-    if explicit_ppt   is not None: result["ppt_id"]   = explicit_ppt
-    if explicit_slide is not None: result["slide_id"] = explicit_slide
+    if explicit_ppt is not None:
+        result["ppt_id"] = explicit_ppt
+    add_slide_anchor_ref = (
+        result.get("intent") == "add_slide"
+        and re.search(r"\b(?:after|before)\s+slide\s*#?\d+\b", text, re.IGNORECASE)
+    )
+    if explicit_slide is not None and not add_slide_anchor_ref:
+        result["slide_id"] = explicit_slide
+    if result.get("intent") == "add_slide":
+        result["slide_id"] = None
  
     # ── Step 3: Hard semantic overrides (keyword patterns win) ───────────────
     
@@ -189,6 +224,7 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         r"make more clear|make it flow|clean up|clean it up|fix this|fix it|"
         r"improve this|improve it|make this better|make it sound better|"
         r"make it engaging|make it impactful|make it punchy|make it snappy)\b",
+        text,
         re.IGNORECASE,
     ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
@@ -203,7 +239,9 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
     # ADD POINTS — second priority
     elif re.search(
         r"\b(?:add|append|insert)\b.*\b(?:point|points|bullet|bullets)\b"
-        r"|\bmore points?\b|\badd one more\b|\badd another point\b",
+        r"|\bmore points?\b|\badd one more\b|\badd another point\b"
+        r"|\b(?:make|expand|elaborate)\b.*\bslide\s*#?\d+\b.*\b(?:longer|more detailed|more detail|detailed|expanded)\b"
+        r"|\bslide\s*#?\d+\b.*\b(?:longer|more detailed|more detail|detailed|expanded)\b",
         text, re.IGNORECASE,
     ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
@@ -247,8 +285,9 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
  
     # ── Step 4: Scope resolution — fill in missing context ───────────────────
     _SLIDE_INTENTS = {
-        "transform_content", "add_points", "edit_slide", "view_slide",
-        "delete_slide", "move_slide", "swap_slides", "add_slide",
+        "transform_content", "add_points", "update_slide", "edit_slide",
+        "view_slide", "explain_slide", "delete_slide", "merge_slides",
+        "move_slide", "swap_slides",
     }
     if (
         result["slide_id"] is None
@@ -287,10 +326,16 @@ def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
     if intent == "transform_content" and slide_id is not None:
         instruction = content or text
         return f"improve slide {slide_id}: {instruction}"
+
+    if intent == "update_slide" and slide_id is not None:
+        return f"edit slide {slide_id}: {content or text}"
  
     if intent == "view_slide" and slide_id is not None:
         return (f"show slide {slide_id} of {ppt_id}" if ppt_id
                 else f"show slide {slide_id}")
+
+    if intent == "explain_slide" and slide_id is not None:
+        return f"explain slide {slide_id}"
  
     if intent == "add_points" and slide_id is not None:
         m = re.search(r"\b(\d+)\s*(?:more\s+)?(?:point|bullet)", text, re.IGNORECASE)
@@ -302,6 +347,11 @@ def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
  
     if intent == "delete_slide" and slide_id is not None:
         return f"delete slide {slide_id}"
+
+    if intent == "merge_slides":
+        slide_ids = (reasoned or {}).get("slide_ids") or []
+        if len(slide_ids) >= 2:
+            return f"merge slide {slide_ids[0]} and {slide_ids[1]}"
  
     return text
  
@@ -372,6 +422,19 @@ def _polish_next_question(
             if count and count > 5:
                 return f"I can add up to 5 points total at a time. Which slide should I add them to in {ppt_label}?"
             return f"Which slide should I add points to in {ppt_label}?"
+
+    if intent == "update_slide":
+        if "slide_number" in missing or slide_num is None:
+            return f"Which slide should I update in {ppt_label}?"
+        if "change_content" in missing:
+            return f"What should I change in {_slide_title_or_ref(slide_num)}?"
+
+    if intent == "explain_slide":
+        if "slide_number" in missing or slide_num is None:
+            return f"Which slide should I explain in {ppt_label}?"
+
+    if intent == "unknown":
+        return next_question or "What would you like me to do with the presentation?"
  
     if intent == "add_slide":
         if "slide_content" in missing or slide_content is None:
@@ -399,6 +462,9 @@ def _polish_next_question(
     if intent == "delete_slide":
         if "slide_number" in missing or slots.get("slide_number") is None:
             return f"Which slide should I delete from {ppt_label}?"
+
+    if intent == "merge_slides":
+        return "Which two slides should I merge?"
  
     if intent == "view_slide":
         if "slide_number" in missing or slots.get("slide_number") is None:
@@ -427,6 +493,30 @@ def _should_execute_directly(reasoned: dict) -> bool:
     confidence >= 0.60 → execute (may add a brief scope note)
     confidence  < 0.60 → ask for clarification first
     """
+    reasoned = reasoned or {}
+    intent = _safe_str(reasoned.get("intent", ""))
+    slide_id = reasoned.get("slide_id")
+    content = _safe_str(reasoned.get("content", ""))
+
+    if intent == "edit_slide":
+        return bool(slide_id and content) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+
+    if intent == "update_slide":
+        return bool(slide_id and content) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+
+    if intent == "add_slide":
+        has_placement = bool(reasoned.get("position") or reasoned.get("anchor_slide"))
+        return bool(content and has_placement) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+
+    if intent in {"delete_slide", "move_slide", "swap_slides", "view_slide", "explain_slide"} and not slide_id:
+        return False
+
+    if intent == "merge_slides" and len(reasoned.get("slide_ids") or []) < 2:
+        return False
+
+    if intent == "unknown":
+        return False
+
     conf = float((reasoned or {}).get("confidence", 0.0) or 0.0)
     return conf >= 0.60
  
@@ -441,7 +531,7 @@ def _confidence_preface(reasoned: dict) -> Optional[str]:
         return None
     intent   = (reasoned or {}).get("intent", "")
     slide_id = (reasoned or {}).get("slide_id")
-    if intent in {"transform_content", "add_points", "edit_slide"} and slide_id:
+    if intent in {"transform_content", "add_points", "update_slide", "edit_slide"} and slide_id:
         return f"*(Working on slide {slide_id} — let me know if that's not right.)*"
     return None
  
