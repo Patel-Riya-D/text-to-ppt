@@ -196,13 +196,13 @@ _ICON_TOKENS = {
 
 # Pre-compiled: matches **any-icon-token** with optional surrounding spaces
 _RE_BOLD_ICON = re.compile(
-    r'\*\*\s*(' + '|'.join(re.escape(t) for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')\s*\*\*',
+    r'\*\*\s*(?:' + '|'.join(r'(?<!\w)' + re.escape(t) + r'(?!\w)' for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')\s*\*\*',
     re.IGNORECASE
 )
 
 # Matches a bare icon token at the VERY START of a string
 _RE_LEADING_ICON = re.compile(
-    r'^\s*(' + '|'.join(re.escape(t) for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')[\s:\-\.]*',
+    r'^\s*(?:' + '|'.join(r'(?<!\w)' + re.escape(t) + r'(?!\w)' for t in sorted(_ICON_TOKENS, key=len, reverse=True)) + r')[\s:\-\.]*',
     re.IGNORECASE
 )
 
@@ -1715,6 +1715,102 @@ def normalize_outline_payload(payload: dict, topic: str = "", tone: str = "Profe
 
     data["slides"] = repaired
     return data
+
+
+def merge_slides(primary_slide: dict, secondary_slide: dict, *, topic: str = "Presentation") -> dict:
+    """
+    Merge two slide payloads into one slide while preserving the primary slide identity.
+
+    Rules:
+    - Keep primary title and layout whenever possible.
+    - Merge subtitle/content from both slides.
+    - Preserve structured layout fields for two_column/timeline/icon_grid where possible.
+    - Deduplicate text fragments and normalize the final payload.
+    """
+    if not isinstance(primary_slide, dict):
+        primary_slide = {}
+    if not isinstance(secondary_slide, dict):
+        secondary_slide = {}
+
+    merged = copy.deepcopy(primary_slide)
+    primary_layout = _canon(primary_slide.get("layout", "bullets"))
+    secondary_layout = _canon(secondary_slide.get("layout", "bullets"))
+
+    # Keep primary title; append secondary subtitle context when available.
+    primary_sub = _safe_str(primary_slide.get("subtitle", ""))
+    secondary_title = _safe_str(secondary_slide.get("title", ""))
+    secondary_sub = _safe_str(secondary_slide.get("subtitle", ""))
+    subtitle_bits = _dedupe_keep_order([primary_sub, secondary_sub, secondary_title])
+    merged["subtitle"] = " | ".join(subtitle_bits[:2]) if subtitle_bits else ""
+
+    primary_points = _validate_and_clean_content(_flatten_to_strings(primary_slide.get("content", [])))
+    secondary_points = _validate_and_clean_content(_flatten_to_strings(secondary_slide.get("content", [])))
+    all_points = _dedupe_keep_order(primary_points + secondary_points)
+
+    if primary_layout == "two_column":
+        left = _validate_and_clean_content(_flatten_to_strings(primary_slide.get("left_points", [])))
+        right = _validate_and_clean_content(_flatten_to_strings(primary_slide.get("right_points", [])))
+        if not left and not right:
+            midpoint = max(1, len(primary_points) // 2)
+            left, right = primary_points[:midpoint], primary_points[midpoint:]
+        for idx, point in enumerate(secondary_points):
+            if len(left) <= len(right):
+                left.append(point)
+            else:
+                right.append(point)
+        left = _dedupe_keep_order(left)
+        right = _dedupe_keep_order(right)
+        merged["left_points"] = left
+        merged["right_points"] = right
+        merged["left"] = copy.deepcopy(left)
+        merged["right"] = copy.deepcopy(right)
+        merged["content"] = _dedupe_keep_order(left + right)
+        merged.setdefault("left_title", _safe_str(primary_slide.get("left_title", "")) or "Key Points")
+        merged.setdefault("right_title", _safe_str(primary_slide.get("right_title", "")) or "Supporting Points")
+    elif primary_layout == "timeline" and secondary_layout == "timeline":
+        p_steps = [s for s in (primary_slide.get("steps") or []) if isinstance(s, dict)]
+        s_steps = [s for s in (secondary_slide.get("steps") or []) if isinstance(s, dict)]
+        seen = set()
+        steps = []
+        for step in p_steps + s_steps:
+            label = _clean_bullet_text(_safe_str(step.get("label", "")))
+            detail = _clean_bullet_text(_safe_str(step.get("detail", "")))
+            key = f"{label.casefold()}::{detail.casefold()}"
+            if not label or key in seen:
+                continue
+            seen.add(key)
+            steps.append({"label": label, "detail": detail})
+        merged["steps"] = steps[:6]
+        merged["content"] = _dedupe_keep_order(
+            [f"{s.get('label', '')}: {s.get('detail', '')}".strip(": ").strip() for s in merged["steps"]]
+        )
+    elif primary_layout == "icon_grid" and secondary_layout == "icon_grid":
+        p_items = _normalize_icon_grid_items(primary_slide)
+        s_items = _normalize_icon_grid_items(secondary_slide)
+        seen = set()
+        grid_items = []
+        for item in p_items + s_items:
+            title = _clean_bullet_text(_safe_str(item.get("title", "")))
+            detail = _clean_bullet_text(_safe_str(item.get("detail", "")))
+            key = f"{title.casefold()}::{detail.casefold()}"
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            grid_items.append({
+                "icon": _safe_str(item.get("icon", "")) or _seq_icon(len(grid_items)),
+                "title": title,
+                "detail": detail,
+            })
+        merged["grid_items"] = grid_items[:6]
+        merged["content"] = _dedupe_keep_order(
+            [f"{i['title']}: {i['detail']}".rstrip(": ").strip() for i in merged["grid_items"]]
+        )
+    else:
+        merged["content"] = all_points
+
+    merged["_user_modified"] = True
+    merged = _normalize_slide(merged, idx=1, topic=topic or "Presentation")
+    return merged
 
 
 # ═══════════════════════════════════════════════════════════════════════════

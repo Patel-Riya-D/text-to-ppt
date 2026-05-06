@@ -1,45 +1,39 @@
 """
-intelligence_layer.py
-=====================
- 
-Drop-in replacements and additions for the intelligence section of app.py.
- 
-WHAT CHANGED (nothing else in app.py is touched):
-  • reasoning_layer()                — LLM-first, context-aware, priority-correct
-  • _canonicalize_reasoned_prompt()  — cleaner internal routing instructions
-  • _polish_next_question()          — natural, slide-title-aware follow-ups
-  • _should_execute_directly()       — NEW: confidence gate (replaces hardcoded flow)
-  • _confidence_preface()            — NEW: subtle scope-inference notice
-  • _natural_success_message()       — NEW: human-sounding confirmations
- 
-HOW TO INTEGRATE
-----------------
-1. Copy intent_classifier_final.py  →  backend/services/intent_classifier.py
-2. In app.py, replace the four existing functions with the versions below.
-3. Add _should_execute_directly, _confidence_preface, _natural_success_message
-   anywhere before the "ACTION EXECUTORS" section.
-4. In the main chat loop, update the three blocks that call reasoning_layer()
-   to also call _should_execute_directly() and _natural_success_message().
-   See the INTEGRATION GUIDE at the bottom of this file.
- 
-No FastAPI routes, file-upload logic, ppt_service, or UI structure is changed.
+intelligence_layer.py  (v3 — strict routing, no add_slide fallback)
+====================================================================
+
+Drop-in replacement for the intelligence layer in app.py.
+
+KEY CHANGES vs v2:
+  - reasoning_layer() applies hard semantic guards BEFORE touching intents
+  - _should_execute_directly() has tighter per-intent rules
+  - _confidence_preface() only fires when scope was inferred (not explicit)
+  - _natural_success_message() unchanged API
+  - New helper _safe_intent() prevents routing surprises
+  - CRITICAL: unknown / ambiguous intent → ask clarification, NOT add_slide
 """
- 
+
+from __future__ import annotations
+
 import re
 from typing import Optional
 
 import streamlit as st
 
 from backend.services.intent_classifier import classify_ppt_intent
- 
-def _norm_text(v):
-    """Normalize text for fuzzy matching."""
+from backend.services.response_generator import generate_response
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_text(v: object) -> str:
     s = str(v or "").casefold()
-    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-    return s
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
-def _safe_str(v, default=""):
+def _safe_str(v: object, default: str = "") -> str:
     return str(v).strip() if v is not None else default
 
 
@@ -52,180 +46,202 @@ def _ppt_display_label(ppt_id: str) -> str:
     if not ppt_id:
         return "ppt"
     m = re.search(r"ppt_(\d+)", str(ppt_id), re.IGNORECASE)
-    if m:
-        return f"ppt {m.group(1)}"
-    return str(ppt_id).replace("_", " ")
+    return f"ppt {m.group(1)}" if m else str(ppt_id).replace("_", " ")
 
 
-def _extract_explicit_slide_number_from_text(user_input: str) -> Optional[int]:
-    text = user_input or ""
-    if not text:
-        return None
-    patterns = [
+def _extract_explicit_slide_number(user_input: str) -> Optional[int]:
+    for pat in (
         r"\bslide[_\s-]*#?(\d+)\b",
         r"\b(\d+)(?:st|nd|rd|th)?\s+slide\b",
-        r"\bslide\s+(\d+)\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
+    ):
+        m = re.search(pat, user_input or "", re.IGNORECASE)
         if m:
             try:
                 return int(m.group(1))
             except ValueError:
-                return None
+                pass
     return None
 
 
-def _extract_explicit_ppt_ref_from_text(user_input: str) -> Optional[str]:
-    text = user_input or ""
-    if not text:
-        return None
-    patterns = [
+def _extract_explicit_ppt_ref(user_input: str) -> Optional[str]:
+    for pat in (
         r"\b(?:ppt|presentation|deck)[_\s-]*#?(\d+)\b",
         r"\b(\d+)(?:st|nd|rd|th)?\s*(?:ppt|presentation|deck)\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
+    ):
+        m = re.search(pat, user_input or "", re.IGNORECASE)
         if m:
             return f"ppt {m.group(1)}"
     return None
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════
+
+
+# Intents that operate on an existing slide
+_SLIDE_INTENTS = {
+    "transform_content", "add_points", "update_slide", "edit_slide",
+    "view_slide", "explain_slide", "delete_slide", "merge_slides",
+    "move_slide", "swap_slides", "clear_slide", "blank_slide",
+}
+
+# Intents that MUST NOT be silently redirected to add_slide
+_NEVER_ADD_SLIDE = _SLIDE_INTENTS | {
+    "preview_ppt", "switch_ppt", "download_ppt", "ppt_info",
+    "suggest_topic", "refine_ppt", "create_ppt",
+    "cancel", "greeting", "smalltalk", "unknown",
+}
+
+
+def _safe_intent(intent: str, fallback: str = "unknown") -> str:
+    """Return intent unchanged, but guarantee we never smuggle in add_slide."""
+    if not intent or intent not in {
+        "transform_content", "add_points", "update_slide", "edit_slide",
+        "view_slide", "explain_slide", "delete_slide", "merge_slides",
+        "move_slide", "swap_slides", "clear_slide", "blank_slide",
+        "add_slide", "preview_ppt", "switch_ppt", "download_ppt",
+        "create_ppt", "ppt_info", "suggest_topic", "refine_ppt",
+        "cancel", "greeting", "smalltalk", "unknown",
+    }:
+        return fallback
+    return intent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  1. REASONING LAYER
-# ═══════════════════════════════════════════════════════════════════════════
- 
+# ─────────────────────────────────────────────────────────────────────────────
+
 def reasoning_layer(user_input: str, state: dict) -> dict:
     """
     Unified conversational reasoning layer.
- 
-    - Uses the LLM-backed classify_ppt_intent() for semantic understanding.
-    - Applies hard overrides for high-confidence patterns (transform, add-points …).
-    - Resolves scope from conversation context when the user omits slide/ppt refs.
-    - Returns a clean dict used by the downstream router.
- 
-    Intent priority (hardcoded):
-      transform_content > add_points > edit_slide > add_slide > …
+
+    Priority of overrides (highest wins):
+      cancel > clear/blank > view_slide (explicit number) >
+      transform_content > add_points/expand > add_slide (explicit) >
+      context-continuation > LLM result
     """
-    state = state if isinstance(state, dict) else {}
-    text  = (user_input or "").strip()
-    lower = _norm_text(text)
- 
-    # Pull conversation context
+    state  = state if isinstance(state, dict) else {}
+    text   = (user_input or "").strip()
+    lower  = _norm_text(text)
+
     current_ppt_id   = state.get("current_ppt_id")
     current_slide_id = state.get("current_slide_id")
-    last_intent      = _safe_str(state.get("last_intent", ""))
-    last_action      = _safe_str(state.get("last_action", ""))
- 
-    # ── Step 1: Semantic classification (LLM-first, regex-fallback) ─────────
-    base = classify_ppt_intent(
-        text,
-        ppt_id=current_ppt_id,
-        slide_id=current_slide_id,
-    )
- 
-    result = {
-        "intent":     base.get("intent", "unknown"),
-        "slide_id":   base.get("slide_id"),
-        "slide_ids":  base.get("slide_ids", []),
-        "ppt_id":     base.get("ppt_id"),
-        "operation":  base.get("operation"),
-        "content":    base.get("content"),
-        "action_type": base.get("action_type"),
-        "target":     base.get("target"),
-        "sub_intent": base.get("sub_intent"),
-        "missing_entities": base.get("missing_entities", []),
+    last_intent      = _safe_str(state.get("last_intent"))
+    last_action      = _safe_str(state.get("last_action"))
+
+    # ── Step 1: LLM-first classification ────────────────────────────────────
+    base = classify_ppt_intent(text, ppt_id=current_ppt_id, slide_id=current_slide_id)
+
+    result: dict = {
+        "intent":                 _safe_intent(base.get("intent", "unknown")),
+        "slide_id":               base.get("slide_id"),
+        "slide_ids":              base.get("slide_ids", []),
+        "ppt_id":                 base.get("ppt_id"),
+        "operation":              base.get("operation"),
+        "content":                base.get("content"),
+        "action_type":            base.get("action_type"),
+        "target":                 base.get("target"),
+        "sub_intent":             base.get("sub_intent"),
+        "missing_entities":       base.get("missing_entities", []),
         "clarification_question": base.get("clarification_question"),
-        "position":   base.get("position"),
-        "anchor_slide": base.get("anchor_slide"),
-        "confidence": float(base.get("confidence", 0.35) or 0.35),
+        "position":               base.get("position"),
+        "anchor_slide":           base.get("anchor_slide"),
+        "confidence":             float(base.get("confidence", 0.30) or 0.30),
     }
-    text_raw = (user_input or "").strip()
 
-    # For add_slide, ensure content extraction handles the "[Topic] slide" pattern
-    if result["intent"] == "add_slide":
-        topic_match = re.search(r"(?i)\b(?:add|insert|create|make|generate)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+|another\s+|one more\s+)?(.+?)\s+slide\b", text_raw)
-        if topic_match:
-            result["content"] = topic_match.group(1).strip()
-            result["confidence"] = max(result["confidence"], 0.92)
-
-    if result["intent"] == "add_slide":
-        placement_match = re.search(
-            r"(?i)\b(after|before)\s+slide\s+#?(\d+)\b"
-            r"|\bat\s+the\s+(start|beginning|end)\b"
-            r"|\b(to|at)\s+position\s+(\d+)\b",
-            text_raw,
-        )
-        if placement_match:
-            if placement_match.group(1) and placement_match.group(2):
-                result["position"] = placement_match.group(1).lower()
-                result["anchor_slide"] = int(placement_match.group(2))
-            elif placement_match.group(3):
-                pos = placement_match.group(3).lower()
-                result["position"] = "start" if pos in {"start", "beginning"} else "end"
-            elif placement_match.group(5):
-                result["position"] = "position"
-                result["anchor_slide"] = int(placement_match.group(5))
-            result["confidence"] = max(result["confidence"], 0.95)
- 
-    def _override(intent, *, operation=None, slide_id=None,
-                  ppt_id=None, content=None, confidence=0.92):
-        result["intent"]    = intent
-        result["operation"] = operation or intent
+    # Helper: override result cleanly
+    def _override(
+        intent: str,
+        *,
+        operation: Optional[str] = None,
+        slide_id: Optional[int] = None,
+        ppt_id: Optional[str] = None,
+        content: Optional[str] = None,
+        confidence: float = 0.95,
+        sub_intent: Optional[str] = None,
+    ) -> None:
+        result["intent"]     = _safe_intent(intent)
+        result["operation"]  = operation or intent
+        result["confidence"] = confidence
         if slide_id  is not None: result["slide_id"]  = slide_id
         if ppt_id    is not None: result["ppt_id"]    = ppt_id
         if content   is not None: result["content"]   = content
-        result["confidence"] = confidence
+        if sub_intent is not None: result["sub_intent"] = sub_intent
 
-    # ── Step 2: Extract explicit references from the raw message ─────────────
-    explicit_slide = _extract_explicit_slide_number_from_text(text)
-    explicit_ppt   = _extract_explicit_ppt_ref_from_text(text)
- 
-    if explicit_ppt is not None:
+    # ── Step 2: Extract explicit references ──────────────────────────────────
+    explicit_slide = _extract_explicit_slide_number(text)
+    explicit_ppt   = _extract_explicit_ppt_ref(text)
+
+    if explicit_ppt:
         result["ppt_id"] = explicit_ppt
-    add_slide_anchor_ref = (
-        result.get("intent") == "add_slide"
+
+    # For add_slide, an anchor slide ref is NOT the target slide
+    add_slide_anchor = (
+        result["intent"] == "add_slide"
         and re.search(r"\b(?:after|before)\s+slide\s*#?\d+\b", text, re.IGNORECASE)
     )
-    if explicit_slide is not None and not add_slide_anchor_ref:
+    if explicit_slide is not None and not add_slide_anchor:
         result["slide_id"] = explicit_slide
-    if result.get("intent") == "add_slide":
+
+    if result["intent"] == "add_slide":
         result["slide_id"] = None
- 
-    # ── Step 3: Hard semantic overrides (keyword patterns win) ───────────────
-    
-    # VIEW SLIDE — HIGHEST PRIORITY (comes before TRANSFORM and ADD_POINTS)
+
+    # ── Step 3: Hard semantic overrides ─────────────────────────────────────
+
+    # CANCEL — absolute priority
+    if re.fullmatch(r"(?:stop|cancel|nevermind|never\s*mind|abort|quit)", lower):
+        _override("cancel", operation="cancel", confidence=0.99)
+        return result
+
+    # CLEAR / BLANK
+    if re.search(r"\b(?:remove everything|clear slide|clear all|erase all|wipe slide|delete all content|remove all content)\b", text, re.IGNORECASE):
+        target = explicit_slide if explicit_slide is not None else current_slide_id
+        _override("clear_slide", operation="clear", slide_id=target, confidence=0.97)
+        return result
+
+    if re.search(r"\b(?:make blank slide|blank slide|empty slide)\b", text, re.IGNORECASE):
+        target = explicit_slide if explicit_slide is not None else current_slide_id
+        _override("blank_slide", operation="clear", slide_id=target, confidence=0.97)
+        return result
+
+    # VIEW SLIDE — explicit number present (highest priority before transforms)
+    view_match = re.search(
+        r"\b(?:show|view|display|see|go\s+to|jump\s+to|navigate\s+to)\s+slide\s*#?(\d+)\b"
+        r"|\bslide\s*#?(\d+)\s+(?:show|view|display|see)\b",
+        text, re.IGNORECASE,
+    )
+    if view_match:
+        num_str = next((g for g in view_match.groups() if g), None)
+        slide_num = int(num_str) if num_str else explicit_slide
+        _override("view_slide", operation="view", slide_id=slide_num, confidence=0.99)
+        return result
+
+    # EXPLAIN SLIDE
     if re.search(
-        r"\b(?:show|view|display|see|go\s+to|jump\s+to|navigate\s+to)\s+slide\s+#?(\d+)\b"
-        r"|\bslide\s+#?(\d+)\s+(?:show|view|display|see)\b",
+        r"\b(?:explain|describe|summarize|summary\s+of|walk\s+me\s+through)\b.*\bslide\s*#?\d+\b"
+        r"|\bslide\s*#?\d+\b.*\b(?:explain|describe|summarize|about)\b",
         text, re.IGNORECASE,
     ):
-        match = re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to|navigate\s+to)\s+slide\s+#?(\d+)\b|\bslide\s+#?(\d+)\s+(?:show|view|display|see)\b", text, re.IGNORECASE)
-        slide_num = None
-        if match:
-            for g in match.groups():
-                if g:
-                    slide_num = int(g)
-                    break
-        _override(
-            "view_slide",
-            operation="view",
-            slide_id=slide_num or explicit_slide,
-            content=text,
-            confidence=0.99 if slide_num else 0.95,
-        )
- 
-    # TRANSFORM — highest priority after view_slide, always wins
-    elif re.search(
-        r"\b(?:improve|enhance|refine|shorten|simplify|rewrite|reword|fix|polish|"
-        r"condense|make it better|make it shorter|make it professional|"
-        r"make it cleaner|make it clearer|make it concise|spice up|jazz up|"
-        r"tighten|upgrade|rephrase|make more professional|make more concise|"
-        r"make more clear|make it flow|clean up|clean it up|fix this|fix it|"
-        r"improve this|improve it|make this better|make it sound better|"
-        r"make it engaging|make it impactful|make it punchy|make it snappy)\b",
-        text,
-        re.IGNORECASE,
+        target = explicit_slide if explicit_slide is not None else current_slide_id
+        _override("explain_slide", operation="explain", slide_id=target, confidence=0.97)
+        return result
+
+    # DELETE SLIDE
+    if re.search(r"\b(?:delete|remove)\s+slide\s*#?\d+\b|\bslide\s*#?\d+\b.*\b(?:delete|remove)\b", text, re.IGNORECASE):
+        target = explicit_slide if explicit_slide is not None else current_slide_id
+        _override("delete_slide", operation="delete", slide_id=target, confidence=0.97)
+        return result
+
+    # MERGE SLIDES
+    if re.search(r"\b(?:merge|combine|join|consolidate)\s+slide", text, re.IGNORECASE):
+        _override("merge_slides", operation="merge", confidence=0.96)
+        return result
+
+    # TRANSFORM — high priority
+    if re.search(
+        r"\b(?:improve|enhance|refine|shorten|simplify|rewrite|reword|fix|polish|condense|"
+        r"make\s+it\s+better|make\s+it\s+shorter|make\s+it\s+professional|make\s+it\s+cleaner|"
+        r"make\s+it\s+clearer|make\s+it\s+concise|spice\s+up|jazz\s+up|tighten|upgrade|rephrase|"
+        r"make\s+more\s+professional|make\s+more\s+concise|clean\s+up|fix\s+this|fix\s+it|"
+        r"improve\s+this|improve\s+it|make\s+this\s+better|make\s+it\s+sound\s+better|"
+        r"make\s+it\s+engaging|make\s+it\s+impactful|make\s+it\s+punchy|make\s+it\s+snappy)\b",
+        text, re.IGNORECASE,
     ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
         _override(
@@ -235,13 +251,14 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
             content=text,
             confidence=0.97,
         )
- 
-    # ADD POINTS — second priority
-    elif re.search(
+        return result
+
+    # ADD POINTS / EXPAND
+    if re.search(
         r"\b(?:add|append|insert)\b.*\b(?:point|points|bullet|bullets)\b"
-        r"|\bmore points?\b|\badd one more\b|\badd another point\b"
-        r"|\b(?:make|expand|elaborate)\b.*\bslide\s*#?\d+\b.*\b(?:longer|more detailed|more detail|detailed|expanded)\b"
-        r"|\bslide\s*#?\d+\b.*\b(?:longer|more detailed|more detail|detailed|expanded)\b",
+        r"|\bmore\s+points?\b|\badd\s+one\s+more\b|\badd\s+another\s+point\b"
+        r"|\b(?:make|expand|elaborate)\b.*\bslide\s*#?\d+\b.*\b(?:longer|more\s+detailed|more\s+detail)\b"
+        r"|\bslide\s*#?\d+\b.*\b(?:longer|more\s+detailed|more\s+detail|expand)\b",
         text, re.IGNORECASE,
     ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
@@ -250,18 +267,22 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
             operation="append",
             slide_id=target,
             content=text,
-            confidence=0.95,
+            sub_intent="add_point",
+            confidence=0.96,
         )
- 
-    # CONTEXT CONTINUATION — "more", "another", "add one more", "continue"
-    # BUT: Skip if user is explicitly requesting to view/show a slide
-    elif not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE) and re.fullmatch(
+        return result
+
+    # CONTEXT CONTINUATION ("more", "another", "continue" …)
+    continuation_re = re.fullmatch(
         r"(?:add\s+)?(?:one\s+)?more|another|continue|carry\s+on|"
         r"add\s+one\s+more|keep\s+going|yes\s+more|one\s+more\s+point",
         lower,
-    ) and last_intent in {
-        "add_points", "edit_slide", "transform_content", "add_slide",
-    }:
+    )
+    if (
+        continuation_re
+        and last_intent in {"add_points", "edit_slide", "transform_content", "add_slide"}
+        and not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE)
+    ):
         target = explicit_slide if explicit_slide is not None else current_slide_id
         _override(
             last_intent,
@@ -270,11 +291,15 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
             content=last_action or text,
             confidence=0.88,
         )
- 
-    # VAGUE FOLLOW-UP: "this", "it", "that" → continue last action
-    # BUT: Skip if user is explicitly requesting to view/show a slide
-    elif not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE) and re.fullmatch(r"(?:this|it|that|here|go ahead|do it)", lower) \
-            and last_intent and current_slide_id:
+        return result
+
+    # VAGUE FOLLOW-UP ("this", "it", "that")
+    if (
+        re.fullmatch(r"(?:this|it|that|here|go\s+ahead|do\s+it)", lower)
+        and last_intent
+        and current_slide_id
+        and not re.search(r"\b(?:show|view|display|see|go\s+to|jump\s+to)\s+slide\b", text, re.IGNORECASE)
+    ):
         _override(
             last_intent,
             operation="append" if last_intent == "add_points" else "modify",
@@ -282,84 +307,75 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
             content=last_action or text,
             confidence=0.82,
         )
- 
-    # ── Step 4: Scope resolution — fill in missing context ───────────────────
-    _SLIDE_INTENTS = {
-        "transform_content", "add_points", "update_slide", "edit_slide",
-        "view_slide", "explain_slide", "delete_slide", "merge_slides",
-        "move_slide", "swap_slides",
-    }
-    if (
-        result["slide_id"] is None
-        and current_slide_id
-        and result["intent"] in _SLIDE_INTENTS
-    ):
+        return result
+
+    # ── Step 4: Scope resolution — fill missing context ──────────────────────
+    if result["slide_id"] is None and current_slide_id and result["intent"] in _SLIDE_INTENTS:
         result["slide_id"]  = current_slide_id
-        # Slightly lower confidence: we inferred the target slide
         result["confidence"] = max(0.60, result["confidence"] - 0.10)
- 
+
     if result["ppt_id"] is None and current_ppt_id:
         result["ppt_id"] = current_ppt_id
- 
-    # ── Step 5: Confidence floor for fully-resolved slide intents ─────────────
+
+    # ── Step 5: Confidence floor for resolved slide intents ──────────────────
     if result["intent"] in _SLIDE_INTENTS and result["slide_id"] is not None:
         result["confidence"] = max(result["confidence"], 0.72)
- 
-    return result
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════
-#  2. CANONICALIZE REASONED PROMPT
-# ═══════════════════════════════════════════════════════════════════════════
- 
-def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
-    """
-    Build a clean, structured internal instruction from the reasoned intent.
-    The result is passed to the downstream slot-filler / executor.
-    """
-    text     = (user_input or "").strip()
-    intent   = _safe_str((reasoned or {}).get("intent", ""))
-    slide_id = (reasoned or {}).get("slide_id")
-    ppt_id   = _safe_str((reasoned or {}).get("ppt_id", ""))
-    content  = _safe_str((reasoned or {}).get("content", ""))
- 
-    if intent == "transform_content" and slide_id is not None:
-        instruction = content or text
-        return f"improve slide {slide_id}: {instruction}"
 
+    # ── Step 6: Safety net — unknown must not morph into add_slide ───────────
+    if result["intent"] == "unknown":
+        result["clarification_question"] = (
+            result.get("clarification_question")
+            or "What would you like me to do with the presentation?"
+        )
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. CANONICALIZE REASONED PROMPT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
+    """Build a clean internal routing string from the reasoned intent."""
+    text     = (user_input or "").strip()
+    intent   = _safe_str((reasoned or {}).get("intent"))
+    slide_id = (reasoned or {}).get("slide_id")
+    ppt_id   = _safe_str((reasoned or {}).get("ppt_id"))
+    content  = _safe_str((reasoned or {}).get("content"))
+
+    if intent == "cancel":
+        return "cancel"
+    if intent == "blank_slide" and slide_id is not None:
+        return f"blank slide {slide_id}"
+    if intent == "clear_slide" and slide_id is not None:
+        return f"clear slide {slide_id}"
+    if intent == "transform_content" and slide_id is not None:
+        return f"improve slide {slide_id}: {content or text}"
     if intent == "update_slide" and slide_id is not None:
         return f"edit slide {slide_id}: {content or text}"
- 
     if intent == "view_slide" and slide_id is not None:
-        return (f"show slide {slide_id} of {ppt_id}" if ppt_id
-                else f"show slide {slide_id}")
-
+        return (f"show slide {slide_id} of {ppt_id}" if ppt_id else f"show slide {slide_id}")
     if intent == "explain_slide" and slide_id is not None:
         return f"explain slide {slide_id}"
- 
     if intent == "add_points" and slide_id is not None:
         m = re.search(r"\b(\d+)\s*(?:more\s+)?(?:point|bullet)", text, re.IGNORECASE)
         n = m.group(1) if m else "1"
         return f"add {n} point(s) in slide {slide_id}"
- 
     if intent == "edit_slide" and slide_id is not None and content:
         return f"edit slide {slide_id}: {content}"
- 
     if intent == "delete_slide" and slide_id is not None:
         return f"delete slide {slide_id}"
-
     if intent == "merge_slides":
-        slide_ids = (reasoned or {}).get("slide_ids") or []
-        if len(slide_ids) >= 2:
-            return f"merge slide {slide_ids[0]} and {slide_ids[1]}"
- 
+        ids = (reasoned or {}).get("slide_ids") or []
+        if len(ids) >= 2:
+            return f"merge slide {ids[0]} and {ids[1]}"
     return text
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════
-#  3. POLISH NEXT QUESTION  (replaces existing in app.py)
-# ═══════════════════════════════════════════════════════════════════════════
- 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3. POLISH NEXT QUESTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _polish_next_question(
     user_input: str,
     intent: Optional[str],
@@ -367,35 +383,34 @@ def _polish_next_question(
     missing: list,
     next_question: Optional[str],
 ) -> str:
-    """
-    Return a natural, context-specific follow-up question.
-    Never uses robotic phrasing like "What change would you like to make?".
-    """
-    slide_num = slots.get("slide_number")
+    """Return a natural, context-specific follow-up question."""
+    slide_num     = slots.get("slide_number")
     slide_content = slots.get("slide_content")
-    ppt_id    = st.session_state.get("current_ppt_id") or slots.get("ppt_ref")
-    ppt_label = _ppt_display_label(str(ppt_id)) if ppt_id else "the presentation"
- 
-    def _slide_title_or_ref(num):
+    ppt_id        = st.session_state.get("current_ppt_id") or slots.get("ppt_ref")
+    ppt_label     = _ppt_display_label(str(ppt_id)) if ppt_id else "the presentation"
+    missing       = missing or []
+
+    def _slide_ref(num: object) -> str:
         try:
             outline = _current_outline_payload()
             slides  = (outline or {}).get("slides", [])
-            if num and 1 <= int(num) <= len(slides):
-                t = slides[int(num) - 1].get("title", "")
-                if t:
-                    return f'**{t}** (slide {num})'
+            n = int(num)  # type: ignore[arg-type]
+            if 1 <= n <= len(slides):
+                title = slides[n - 1].get("title", "")
+                if title:
+                    return f"**{title}** (slide {n})"
         except Exception:
             pass
         return f"slide {num}" if num else "that slide"
- 
-    missing = missing or []
- 
+
     if intent == "edit_slide":
         if "slide_number" in missing or slide_num is None:
             return f"Which slide would you like to edit in {ppt_label}?"
         if "change_content" in missing:
-            return (f"What should I change in {_slide_title_or_ref(slide_num)}? "
-                    f"(e.g. rewrite a bullet, update the title, add a point)")
+            return (
+                f"What should I change in {_slide_ref(slide_num)}? "
+                f"(e.g. rewrite a bullet, update the title, add a point)"
+            )
 
     if intent in {"clear_slide", "blank_slide"}:
         if "slide_number" in missing or slide_num is None:
@@ -407,70 +422,67 @@ def _polish_next_question(
     if intent == "transform_content":
         if "slide_number" in missing or slide_num is None:
             return f"Which slide should I improve in {ppt_label}?"
-        return (f"How should I improve {_slide_title_or_ref(slide_num)}? "
-                f"(e.g. make it shorter, rewrite, make it more professional)")
- 
+        return (
+            f"How should I improve {_slide_ref(slide_num)}? "
+            f"(e.g. make it shorter, rewrite, more professional)"
+        )
+
     if intent == "add_points":
         if "slide_number" in missing or slide_num is None:
-            count = None
-            try:
-                m = re.search(r"\b(\d+)\s*(?:more\s+)?(?:point|bullet)", user_input or "", re.IGNORECASE)
-                if m:
-                    count = int(m.group(1))
-            except Exception:
-                count = None
-            if count and count > 5:
-                return f"I can add up to 5 points total at a time. Which slide should I add them to in {ppt_label}?"
             return f"Which slide should I add points to in {ppt_label}?"
 
     if intent == "update_slide":
         if "slide_number" in missing or slide_num is None:
             return f"Which slide should I update in {ppt_label}?"
         if "change_content" in missing:
-            return f"What should I change in {_slide_title_or_ref(slide_num)}?"
+            return f"What should I change in {_slide_ref(slide_num)}?"
 
     if intent == "explain_slide":
         if "slide_number" in missing or slide_num is None:
             return f"Which slide should I explain in {ppt_label}?"
 
-    if intent == "unknown":
-        return next_question or "What would you like me to do with the presentation?"
- 
-    if intent == "add_slide":
-        if "slide_content" in missing or slide_content is None:
-            return f"What topic should the new slide cover?"
-        if "position" in missing:
-            return ("Where should I place the new slide? "
-                    "(e.g. at the end, after slide 3, at the start)")
- 
-    if intent == "move_slide":
+    if intent == "view_slide":
         if "slide_number" in missing or slots.get("slide_number") is None:
-            return f"Which slide would you like to move in {ppt_label}?"
-        num = slots.get("slide_number")
-        if "anchor_slide" in missing and "position" not in missing:
-            return (f"Where should {_slide_title_or_ref(num)} go? "
-                    f"(e.g. before slide 4, after slide 6, to position 2)")
-        if "position" in missing:
-            return f"What position should {_slide_title_or_ref(num)} move to?"
- 
-    if intent == "swap_slides":
-        if "slide_a" in missing or slots.get("slide_a") is None:
-            return f"Which two slides should I swap in {ppt_label}?"
-        if "slide_b" in missing or slots.get("slide_b") is None:
-            return f"Swap slide {slots.get('slide_a')} with which other slide?"
- 
+            return f"Which slide would you like to see in {ppt_label}?"
+
     if intent == "delete_slide":
         if "slide_number" in missing or slots.get("slide_number") is None:
             return f"Which slide should I delete from {ppt_label}?"
 
     if intent == "merge_slides":
         return "Which two slides should I merge?"
- 
-    if intent == "view_slide":
+
+    if intent == "add_slide":
+        if "slide_content" in missing or slide_content is None:
+            return f"What topic should the new slide cover in {ppt_label}?"
+        if "position" in missing:
+            return (
+                "Where should I place the new slide? "
+                "(e.g. at the end, after slide 3, at the start)"
+            )
+
+    if intent == "move_slide":
         if "slide_number" in missing or slots.get("slide_number") is None:
-            return f"Which slide would you like to see in {ppt_label}?"
- 
-    # Clean up generic wording if LLM returned it
+            return f"Which slide would you like to move in {ppt_label}?"
+        num = slots.get("slide_number")
+        if "anchor_slide" in missing and "position" not in missing:
+            return (
+                f"Where should {_slide_ref(num)} go? "
+                f"(e.g. before slide 4, after slide 6, to position 2)"
+            )
+        if "position" in missing:
+            return f"What position should {_slide_ref(num)} move to?"
+
+    if intent == "swap_slides":
+        if "slide_a" in missing or slots.get("slide_a") is None:
+            return f"Which two slides should I swap in {ppt_label}?"
+        if "slide_b" in missing or slots.get("slide_b") is None:
+            return f"Swap slide {slots.get('slide_a')} with which other slide?"
+
+    if intent == "unknown":
+        return next_question or "What would you like me to do with the presentation?"
+
+    # Clean up generic LLM wording
     q = (next_question or "").strip()
     if q:
         q = re.sub(r"(?i)\bwhat point\b", "what bullet point", q)
@@ -478,35 +490,45 @@ def _polish_next_question(
         q = re.sub(r"(?i)what change would you like to make\??", "", q).strip()
         if q:
             return q
- 
+
     return "Could you give me a bit more detail?"
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════
-#  4. CONFIDENCE-BASED EXECUTION GATE  (NEW)
-# ═══════════════════════════════════════════════════════════════════════════
- 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  4. CONFIDENCE-BASED EXECUTION GATE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _should_execute_directly(reasoned: dict) -> bool:
     """
     Return True when confidence is high enough to act without asking.
- 
-    confidence >= 0.60 → execute (may add a brief scope note)
-    confidence  < 0.60 → ask for clarification first
-    """
-    reasoned = reasoned or {}
-    intent = _safe_str(reasoned.get("intent", ""))
-    slide_id = reasoned.get("slide_id")
-    content = _safe_str(reasoned.get("content", ""))
 
+    confidence ≥ 0.60 → execute (possibly with a scope note)
+    confidence  < 0.60 → ask for clarification
+    """
+    reasoned  = reasoned or {}
+    intent    = _safe_str(reasoned.get("intent"))
+    slide_id  = reasoned.get("slide_id")
+    content   = _safe_str(reasoned.get("content"))
+    conf      = float(reasoned.get("confidence") or 0.0)
+
+    # unknown → never execute
+    if intent == "unknown":
+        return False
+
+    # Slide-level intents require a slide_id
+    if intent in _SLIDE_INTENTS and slide_id is None:
+        return False
+
+    # Intents that need specific sub-slots
     if intent == "edit_slide":
-        return bool(slide_id and content) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+        return bool(slide_id and content) and conf >= 0.60
 
     if intent == "update_slide":
-        return bool(slide_id and content) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+        return bool(slide_id and content) and conf >= 0.60
 
     if intent == "add_slide":
         has_placement = bool(reasoned.get("position") or reasoned.get("anchor_slide"))
-        return bool(content and has_placement) and float(reasoned.get("confidence", 0.0) or 0.0) >= 0.60
+        return bool(content and has_placement) and conf >= 0.60
 
     if intent in {"delete_slide", "move_slide", "swap_slides", "view_slide", "explain_slide"} and not slide_id:
         return False
@@ -514,63 +536,83 @@ def _should_execute_directly(reasoned: dict) -> bool:
     if intent == "merge_slides" and len(reasoned.get("slide_ids") or []) < 2:
         return False
 
-    if intent == "unknown":
-        return False
-
-    conf = float((reasoned or {}).get("confidence", 0.0) or 0.0)
     return conf >= 0.60
- 
- 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  5. CONFIDENCE PREFACE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _confidence_preface(reasoned: dict) -> Optional[str]:
     """
-    For confidence 0.60–0.79, return a brief note so the user knows the
-    system inferred the target from context.  Returns None when not needed.
+    For confidence 0.60–0.79, return a brief note when scope was inferred.
+    Returns None when confidence is high (≥ 0.80) or not applicable.
     """
-    conf = float((reasoned or {}).get("confidence", 1.0) or 1.0)
-    if conf >= 0.80:
-        return None
+    conf     = float((reasoned or {}).get("confidence") or 1.0)
     intent   = (reasoned or {}).get("intent", "")
     slide_id = (reasoned or {}).get("slide_id")
+
+    if conf >= 0.80:
+        return None
+
     if intent in {"transform_content", "add_points", "update_slide", "edit_slide"} and slide_id:
         return f"*(Working on slide {slide_id} — let me know if that's not right.)*"
+
     return None
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════
-#  5. NATURAL SUCCESS MESSAGES  (NEW)
-# ═══════════════════════════════════════════════════════════════════════════
- 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  6. NATURAL SUCCESS MESSAGES
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _natural_success_message(intent: str, slots: dict) -> str:
-    """
-    Return a conversational confirmation instead of "✅ Slide X updated."
-    Pass this as the success_msg argument to commit_changes().
-    """
+    """Return a controlled but varied confirmation after an action completes."""
     slide_num = slots.get("slide_number") or slots.get("slide_id")
     n         = slots.get("n_points", 1)
     ppt_id    = st.session_state.get("current_ppt_id", "")
     ppt_label = _ppt_display_label(ppt_id) if ppt_id else "the deck"
- 
+    current_ppt = st.session_state.get("current_ppt")
+    ppt_topic = st.session_state.get("topic") or (
+        current_ppt.get("topic") if isinstance(current_ppt, dict) else ""
+    )
+
     slide_title = ""
     if slide_num:
         try:
             outline = _current_outline_payload()
             slides  = (outline or {}).get("slides", [])
-            if 1 <= int(slide_num) <= len(slides):
-                slide_title = slides[int(slide_num) - 1].get("title", "")
+            n_int   = int(slide_num)
+            if 1 <= n_int <= len(slides):
+                slide_title = slides[n_int - 1].get("title", "")
         except Exception:
             pass
- 
-    title_ref = f'**{slide_title}**' if slide_title else f"slide {slide_num}"
- 
-    messages = {
-        "transform_content": f"Done! I've improved {title_ref}. Here's the updated deck 👇",
-        "add_points":        f"Added {n} new point(s) to {title_ref} ✅",
-        "edit_slide":        f"Got it — {title_ref} has been updated 👇",
-        "add_slide":         f"New slide added to {ppt_label} ✅",
-        "delete_slide":      f"Slide {slide_num} removed from {ppt_label}.",
-        "move_slide":        f"Slide repositioned in {ppt_label} ✅",
-        "swap_slides":       f"Slides swapped in {ppt_label} ✅",
-        "refine_ppt":        f"Refreshed! Here's the updated {ppt_label} 👇",
-        "create_ppt":        "Here's your new presentation 👇",
-    }
-    return messages.get(intent, "Done! Here's the updated presentation 👇")
+
+    client = None
+    model = None
+    try:
+        from openai import AzureOpenAI
+        from backend.config import AZURE_API_VERSION, AZURE_DEPLOYMENT, AZURE_ENDPOINT, AZURE_KEY
+
+        client = AzureOpenAI(
+            api_key=AZURE_KEY,
+            api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT,
+        )
+        model = AZURE_DEPLOYMENT
+    except Exception:
+        client = None
+        model = None
+
+    return generate_response(
+        intent,
+        slide_number=int(slide_num) if slide_num is not None else None,
+        slide_title=slide_title,
+        ppt_topic=str(ppt_topic or ""),
+        ppt_label=ppt_label,
+        change_type=str(slots.get("change_type") or slots.get("sub_intent") or ""),
+        change_content=str(slots.get("change_content") or slots.get("content") or ""),
+        n_points=int(n) if n is not None else None,
+        user_request=str(slots.get("user_request") or ""),
+        llm_client=client,
+        llm_model=model,
+    )
