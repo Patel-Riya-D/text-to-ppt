@@ -145,7 +145,7 @@ def _classify_presentation_mode_sub_intent(text: str) -> Optional[str]:
         return "slide_script"
     if re.search(r"\b(?:2 minute|2-minute|two minute|speech|summarize.*speech|summary.*speech)\b", low):
         return "speech_summary"
-    if re.search(r"\b(?:explain.*present|present.*explain|like i.m present|presenting)\b", low):
+    if re.search(r"\b(?:explain.*present|present.*explain|like i.m present|presenting|explain\s+(?:this\s+)?(?:ppt|presentation|deck)|walk\s+me\s+through\s+(?:this\s+)?(?:ppt|presentation|deck))\b", low):
         return "presentation_explain"
     if re.search(r"\b(?:interactive question|one question per slide|question per slide)\b", low):
         return "interactive_questions"
@@ -330,7 +330,7 @@ _RE_ADD_POINTS   = re.compile(r"\b(?:add|append|insert)\b.{0,20}\b(?:point|point
 _RE_BULK         = re.compile(r"\b(?:all slides?|every slide|each slide|entire (?:ppt|deck|presentation)|whole (?:ppt|deck|presentation)|throughout|across all)\b", _R)
 _RE_REGEN        = re.compile(r"\b(?:regenerate|re-generate|redo|rebuild)\s+(?:slide|only slide|just slide)\b|\brewrite\s+(?:conclusion|introduction|intro|summary|thank you)\s+slide\b", _R)
 _RE_DESIGN       = re.compile(r"\b(?:dark theme|dark mode|modern|minimal|minimalist|business presentation|investor|visually appealing|icons?|visuals?|impactful heading|use less text|visual\s+appeal)\b", _R)
-_RE_PRES_MODE    = re.compile(r"\b(?:speaker notes?|slide script|script for each|audience question|questions? audience|audience.*questions?|q\s*&?\s*a|2[\s-]minute speech|two[\s-]minute|summarize.*speech|interactive question|question per slide|like i.m present|presenting)\b", _R)
+_RE_PRES_MODE    = re.compile(r"\b(?:speaker notes?|slide script|script for each|audience question|questions? audience|audience.*questions?|q\s*&?\s*a|2[\s-]minute speech|two[\s-]minute|summarize.*speech|interactive question|question per slide|like i.m present|presenting|explain\s+(?:this\s+)?(?:ppt|presentation|deck)|walk\s+me\s+through\s+(?:this\s+)?(?:ppt|presentation|deck))\b", _R)
 _RE_TRANSLATE    = re.compile(r"\b(?:translate|convert)\b.{0,30}\b(?:hindi|french|spanish|german|japanese|chinese|arabic|portuguese|urdu|bengali|tamil|telugu|kannada|marathi|gujarati|malayalam)\b", _R)
 _RE_STATS        = re.compile(r"\b(?:include|add|insert)\b.{0,30}\b(?:statistics?|stats?|data|numbers?|figures?|facts?|percentage|metric|kpi)\b", _R)
 _RE_EXAMPLES     = re.compile(r"\b(?:add|include|insert)\b.{0,30}\b(?:real[\s-]world examples?|examples?|case studi(?:es|y)|indian context|local context|context)\b", _R)

@@ -37,6 +37,30 @@ def _safe_str(v: object, default: str = "") -> str:
     return str(v).strip() if v is not None else default
 
 
+_NUMBER_WORDS = {
+    "one": 1, "a": 1, "an": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+}
+
+
+def _extract_requested_point_count(text: str) -> Optional[int]:
+    m = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+        r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+        r"nineteen|twenty|thirty|forty|fifty)\s*(?:more\s+)?"
+        r"(?:point|points|bullet|bullets|item|items)\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    token = m.group(1).lower()
+    return int(token) if token.isdigit() else _NUMBER_WORDS.get(token)
+
+
 def _current_outline_payload() -> dict:
     outline = st.session_state.get("outline_payload")
     return outline if isinstance(outline, dict) else {}
@@ -358,8 +382,7 @@ def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
     if intent == "explain_slide" and slide_id is not None:
         return f"explain slide {slide_id}"
     if intent == "add_points" and slide_id is not None:
-        m = re.search(r"\b(\d+)\s*(?:more\s+)?(?:point|bullet)", text, re.IGNORECASE)
-        n = m.group(1) if m else "1"
+        n = _extract_requested_point_count(content or text) or 1
         return f"add {n} point(s) in slide {slide_id}"
     if intent == "edit_slide" and slide_id is not None and content:
         return f"edit slide {slide_id}: {content}"

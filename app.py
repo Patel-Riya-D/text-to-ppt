@@ -60,6 +60,7 @@ def clean_icon_tokens(text: str) -> str:
 
 _SAFE_BULLET_ICONS = {"▸", "◆", "✓", "•", "●", "▪", "‣", "→", "➜", "➤", "▶", "►"}
 _MAX_POINTS_PER_REQUEST = 5
+_MAX_SLIDES_WITHOUT_CONFIRMATION = 15
 
 
 def clean_bullet_icon(icon: str, fallback: str = "▸") -> str:
@@ -1393,6 +1394,22 @@ def _is_negative_command(user_input: str) -> bool:
     text = _safe_str(user_input)
     return bool(re.fullmatch(r"(?:no|nope|not now|don't|do not|cancel)", text, re.IGNORECASE))
 
+_NUMBER_WORDS = {
+    "zero": 0, "one": 1, "a": 1, "an": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50,
+}
+
+def _parse_small_number_token(token: str) -> Optional[int]:
+    token = _safe_str(token).lower()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    return _NUMBER_WORDS.get(token)
+
 def _is_null_add_request(user_input: str) -> bool:
     text = _norm_text(user_input)
     return bool(re.fullmatch(r"(?:add nothing|nothing to add|no change|no changes|nothing)", text, re.IGNORECASE))
@@ -1414,12 +1431,10 @@ def _extract_point_count(change_content: str) -> Optional[int]:
     if not text or "add" not in text:
         return None
     text = text.replace("point(s)", "points").replace("bullet(s)", "bullets")
-    num_match = re.search(r"(\d+)\s*(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text)
+    num_match = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s*(?:bullet\s*)?(?:point|points|bullet|bullets|item|items)\b", text)
     if num_match:
-        try:
-            return max(1, int(num_match.group(1)))
-        except ValueError:
-            return 1
+        parsed = _parse_small_number_token(num_match.group(1))
+        return max(1, parsed or 1)
     if re.search(r"\b(?:one|a|an)\s+(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text):
         return 1
     if re.search(r"\b(?:point|points|bullet|bullets)\b", text):
@@ -1864,6 +1879,20 @@ def _handle_create_request(prompt: str) -> bool:
     st.session_state.pending_intent = None
     st.session_state.pending_action = None
     if slide_count:
+        if int(slide_count) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+            question = _slide_limit_confirmation_question(int(slide_count))
+            pending = {
+                "intent": "confirm_large_slide_count",
+                "target_intent": "create_ppt",
+                "slots": {"topic": topic, "slide_count": int(slide_count), "sections": sections},
+                "next_question": question,
+                "action": "confirm",
+            }
+            _store_pending_action(pending)
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
         generate_outline_and_reply(topic, slide_count, st.session_state.tone, sections, theme_colors)
     else:
         st.session_state.pending_new_ppt = {
@@ -1881,8 +1910,8 @@ def _handle_create_request(prompt: str) -> bool:
 def _extract_slide_count_from_text(user_input: str) -> Optional[int]:
     text = user_input or ""
     patterns = [
-        r"\b(?:with|of|for)\s+(\d+)\s+slides?\b",
-        r"\b(\d+)\s+slides?\b",
+        r"\b(?:with|of|for)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s+slides?\b",
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s+slides?\b",
         r"\bslide\s+(\d+)\b",
         r"\bslides?\s+of\s+(\d+)\b",
         r"\b(\d+)\s+slide(?:s)?\b",
@@ -1891,10 +1920,7 @@ def _extract_slide_count_from_text(user_input: str) -> Optional[int]:
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                return None
+            return _parse_small_number_token(m.group(1))
     if re.fullmatch(r"\d+", text.strip()):
         try:
             return int(text.strip())
@@ -1971,7 +1997,7 @@ def _is_add_slide_request(user_input: str) -> bool:
         return False
     if _has_explicit_slide_reference(text) and not re.search(r"\b(?:after|before)\s+slide\s*#?\d+\b", text, re.IGNORECASE):
         return False
-    if re.search(r"\b(?:point|points|bullet|bullets)\b", text, re.IGNORECASE):
+    if re.search(r"\b(?:point|points|bullet|bullets)\b", text, re.IGNORECASE) and not _extract_explicit_provided_content(text):
         return False
     return bool(re.search(
         r"\b(?:add|insert)\b.*\b(?:new\s+|another\s+|one more\s+)?slide\b"
@@ -2082,6 +2108,47 @@ def _extract_add_slide_content(user_input: str) -> Optional[str]:
     text = re.sub(r"(?i)^\s*(?:about|on|for)\s+", "", text).strip()
     text = text.strip(" ,.;:-")
     return text or None
+
+def _extract_explicit_provided_content(user_input: str) -> Optional[str]:
+    text = (user_input or "").strip()
+    if not text:
+        return None
+    patterns = [
+        r"(?is)\b(?:add|insert|include|use)\s+(?:the\s+)?(?:below|following)\s+content\s*[:\-]?\s*(.+)$",
+        r"(?is)\b(?:content|text)\s*(?:is|:|-)\s*(.+)$",
+        r"(?is)\bwith\s+(?:this\s+)?(?:exact\s+)?content\s*[:\-]?\s*(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            content = m.group(1).strip()
+            return content or None
+    return None
+
+def _slide_from_explicit_content(content: str, fallback_title: str = "User Provided Content") -> dict:
+    lines = [clean_icon_tokens(line) for line in re.split(r"[\r\n]+", content or "") if clean_icon_tokens(line)]
+    if not lines:
+        lines = flatten_slide_content(content)
+    title = fallback_title
+    bullets = lines
+    if lines:
+        first = lines[0].strip()
+        if len(first.split()) <= 10 and not first.endswith("."):
+            title = first.strip(" :-")
+            bullets = lines[1:] or [first]
+    if len(bullets) == 1:
+        pieces = [clean_icon_tokens(p) for p in re.split(r"\s*(?:;|•|\u2022)\s*", bullets[0]) if clean_icon_tokens(p)]
+        if len(pieces) > 1:
+            bullets = pieces
+    return normalize_slide({
+        "title": title or fallback_title,
+        "subtitle": "",
+        "layout": "bullets",
+        "icon": "▸",
+        "content": bullets or [clean_icon_tokens(content)],
+        "style": {},
+        "_user_modified": True,
+    })
 
 def _extract_edit_change_content(user_input: str) -> Optional[str]:
     """
@@ -2311,13 +2378,16 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         r"\b(?:speaker notes?|speaker script|slide script|script for each|short script|"
         r"audience question|questions? audience|audience.*questions?|q\s*&?\s*a|"
         r"2[\s-]minute speech|two[\s-]minute|summarize.*speech|summary.*speech|"
-        r"interactive question|question per slide|like i.m present|presenting)\b",
+        r"interactive question|question per slide|like i.m present|presenting|"
+        r"explain\s+(?:this\s+)?(?:ppt|presentation|deck)|walk\s+me\s+through\s+(?:this\s+)?(?:ppt|presentation|deck))\b",
         text,
         re.IGNORECASE,
     ):
         result["intent"] = "presentation_mode"
         result["operation"] = "presentation_mode"
         result["content"] = text or user_input
+        if not result.get("sub_intent"):
+            result["sub_intent"] = "presentation_explain"
         result["confidence"] = 0.98
 
     elif _is_expand_existing_slide_request(text):
@@ -2362,7 +2432,13 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         )
 
     # Prefer interpreting explicit point/bullet additions as `add_points`.
-    elif re.search(r"\b(?:add|insert|append)\b.*\b(point|points|bullet|bullets|item|items)\b", text, re.IGNORECASE) or re.search(r"\bboth\b.*\b(side|sides|column|columns)\b", text, re.IGNORECASE):
+    elif (
+        not (_is_add_slide_request(text) and _extract_explicit_provided_content(text))
+        and (
+            re.search(r"\b(?:add|insert|append)\b.*\b(point|points|bullet|bullets|item|items)\b", text, re.IGNORECASE)
+            or re.search(r"\bboth\b.*\b(side|sides|column|columns)\b", text, re.IGNORECASE)
+        )
+    ):
         _set(
             "add_points",
             operation="append",
@@ -2429,7 +2505,7 @@ def _canonicalize_reasoned_prompt(user_input: str, reasoned: dict) -> str:
     if intent == "explain_slide" and slide_id is not None:
         return f"explain slide {slide_id}"
     if intent == "add_points" and slide_id is not None:
-        return f"add 1 point in slide {slide_id}"
+        return f"{content or text or 'add point'} in slide {slide_id}"
     if intent == "edit_slide" and slide_id is not None and content:
         return f"edit slide {slide_id}: {content}"
     if intent == "delete_slide" and slide_id is not None:
@@ -2762,7 +2838,11 @@ def _resolve_vague_followup_prompt(prompt: str) -> str:
         return prompt
     if ctx.get("ppt_id") and ctx.get("ppt_id") != st.session_state.get("current_ppt_id"):
         switch_active_ppt(ctx["ppt_id"])
-    return f"add 1 point in slide {ctx['slide_index']}"
+    requested = _parse_bullet_add_request(text)
+    if requested is None:
+        requested = 1
+    label = "point" if int(requested) == 1 else "points"
+    return f"add {int(requested)} {label} in slide {ctx['slide_index']}"
 
 def _slot_missing(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, (list, tuple, dict)) and not value)
@@ -2857,9 +2937,13 @@ def _infer_agent_slots(intent: Optional[str], user_input: str, slots: dict, cont
             updated.pop("change_content", None)
 
     if intent == "add_slide":
+        explicit_content = _extract_explicit_provided_content(text)
         content = _extract_add_slide_content(text)
         position = _extract_add_slide_position(text, slides)
-        if content and updated.get("slide_content") is None:
+        if explicit_content and updated.get("slide_content") is None:
+            updated["slide_content"] = explicit_content
+            updated["explicit_user_content"] = explicit_content
+        elif content and updated.get("slide_content") is None:
             updated["slide_content"] = content
         if position is not None and updated.get("position") is None:
             updated["position"] = position
@@ -3256,6 +3340,9 @@ def _point_limit_confirmation_question(slide_num: int, requested: int, allowed: 
         f"Do you want me to add {allowed} points to slide {slide_num} instead?"
     )
 
+def _slide_limit_confirmation_question(requested: int) -> str:
+    return f"You requested {requested} slides. Do you want to continue?"
+
 def _topic_switch_confirmation_question(active_domain: str, new_domain: str) -> str:
     return (
         f"We are currently working within '{active_domain}'. "
@@ -3275,20 +3362,18 @@ def _parse_bullet_add_request(change_content: str) -> Optional[int]:
         return None
     # Normalize common shorthand used by the routing layer.
     text = text.replace("point(s)", "points").replace("bullet(s)", "bullets")
-    if not re.search(r"\b(point|points|bullet|bullets)\b", text):
+    if not re.search(r"\b(point|points|bullet|bullets|item|items)\b", text):
         return None
 
-    num_match = re.search(r"(\d+)\s*(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text)
+    num_match = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s*(?:bullet\s*)?(?:point|points|bullet|bullets|item|items)\b", text)
     if num_match:
-        try:
-            return max(1, int(num_match.group(1)))
-        except ValueError:
-            return 1
+        parsed = _parse_small_number_token(num_match.group(1))
+        return max(1, parsed or 1)
 
-    if re.search(r"\b(?:one|a|an)\s+(?:bullet\s*)?(?:point|points|bullet|bullets)\b", text):
+    if re.search(r"\b(?:one|a|an)\s+(?:bullet\s*)?(?:point|points|bullet|bullets|item|items)\b", text):
         return 1
 
-    if re.search(r"\b(?:point|points|bullet|bullets)\b", text):
+    if re.search(r"\b(?:point|points|bullet|bullets|item|items)\b", text):
         return 2
 
     return 1
@@ -4000,35 +4085,129 @@ def _split_slide_into_parts(slide: dict) -> list[dict]:
 
 def _expand_existing_deck_slides(slides: list, target_count: int) -> tuple[list, int]:
     """
-    Expand current deck to target count without regenerating the whole deck.
+    Expand current deck to target count with new, meaningful subtopic slides.
     Returns (updated_slides, added_count).
     """
     base = copy.deepcopy(slides or [])
     if target_count <= len(base):
         return base, 0
     need_add = target_count - len(base)
-    additions: list[dict] = []
-    for slide in base:
-        if len(additions) >= need_add:
-            break
-        parts = _split_slide_into_parts(slide)
-        if len(parts) > 1:
-            for extra in parts[1:]:
-                additions.append(extra)
-                if len(additions) >= need_add:
-                    break
-    # If still short, clone rich slides as continuation placeholders.
+
+    # Deck-level expansion should add new topics, not cloned "(Part 2)" slides.
+    additions: list[dict] = _generate_semantic_expansion_slides(base, need_add)
     if len(additions) < need_add:
-        for slide in base:
-            if len(additions) >= need_add:
-                break
-            fallback = copy.deepcopy(slide)
-            fallback["title"] = f"{_safe_str(slide.get('title', 'Slide'), 'Slide')} (Continuation)"
-            fallback["_user_modified"] = True
-            additions.append(normalize_slide(fallback))
+        additions.extend(_generate_deterministic_expansion_slides(base + additions, need_add - len(additions)))
     updated = base + additions[:need_add]
     updated = refresh_section_index_slide(updated)
     return updated, min(len(additions), need_add)
+
+def _is_bad_expansion_title(title: str, existing_titles: Optional[set[str]] = None) -> bool:
+    norm = _norm_text(title)
+    if not norm:
+        return True
+    if existing_titles and norm in existing_titles:
+        return True
+    return bool(re.search(r"\b(?:part|continuation|continued|summary\s+part)\s*\d*\b", norm, re.IGNORECASE))
+
+def _generate_semantic_expansion_slides(slides: list, needed: int) -> list[dict]:
+    needed = max(0, int(needed or 0))
+    if needed <= 0:
+        return []
+    existing_titles = [_safe_str(s.get("title", ""), "") for s in slides if isinstance(s, dict)]
+    compact = summarize_slides_for_llm(slides)
+    prompt = f"""
+Create {needed} NEW PowerPoint slide objects that expand this deck with meaningful missing subtopics.
+
+Existing slides:
+{json.dumps(compact, indent=2)}
+
+Rules:
+- Generate genuinely new slide topics, not split copies of existing slides.
+- Never use title suffixes like "(Part 2)", "Continuation", or "Continued".
+- Do not duplicate existing titles or produce summary/review duplicates.
+- Each new slide must cover a distinct subtopic, application, implication, example, risk, opportunity, or future direction that logically expands the deck.
+- Use concise, useful bullets grounded in the deck's topic, with new wording and new examples.
+- Return ONLY JSON: {{"slides": [{{"title": "...", "subtitle": "", "layout": "bullets", "icon": "▸", "content": ["...", "..."], "style": {{}}}}]}}
+"""
+    try:
+        resp = _client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.55,
+            max_tokens=900,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if not raw.startswith("{"):
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            raw = m.group() if m else raw
+        data = json.loads(raw)
+        proposed = data.get("slides", []) if isinstance(data, dict) else []
+    except Exception:
+        proposed = []
+    normalized: list[dict] = []
+    seen = {_norm_text(t) for t in existing_titles if t}
+    for slide in proposed:
+        if not isinstance(slide, dict):
+            continue
+        title_norm = _norm_text(slide.get("title", ""))
+        if _is_bad_expansion_title(slide.get("title", ""), seen):
+            continue
+        seen.add(title_norm)
+        slide["_user_modified"] = True
+        normalized.append(normalize_slide(slide))
+        if len(normalized) >= needed:
+            break
+    return normalized
+
+def _generate_deterministic_expansion_slides(slides: list, needed: int) -> list[dict]:
+    needed = max(0, int(needed or 0))
+    if needed <= 0:
+        return []
+    existing = {_norm_text(s.get("title", "")) for s in slides if isinstance(s, dict)}
+    candidates: list[tuple[str, list[str]]] = []
+    for slide in slides or []:
+        if not isinstance(slide, dict):
+            continue
+        base_title = _safe_str(slide.get("title", ""), "Topic")
+        points = _dedupe_preserve_order(
+            flatten_slide_content(slide.get("content", []))
+            + flatten_slide_content(slide.get("left_points", []))
+            + flatten_slide_content(slide.get("right_points", []))
+        )
+        for point in points[:4]:
+            words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9-]+", point) if len(w) > 3]
+            focus = " ".join(words[:4]).strip() or base_title
+            title = f"Deep Dive: {focus}"
+            bullets = [
+                f"Why {focus.lower()} matters in this topic area.",
+                f"Practical implications connected to {base_title}.",
+                "Key considerations for applying this idea responsibly.",
+                "Audience takeaway: how this subtopic changes decisions or next steps.",
+            ]
+            candidates.append((title, bullets))
+    if not candidates:
+        candidates = [
+            ("Real-World Applications", ["Where the topic is used today.", "Common implementation patterns.", "Benefits for users and organizations.", "Important constraints to manage."]),
+            ("Risks and Considerations", ["Potential limitations to watch.", "Operational and ethical concerns.", "Ways to reduce unintended outcomes.", "Decision criteria for responsible use."]),
+            ("Future Opportunities", ["Emerging directions in the field.", "New capabilities likely to matter next.", "Signals teams should monitor.", "Long-term impact on strategy and work."]),
+        ]
+    generated: list[dict] = []
+    for title, bullets in candidates:
+        if _is_bad_expansion_title(title, existing):
+            continue
+        existing.add(_norm_text(title))
+        generated.append(normalize_slide({
+            "title": title,
+            "subtitle": "",
+            "layout": "bullets",
+            "icon": "▸",
+            "content": bullets,
+            "style": {},
+            "_user_modified": True,
+        }))
+        if len(generated) >= needed:
+            break
+    return generated
 
 def llm_expand_split_prompt_template() -> str:
     """
@@ -4475,6 +4654,9 @@ Rules:
 - Do not ask where to place a slide.
 - Keep the answer directly usable by a presenter.
 - Be concise, specific, and grounded only in the slide content.
+- Avoid repetitive openings like "This slide shows" on every slide.
+- Use natural transitions between slides and vary sentence structure.
+- For whole-PPT explanations, create a flowing presenter talk track with a beginning, bridge phrases, and a closing.
 """
     try:
         resp = _client.chat.completions.create(
@@ -4486,6 +4668,62 @@ Rules:
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"Presentation coaching failed: {e}"
+
+def _slide_signature(slide: dict) -> str:
+    if not isinstance(slide, dict):
+        return ""
+    bits = [
+        _safe_str(slide.get("title", "")),
+        _safe_str(slide.get("subtitle", "")),
+        " ".join(flatten_slide_content(slide.get("content", []))),
+        " ".join(flatten_slide_content(slide.get("left_points", []))),
+        " ".join(flatten_slide_content(slide.get("right_points", []))),
+    ]
+    return _norm_text(" ".join(bits))
+
+def regenerate_slide_variant(slides: list, slide_num: int) -> dict:
+    old_slide = slides[slide_num - 1]
+    nearby_titles = [_safe_str(s.get("title", ""), "") for s in slides if isinstance(s, dict)]
+    prompt = f"""
+Regenerate slide {slide_num} as a genuinely new version while keeping it relevant to the same deck.
+
+Old slide:
+{json.dumps(old_slide, indent=2)}
+
+Deck titles:
+{json.dumps(nearby_titles)}
+
+Return ONLY one JSON slide object with title, subtitle, layout, icon, content, style.
+Rules:
+- Do not reuse the same bullet wording.
+- Keep the same broad purpose, but change the framing, title, and examples where useful.
+- Use 4-6 concise, plain-English bullets.
+- No markdown, no nested objects in content.
+"""
+    resp = _client.chat.completions.create(
+        model=AZURE_DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.8,
+        max_tokens=650,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    if not raw.startswith("{"):
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        raw = m.group() if m else raw
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid regenerated slide JSON")
+    data["_user_modified"] = True
+    regenerated = normalize_slide(data)
+    if _slide_signature(regenerated) == _slide_signature(old_slide):
+        regenerated["title"] = f"Fresh Perspective: {_safe_str(old_slide.get('title', 'Slide'), 'Slide')}"
+        regenerated["content"] = [
+            f"Reframed focus: {_safe_str(old_slide.get('title', 'the topic'), 'the topic')}",
+            "Updated angle with clearer emphasis for the audience.",
+            "New supporting detail to avoid repeating the previous version.",
+            "Sharper takeaway that connects this slide to the deck narrative.",
+        ]
+    return regenerated
 
 def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     if intent == "update_slide":
@@ -4600,25 +4838,17 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         if not (1 <= slide_num <= len(slides)):
             return f"Slide {slide_num} does not exist. The deck has {len(slides)} slide(s).", False
         try:
-            result, usage = transform_slide_with_llm(
-                f"Regenerate only slide {slide_num} from scratch. Keep it aligned with the deck topic and surrounding slides.",
-                slides,
-                slide_num,
-            )
-            record_usage("regenerate_slide", usage)
+            regenerated = regenerate_slide_variant(slides, slide_num)
         except Exception as e:
             return f"Regenerate failed: {e}", False
-        if result.get("action") == "edit" and result.get("slides"):
-            cleaned = [ensure_editor_id(s) for s in result.get("slides", [])]
-            if 1 <= slide_num <= len(cleaned):
-                cleaned[slide_num - 1]["_user_modified"] = True
-            updated_slides = refresh_section_index_slide(cleaned)
-            _remember_action_context("regenerate_slide", slide_num, st.session_state.get("current_ppt_id"), f"Regenerated slide {slide_num}")
-            msg = _natural_success_message("regenerate_slide", {"slide_number": slide_num, "change_type": "regenerated"})
-            commit_changes(updated_slides, msg)
-            _clear_transient_conversation_state()
-            return msg, True
-        return "Regenerate failed. Please try again.", False
+        updated_slides = copy.deepcopy(slides)
+        updated_slides[slide_num - 1] = ensure_editor_id(regenerated)
+        updated_slides = refresh_section_index_slide(updated_slides)
+        _remember_action_context("regenerate_slide", slide_num, st.session_state.get("current_ppt_id"), f"Regenerated slide {slide_num}")
+        msg = _natural_success_message("regenerate_slide", {"slide_number": slide_num, "change_type": "regenerated"})
+        commit_changes(updated_slides, msg)
+        _clear_transient_conversation_state()
+        return msg, True
 
     elif intent == "move_slide":
         slide_num = slots.get("slide_number")
@@ -4777,6 +5007,25 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         if slide_num < 1 or slide_num > len(slides):
             return f"Slide {slide_num} doesn't exist. Deck has {len(slides)} slides.", False
         target_slide = slides[slide_num - 1]
+
+        explicit_content = _extract_explicit_provided_content(change_content)
+        if explicit_content:
+            updated_slide = copy.deepcopy(target_slide)
+            replacement = _slide_from_explicit_content(explicit_content, _safe_str(updated_slide.get("title", "User Provided Content"), "User Provided Content"))
+            updated_slide["layout"] = replacement.get("layout", "bullets")
+            updated_slide["content"] = replacement.get("content", [])
+            updated_slide["subtitle"] = replacement.get("subtitle", updated_slide.get("subtitle", ""))
+            if replacement.get("title") and replacement.get("title") != "User Provided Content":
+                updated_slide["title"] = replacement.get("title")
+            for key in ("left_points", "right_points", "left", "right", "steps", "grid_items", "table_columns", "table_rows"):
+                updated_slide.pop(key, None)
+            updated_slide["_user_modified"] = True
+            updated_slides = refresh_section_index_slide(_merge_updated_slide(slides, slide_num, updated_slide))
+            _remember_action_context("edit_slide", slide_num, st.session_state.get("current_ppt_id"), f"Inserted provided content on slide {slide_num}")
+            msg = _natural_success_message("edit_slide", {"slide_number": slide_num, "change_type": "inserted provided content", "change_content": change_content})
+            commit_changes(updated_slides, msg)
+            _clear_transient_conversation_state()
+            return msg, True
 
         layout_change_match = re.search(
             r"\b(?:change|convert|switch|set)\b.*\blayout\b.*\b(?:to|as)\b.*\b(?:bullet|bullets|bullet points?)\b"
@@ -4971,7 +5220,10 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
             return f"Where should I add the slide about '{slide_content}' in {_ppt_display_label(st.session_state.get('current_ppt_id'))}?", False
         try:
             before_count = len(slides)
-            if is_thank_you:
+            explicit_content = slots.get("explicit_user_content") or _extract_explicit_provided_content(slide_content)
+            if explicit_content:
+                new_slide_data = _slide_from_explicit_content(explicit_content, "User Provided Content")
+            elif is_thank_you:
                 new_slide_data = make_thank_you_slide({})
             else:
                 new_slide_data = draft_slide_from_request(slide_content, slides)
@@ -5852,6 +6104,24 @@ if prompt is not None:
             st.session_state.pending_new_ppt = None
             st.session_state.pending_intent = None
             st.session_state.pending_action = None
+            if int(slide_count) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+                question = _slide_limit_confirmation_question(int(slide_count))
+                pending = {
+                    "intent": "confirm_large_slide_count",
+                    "target_intent": "create_ppt",
+                    "slots": {
+                        "topic": pending_topic,
+                        "slide_count": int(slide_count),
+                        "sections": pending_new_ppt.get("sections"),
+                    },
+                    "next_question": question,
+                    "action": "confirm",
+                }
+                _store_pending_action(pending)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
             generate_outline_and_reply(
                 pending_topic,
                 slide_count,
@@ -5989,7 +6259,7 @@ if prompt is not None:
     blank_slide_request = _is_blank_slide_request(routing_prompt)
 
     pending_state = st.session_state.get("pending_action") or st.session_state.get("pending_intent") or {}
-    protected_pending_intents = {"confirm_topic_switch", "confirm_add_points_limit", "confirm_add_slide", "clear_slide"}
+    protected_pending_intents = {"confirm_topic_switch", "confirm_add_points_limit", "confirm_large_slide_count", "confirm_add_slide", "clear_slide"}
     if pending_state and direct_intent in {"greeting", "smalltalk"} and pending_state.get("intent") not in protected_pending_intents:
         _clear_pending_turn_state()
         pending_state = {}
@@ -6051,6 +6321,65 @@ if prompt is not None:
             int((pending_state.get("requested_points") or _MAX_POINTS_PER_REQUEST)),
             int((pending_state.get("allowed_points") or _MAX_POINTS_PER_REQUEST)),
             st.session_state.get("current_ppt_id"),
+        )
+        with st.chat_message("assistant"):
+            st.markdown(question)
+        add_message("assistant", question)
+        st.rerun()
+
+    if pending_state.get("intent") == "confirm_large_slide_count":
+        if _is_cancel_command(routing_prompt) or _is_negative_command(routing_prompt):
+            _clear_pending_turn_state()
+            reply = "Okay, I cancelled that request."
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+        if _is_affirmative_command(routing_prompt):
+            slots = dict(pending_state.get("slots", {}))
+            target_intent = pending_state.get("target_intent") or "create_ppt"
+            _clear_pending_turn_state()
+            if target_intent == "bulk_resize":
+                target_count = int(slots.get("target_count") or slots.get("slide_count") or 0)
+                if target_count <= len(slides):
+                    result_msg = f"The current deck already has {len(slides)} slides. Please choose a larger number than {len(slides)} to expand."
+                    success = False
+                else:
+                    updated_slides, added = _expand_existing_deck_slides(slides, target_count)
+                    if added > 0:
+                        commit_changes(updated_slides, f"Expanded the deck to {len(updated_slides)} slides by splitting existing content.")
+                        st.stop()
+                    result_msg = "I could not expand this deck automatically. Try a slightly smaller target or ask to expand specific slides."
+                    success = False
+            elif target_intent == "single_slide_resize":
+                target_count = int(slots.get("target_count") or slots.get("slide_count") or 0)
+                slide_num = slots.get("slide_number")
+                try:
+                    slide_num = int(slide_num)
+                except (TypeError, ValueError):
+                    slide_num = None
+                if slide_num is None:
+                    result_msg = "Which slide should I expand?"
+                    success = False
+                elif not (1 <= slide_num <= len(slides)):
+                    result_msg = f"Slide {slide_num} does not exist. The deck has {len(slides)} slide(s)."
+                    success = False
+                else:
+                    updated_slides, added = _expand_target_slide_in_deck(slides, slide_num, target_count)
+                    if added > 0:
+                        commit_changes(updated_slides, f"Expanded slide {slide_num} into {target_count} focused slides.")
+                        st.stop()
+                    result_msg = f"I could not split slide {slide_num} into {target_count} meaningful parts automatically."
+                    success = False
+            else:
+                result_msg, success = execute_action("create_ppt", slots, slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            if success:
+                st.rerun()
+        question = pending_state.get("next_question") or _slide_limit_confirmation_question(
+            int((pending_state.get("slots") or {}).get("slide_count") or (pending_state.get("slots") or {}).get("target_count") or 0)
         )
         with st.chat_message("assistant"):
             st.markdown(question)
@@ -6131,6 +6460,23 @@ if prompt is not None:
                 add_message("assistant", reply)
                 st.rerun()
             single_slide_expand = bool(re.search(r"\bexpand\b.*\bslide\b.*\b(?:to|into)\s+\d+\s+slides?\b", routing_prompt, re.IGNORECASE))
+            if int(target_count) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+                target_slide_num = None
+                if single_slide_expand:
+                    target_slide_num = reasoned.get("slide_id") or _extract_explicit_slide_number_from_text(routing_prompt) or st.session_state.get("active_slide_index") or st.session_state.get("last_slide_index")
+                question = _slide_limit_confirmation_question(int(target_count))
+                pending = {
+                    "intent": "confirm_large_slide_count",
+                    "target_intent": "single_slide_resize" if single_slide_expand else "bulk_resize",
+                    "slots": {"target_count": int(target_count), "slide_count": int(target_count), "slide_number": target_slide_num},
+                    "next_question": question,
+                    "action": "confirm",
+                }
+                _store_pending_action(pending)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
             if single_slide_expand:
                 target_slide_num = reasoned.get("slide_id") or _extract_explicit_slide_number_from_text(routing_prompt) or st.session_state.get("active_slide_index") or st.session_state.get("last_slide_index")
                 try:
@@ -6238,6 +6584,20 @@ if prompt is not None:
                     st.markdown(reply)
                 add_message("assistant", reply)
                 st.rerun()
+            if int(slots.get("slide_count")) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+                question = _slide_limit_confirmation_question(int(slots.get("slide_count")))
+                pending = {
+                    "intent": "confirm_large_slide_count",
+                    "target_intent": "create_ppt",
+                    "slots": slots,
+                    "next_question": question,
+                    "action": "confirm",
+                }
+                _store_pending_action(pending)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
             result_msg, success = execute_action("create_ppt", slots, slides)
         with st.chat_message("assistant"):
             st.markdown(result_msg)
@@ -6248,11 +6608,14 @@ if prompt is not None:
     if direct_intent == "add_slide" and pending_state.get("intent") != "add_slide":
         _clear_pending_turn_state()
         slots = {}
-        content_candidate = _extract_add_slide_content(prompt)
+        explicit_content = _extract_explicit_provided_content(prompt)
+        content_candidate = explicit_content or _extract_add_slide_content(prompt)
         position_candidate = _extract_add_slide_position(prompt, slides)
         if content_candidate:
             slots["slide_content"] = content_candidate
             slots["content"] = content_candidate
+            if explicit_content:
+                slots["explicit_user_content"] = explicit_content
         else:
             # Fall back to classifier/reasoned content if available
             if reasoned and reasoned.get("content"):
