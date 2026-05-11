@@ -29,7 +29,7 @@ _client = AzureOpenAI(
 OUTLINE_URL = "http://127.0.0.1:9000/generate-outline"
 BUILD_URL   = "http://127.0.0.1:9000/build-ppt"
 
-st.set_page_config(page_title="AI PPT Chat Builder", page_icon="💬", layout="wide")
+st.set_page_config(page_title="AI PPT Generator", page_icon="💬", layout="wide")
 
 # ------------------------------------------------------------------------------
 #  GLOBAL ICON / MARKDOWN CLEANING (applies everywhere)
@@ -5924,7 +5924,7 @@ def apply_add_action(old_slides, slide, position):
 # ------------------------------------------------------------------------------
 #  MAIN UI — CHAT-FIRST LAYOUT
 # ------------------------------------------------------------------------------
-st.title("💬 AI PPT Chat Builder")
+st.title("💬 AI PPT Generator")
 st.caption("Describe your deck, then edit it in chat and download.")
 st.caption(f"Active context: {_build_context_badge()}")
 
