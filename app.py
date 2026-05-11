@@ -1815,6 +1815,9 @@ def _extract_create_ppt_topic(user_input: str) -> Optional[str]:
             return None
 
     patterns = [
+        r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slides?\s+(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
+        r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slide\s+(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
+        r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slides?\s+(?:on|about|for)\s+(.+)$",
         r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
         r"\b(?:make|create|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:ppt|presentation|deck)\s+(.+)$",
         r"\b(?:ppt|presentation|deck)\s*(?:on|about|for)\s+(.+)$",
@@ -1831,6 +1834,12 @@ def _extract_create_ppt_topic(user_input: str) -> Optional[str]:
     topic = re.sub(r"\bwith\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
     topic = re.sub(r"\bfor\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
     topic = re.sub(r"\b(?:including|containing)\s+\d+\s+slides?\b.*$", "", topic, flags=re.IGNORECASE).strip()
+    topic = re.sub(
+        r"^\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slides?\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    ).strip()
     topic = re.split(
         r"(?i)\b(?:add\s+below\s+content|include\s+below\s+content|content\s*:|with\s+content|add\s+content|include\s+content)\b",
         topic,
@@ -1910,12 +1919,12 @@ def _handle_create_request(prompt: str) -> bool:
 def _extract_slide_count_from_text(user_input: str) -> Optional[int]:
     text = user_input or ""
     patterns = [
-        r"\b(?:with|of|for)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s+slides?\b",
-        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)\s+slides?\b",
+        r"\b(?:with|of|for|only)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slides?\b",
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)[\s-]+slides?\b",
         r"\bslide\s+(\d+)\b",
         r"\bslides?\s+of\s+(\d+)\b",
-        r"\b(\d+)\s+slide(?:s)?\b",
-        r"\b(\d+)\s+slide(?:s)?\s+(?:presentation|ppt|deck)\b",
+        r"\b(\d+)[\s-]+slide(?:s)?\b",
+        r"\b(\d+)[\s-]+slide(?:s)?\s+(?:presentation|ppt|deck)\b",
     ]
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -2375,7 +2384,7 @@ def reasoning_layer(user_input: str, state: dict) -> dict:
         )
 
     elif re.search(
-        r"\b(?:speaker notes?|speaker script|slide script|script for each|short script|"
+        r"\b(?:speaker notes?|speaker script|slide script|script for each|short script|slide by slide"
         r"audience question|questions? audience|audience.*questions?|q\s*&?\s*a|"
         r"2[\s-]minute speech|two[\s-]minute|summarize.*speech|summary.*speech|"
         r"interactive question|question per slide|like i.m present|presenting|"
@@ -4738,11 +4747,16 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     if intent == "view_slide":
         ppt_ref = slots.get("ppt_ref")
         if ppt_ref:
-            best_id, clarification = find_ppt_semantically(str(ppt_ref), disambiguate=True)
-            if clarification:
-                return clarification, False
+            explicit_item = _resolve_ppt_history_item(str(ppt_ref))
+            best_id = explicit_item.get("id") if explicit_item else None
+            if not best_id:
+                best_id, clarification = find_ppt_semantically(str(ppt_ref), disambiguate=True)
+                if clarification:
+                    return clarification, False
             if best_id and best_id != st.session_state.get("current_ppt_id"):
                 switch_active_ppt(best_id)
+            elif ppt_ref and not best_id:
+                return f"I couldn't find {_ppt_display_label(str(ppt_ref))}. Try `ppt 1`, `ppt 2`, or the deck title.", False
         current_outline = _current_outline_payload()
         if not current_outline or not current_outline.get("slides"):
             return "No presentation is currently active. Please create or switch to a presentation first.", False
@@ -4752,10 +4766,10 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         except (ValueError, TypeError):
             return "Please provide a valid slide number to view.", False
         slides_local = current_outline.get("slides", [])
-        if not (1 <= slide_num <= len(slides_local)):
-            return f"Slide {slide_num} does not exist. The deck has {len(slides_local)} slide(s).", False
-        slide = slides_local[slide_num - 1] if isinstance(slides_local[slide_num - 1], dict) else {}
         ppt_label = _ppt_display_label(st.session_state.get("current_ppt_id"))
+        if not (1 <= slide_num <= len(slides_local)):
+            return f"Slide {slide_num} does not exist in {ppt_label}. This presentation only has {len(slides_local)} slide(s).", False
+        slide = slides_local[slide_num - 1] if isinstance(slides_local[slide_num - 1], dict) else {}
         return _format_slide_view(slide, slide_num, ppt_label), True
 
     if intent == "explain_slide":
@@ -6042,6 +6056,17 @@ if prompt is not None:
     with st.chat_message("user"):
         st.markdown(prompt)
     add_message("user", prompt)
+    with st.chat_message("assistant"):
+        st.markdown(
+            """
+            <div style="display:flex;align-items:center;gap:.55rem;color:#6b7280;font-size:.95rem;margin:.2rem 0 .6rem;">
+              <span style="width:14px;height:14px;border:2px solid #d1d5db;border-top-color:#4f46e5;border-radius:50%;display:inline-block;animation:pptSpin .8s linear infinite;"></span>
+              <span>Thinking...</span>
+            </div>
+            <style>@keyframes pptSpin{to{transform:rotate(360deg)}}</style>
+            """,
+            unsafe_allow_html=True,
+        )
     st.session_state.action_target_ppt_id = None
 
     if _is_cancel_command(prompt):
@@ -6087,6 +6112,34 @@ if prompt is not None:
         handled = _handle_create_request(prompt)
         if handled:
             st.stop()
+
+    cancelled_create = st.session_state.get("last_cancelled_create") or {}
+    recovery_slide_count = _extract_slide_count_from_text(prompt)
+    if (
+        cancelled_create.get("topic")
+        and recovery_slide_count
+        and re.search(r"\b(?:generate|create|make|build)\b", prompt, re.IGNORECASE)
+    ):
+        topic = cancelled_create.get("topic")
+        sections = cancelled_create.get("sections")
+        theme_colors = cancelled_create.get("theme_colors") or extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(topic)
+        st.session_state["last_cancelled_create"] = None
+        if int(recovery_slide_count) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+            question = _slide_limit_confirmation_question(int(recovery_slide_count))
+            pending = {
+                "intent": "confirm_large_slide_count",
+                "target_intent": "create_ppt",
+                "slots": {"topic": topic, "slide_count": int(recovery_slide_count), "sections": sections, "theme_colors": theme_colors},
+                "next_question": question,
+                "action": "confirm",
+            }
+            _store_pending_action(pending)
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+        generate_outline_and_reply(topic, int(recovery_slide_count), st.session_state.tone, sections, theme_colors)
+        st.stop()
 
     # If we're waiting for the slide count of a newly requested deck, keep
     # that flow pinned until the user answers or cancels.
@@ -6328,7 +6381,40 @@ if prompt is not None:
         st.rerun()
 
     if pending_state.get("intent") == "confirm_large_slide_count":
+        slots = dict(pending_state.get("slots", {}))
+        target_intent = pending_state.get("target_intent") or "create_ppt"
+        revised_count = _extract_slide_count_from_text(routing_prompt)
+        original_count = slots.get("slide_count") or slots.get("target_count")
+        if target_intent == "create_ppt" and revised_count and int(revised_count) != int(original_count or 0):
+            slots["slide_count"] = int(revised_count)
+            _clear_pending_turn_state()
+            if int(revised_count) > _MAX_SLIDES_WITHOUT_CONFIRMATION:
+                question = _slide_limit_confirmation_question(int(revised_count))
+                pending = {
+                    "intent": "confirm_large_slide_count",
+                    "target_intent": "create_ppt",
+                    "slots": slots,
+                    "next_question": question,
+                    "action": "confirm",
+                }
+                _store_pending_action(pending)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
+            result_msg, success = execute_action("create_ppt", slots, slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            if success:
+                st.rerun()
         if _is_cancel_command(routing_prompt) or _is_negative_command(routing_prompt):
+            if target_intent == "create_ppt" and slots.get("topic"):
+                st.session_state["last_cancelled_create"] = {
+                    "topic": slots.get("topic"),
+                    "sections": slots.get("sections"),
+                    "theme_colors": slots.get("theme_colors"),
+                }
             _clear_pending_turn_state()
             reply = "Okay, I cancelled that request."
             with st.chat_message("assistant"):
@@ -6336,8 +6422,6 @@ if prompt is not None:
             add_message("assistant", reply)
             st.rerun()
         if _is_affirmative_command(routing_prompt):
-            slots = dict(pending_state.get("slots", {}))
-            target_intent = pending_state.get("target_intent") or "create_ppt"
             _clear_pending_turn_state()
             if target_intent == "bulk_resize":
                 target_count = int(slots.get("target_count") or slots.get("slide_count") or 0)
@@ -6778,6 +6862,10 @@ if prompt is not None:
                 st.markdown(full_msg)
             add_message("assistant", full_msg)
             st.rerun()
+        with st.chat_message("assistant"):
+            st.markdown(result_msg)
+        add_message("assistant", result_msg)
+        st.rerun()
 
     if direct_intent == "explain_slide":
         slide_num = reasoned.get("slide_id")
@@ -7448,7 +7536,9 @@ if prompt is not None:
                 st.markdown(reply)
             add_message("assistant", reply)
             st.rerun()
-        reply = f"Slide {slide_num if slide_num is not None else '?'} does not exist in {_ppt_display_label(st.session_state.get('current_ppt_id'))}."
+        slide_label = slide_num if slide_num is not None else "?"
+        ppt_label = _ppt_display_label(st.session_state.get("current_ppt_id"))
+        reply = f"Slide {slide_label} does not exist in {ppt_label}. This presentation only has {len(slides_local)} slide(s)."
         with st.chat_message("assistant"):
             st.markdown(reply)
         add_message("assistant", reply)
