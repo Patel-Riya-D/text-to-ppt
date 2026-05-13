@@ -450,6 +450,63 @@ def record_usage(kind: str, usage: dict):
         totals[k] += int(usage.get(k, 0) or 0)
     st.session_state.last_usage = {"kind": kind, **usage}
 
+def _is_placeholder_slide_title(title: str, idx: Optional[int] = None) -> bool:
+    cleaned = _safe_str(title, "").strip()
+    norm = _norm_text(cleaned)
+    placeholders = {"", "slide", "untitled", "untitled slide", "title", "new slide"}
+    if norm in placeholders:
+        return True
+    if re.fullmatch(r"slide\s*\d+", norm):
+        if idx is None:
+            return True
+        return norm == f"slide {idx}"
+    return False
+
+def _derive_meaningful_slide_title(slide: dict, idx: int = 1) -> str:
+    if not isinstance(slide, dict):
+        return "Key Takeaways"
+    layout = _safe_str(slide.get("layout", "bullets"), "bullets").lower()
+    if layout == "section_index":
+        return "Contents"
+    if layout == "title_cover":
+        topic = _safe_str(st.session_state.get("topic", ""), "")
+        return topic or "Executive Overview"
+    if layout == "table":
+        cols = flatten_slide_content(slide.get("table_columns", []))
+        if len(cols) >= 3:
+            return f"{cols[1]} vs {cols[2]}"
+        return "Comparison Overview"
+    if layout == "two_column":
+        left = _safe_str(slide.get("left_title", ""), "")
+        right = _safe_str(slide.get("right_title", ""), "")
+        if left and right and _norm_text(left) not in {"left", "key points"}:
+            return f"{left} vs {right}" if _norm_text(right) not in {"right", "supporting points"} else left
+    if layout == "timeline":
+        steps = [s for s in (slide.get("steps", []) or []) if isinstance(s, dict)]
+        if steps:
+            return _safe_str(steps[0].get("label", ""), "") or "Roadmap"
+        return "Roadmap"
+    if layout == "icon_grid":
+        items = [g for g in (slide.get("grid_items", []) or []) if isinstance(g, dict)]
+        if items:
+            title = _safe_str(items[0].get("title", ""), "")
+            if title:
+                return title[:60]
+        return "Key Pillars"
+    candidates = []
+    candidates.extend(flatten_slide_content(slide.get("content", [])))
+    candidates.extend(flatten_slide_content(slide.get("left_points", [])))
+    candidates.extend(flatten_slide_content(slide.get("right_points", [])))
+    for raw in candidates:
+        text = clean_icon_tokens(_safe_str(raw, ""))
+        text = re.split(r"[:.;|–-]", text, maxsplit=1)[0].strip()
+        words = [w for w in text.split() if w]
+        if 2 <= len(words) <= 7:
+            return " ".join(words)[:64]
+        if len(words) > 7:
+            return " ".join(words[:6])[:64]
+    return "Key Takeaways"
+
 def ensure_editor_id(slide: dict) -> dict:
     slide = dict(slide or {})
     slide.setdefault("_editor_id", uuid4().hex)
@@ -465,6 +522,8 @@ def ensure_editor_id(slide: dict) -> dict:
         slide["content"] = flatten_slide_content(slide["content"])
     if not isinstance(slide["style"], dict):
         slide["style"] = {}
+    if _is_placeholder_slide_title(slide.get("title", ""), None):
+        slide["title"] = _derive_meaningful_slide_title(slide, 1)
     return slide
 
 def normalize_slide(slide: dict) -> dict:
@@ -832,6 +891,17 @@ def render_inline_preview(slides: list, label: str = "", ppt_bytes: bytes = None
                     st.markdown("**Key Points**")
                     for item in extra:
                         st.markdown(f"- {item}")
+            elif layout == "table":
+                cols = flatten_slide_content(slide.get("table_columns", []))
+                rows = [
+                    [_safe_str(cell, "") for cell in row]
+                    for row in (slide.get("table_rows", []) or [])
+                    if isinstance(row, list)
+                ]
+                if cols and rows:
+                    st.table([dict(zip(cols, row + [""] * max(0, len(cols) - len(row)))) for row in rows])
+                elif cols:
+                    st.caption("No table rows yet.")
     if ppt_bytes is not None:
         dl_key = f"dl_{key_suffix}" if key_suffix else f"dl_{abs(hash(ppt_filename + str(len(slides))))}"
         st.download_button(
@@ -2015,6 +2085,33 @@ def _is_add_slide_request(user_input: str) -> bool:
         text,
         re.IGNORECASE,
     ))
+
+def _is_new_structured_slide_request(user_input: str) -> bool:
+    """
+    Treat "add a comparison table/chart" as a request for a new slide unless
+    the user explicitly targets an existing slide.
+    """
+    text = _safe_str(user_input, "")
+    if not text:
+        return False
+    if re.search(r"\b(?:to|on|in|into|within|for)\s+(?:the\s+)?slide\s*#?\d+\b", text, re.IGNORECASE):
+        return False
+    if re.search(r"\bslide\s*#?\d+\b", text, re.IGNORECASE) and not re.search(r"\b(?:after|before)\s+slide\s*#?\d+\b", text, re.IGNORECASE):
+        return False
+    return bool(re.search(
+        r"\b(?:add|insert|create|make|build|generate)\b.{0,40}\b(?:comparison\s+table|table|chart|graph|matrix)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+def _structured_slide_content_from_request(user_input: str) -> str:
+    text = _safe_str(user_input, "").strip()
+    left, right = _extract_comparison_subjects(text, None)
+    if re.search(r"\bcomparison|compare|vs|versus\b", text, re.IGNORECASE):
+        return f"comparison table between {left} and {right}"
+    if re.search(r"\bchart|graph\b", text, re.IGNORECASE):
+        return text
+    return text or "structured table"
 
 def _is_bare_edit_slide_request(user_input: str) -> bool:
     text = user_input or ""
@@ -3782,6 +3879,46 @@ def _append_unique_table_row(rows: list[list[str]], row: list[str]) -> list[list
         rows.append(cleaned)
     return rows
 
+def _extract_comparison_subjects(text: str, slide: Optional[dict] = None) -> tuple[str, str]:
+    source = _safe_str(text, "")
+    patterns = [
+        r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:$|[,.?;])",
+        r"\bcompare\s+(.+?)\s+(?:and|with|vs|versus)\s+(.+?)(?:$|[,.?;])",
+        r"\b(.+?)\s+(?:vs|versus)\s+(.+?)(?:$|[,.?;])",
+    ]
+    for pat in patterns:
+        m = re.search(pat, source, re.IGNORECASE)
+        if not m:
+            continue
+        left = re.sub(r"(?i)\b(?:a|an|the|one|comparison|table|chart|slide|between|compare)\b", "", m.group(1)).strip(" ,.;:-")
+        right = re.sub(r"(?i)\b(?:a|an|the|one|comparison|table|chart|slide)\b", "", m.group(2)).strip(" ,.;:-")
+        if left and right:
+            return left[:40], right[:40]
+    title = _safe_str((slide or {}).get("title", ""), "")
+    if re.search(r"\b(?:vs|versus)\b", title, re.IGNORECASE):
+        left, right = re.split(r"\b(?:vs|versus)\b", title, maxsplit=1, flags=re.IGNORECASE)
+        if left.strip() and right.strip():
+            return left.strip()[:40], right.strip()[:40]
+    return "Option A", "Option B"
+
+def _build_comparison_table_rows(left: str, right: str, topic_hint: str = "") -> list[list[str]]:
+    l_norm = _norm_text(left)
+    r_norm = _norm_text(right)
+    if {"ml", "machine learning"} & {l_norm, r_norm} or "machine learning" in f"{l_norm} {r_norm}" or "deep learning" in f"{l_norm} {r_norm}":
+        return [
+            ["Core idea", "Learns patterns from structured features", "Uses layered neural networks to learn representations"],
+            ["Data needs", "Works well with moderate, prepared datasets", "Usually needs large datasets for strong results"],
+            ["Feature work", "Often depends on manual feature engineering", "Learns features automatically from raw data"],
+            ["Best fit", "Forecasting, scoring, classification, and tabular tasks", "Images, speech, language, and complex perception tasks"],
+            ["Explainability", "Often easier to inspect and explain", "Can be harder to interpret without special tools"],
+        ]
+    return [
+        ["Definition", f"How {left} is typically understood", f"How {right} is typically understood"],
+        ["Strength", f"Where {left} performs best", f"Where {right} performs best"],
+        ["Limitation", f"Main constraint for {left}", f"Main constraint for {right}"],
+        ["Use case", f"Practical example for {left}", f"Practical example for {right}"],
+    ]
+
 def _llm_layout_aware_restructure(slide: dict, change_content: str) -> Optional[dict]:
     """
     Optional fallback: ask LLM for a structured rewrite of the CURRENT slide only.
@@ -3843,18 +3980,18 @@ def _apply_layout_aware_update(slide: dict, change_content: str) -> bool:
     wants_examples = bool(re.search(r"\b(real[\s-]?world examples?|case studi(?:es|y)|examples?)\b", low))
 
     if layout == "table" or wants_comparison:
+        left_subject, right_subject = _extract_comparison_subjects(text, slide)
         cols = _dedupe_preserve_order(flatten_slide_content(slide.get("table_columns", [])))
         rows = [list(r) for r in (slide.get("table_rows", []) or []) if isinstance(r, list)]
         if wants_adv_dis:
             cols = ["Category", "Advantages", "Disadvantages"]
             rows = _append_unique_table_row(rows, ["Performance", "Fast and efficient on standard tasks", "May underperform on very complex patterns"])
             rows = _append_unique_table_row(rows, ["Interpretability", "Usually easier to interpret", "Can oversimplify nuanced relationships"])
-        elif wants_comparison and len(cols) < 3:
-            cols = ["Aspect", "Option A", "Option B"]
+        elif wants_comparison:
+            cols = ["Aspect", left_subject, right_subject]
+            rows = _build_comparison_table_rows(left_subject, right_subject, text)
         if wants_examples:
-            label = f"Example {len(rows) + 1}"
-            filler = ["Real-world usage example"] * max(1, len(cols) - 1)
-            rows = _append_unique_table_row(rows, [label] + filler)
+            rows = _append_unique_table_row(rows, ["Real-world example", f"Common use of {left_subject} in business workflows", f"Common use of {right_subject} in complex perception or language tasks"])
         if not rows and slide.get("content"):
             for line in flatten_slide_content(slide.get("content", [])):
                 if "|" in line:
@@ -3864,9 +4001,11 @@ def _apply_layout_aware_update(slide: dict, change_content: str) -> bool:
         if not cols:
             cols = ["Aspect", "Option A", "Option B"]
         slide["layout"] = "table"
+        if _is_placeholder_slide_title(slide.get("title", ""), None):
+            slide["title"] = f"{left_subject} vs {right_subject}"
         slide["table_columns"] = cols
         slide["table_rows"] = rows[:8]
-        slide["content"] = [f"{' | '.join(cols)}"] + [" | ".join([_safe_str(c, "") for c in r]) for r in slide["table_rows"]]
+        slide["content"] = []
         slide["_user_modified"] = True
         return before != _slide_point_state(slide)
 
@@ -4109,6 +4248,111 @@ def _expand_existing_deck_slides(slides: list, target_count: int) -> tuple[list,
     updated = base + additions[:need_add]
     updated = refresh_section_index_slide(updated)
     return updated, min(len(additions), need_add)
+
+def _is_structural_slide(slide: dict) -> bool:
+    layout = _safe_str((slide or {}).get("layout", ""), "").lower()
+    return layout in {"title_cover", "section_index"} or _slide_looks_like_thank_you(slide)
+
+def _condense_existing_deck_slides(slides: list, target_count: int) -> tuple[list, int]:
+    """
+    Reduce the deck to an exact target count by preserving bookend slides and
+    merging/removing the least essential body slides.
+    """
+    base = [copy.deepcopy(s) for s in (slides or []) if isinstance(s, dict)]
+    target = max(1, int(target_count or 1))
+    if target >= len(base):
+        return base, 0
+    if target == 1:
+        body_points = []
+        for slide in base:
+            if _slide_looks_like_thank_you(slide):
+                continue
+            title = _safe_str(slide.get("title", ""), "")
+            for point in flatten_slide_content(slide.get("content", []))[:2]:
+                if point:
+                    body_points.append(f"{title}: {point}".strip(": "))
+        summary = {
+            "title": _safe_str(st.session_state.get("topic", ""), "") or "Executive Summary",
+            "subtitle": "Condensed presentation",
+            "layout": "bullets",
+            "icon": "▸",
+            "content": _dedupe_preserve_order(body_points)[:6],
+            "style": {},
+            "_user_modified": True,
+        }
+        return [normalize_slide(summary)], max(0, len(base) - 1)
+
+    title_slide = base[0] if base else None
+    thank_slide = base[-1] if base and _slide_looks_like_thank_you(base[-1]) else None
+    body_start = 1 if title_slide and _safe_str(title_slide.get("layout", "")).lower() == "title_cover" else 0
+    body_end = len(base) - (1 if thank_slide else 0)
+    body = [
+        s for i, s in enumerate(base[body_start:body_end], start=body_start)
+        if _safe_str(s.get("layout", "")).lower() != "section_index"
+    ]
+
+    reserved = []
+    if title_slide:
+        reserved.append(title_slide)
+    if thank_slide and target > len(reserved) + 1:
+        tail = [thank_slide]
+    else:
+        tail = []
+    body_slots = max(0, target - len(reserved) - len(tail))
+    if body_slots <= 0:
+        condensed = (reserved + tail)[:target]
+        return refresh_section_index_slide(condensed), len(base) - len(condensed)
+
+    work = copy.deepcopy(body)
+    topic_hint = _safe_str(st.session_state.get("topic", ""), "Presentation")
+    while len(work) > body_slots:
+        # Merge neighboring body slides to preserve flow instead of dropping
+        # content abruptly.
+        merge_idx = max(0, len(work) - 2)
+        if merge_idx + 1 < len(work):
+            work[merge_idx] = merge_slide_payloads(work[merge_idx], work[merge_idx + 1], topic=topic_hint)
+            del work[merge_idx + 1]
+        else:
+            work.pop()
+    work = [_shorten_slide_structure(s) for s in work[:body_slots]]
+    condensed = reserved + work + tail
+    condensed = condensed[:target]
+    condensed = refresh_section_index_slide(condensed)
+    return condensed, len(base) - len(condensed)
+
+def _design_style_for_request(request: str, sub_intent: str = "") -> dict:
+    text = f"{request} {sub_intent}".lower()
+    style = {
+        "pattern_name": "minimal-lines",
+        "surface": "light",
+        "header_variant": "banded",
+        "card_variant": "outline",
+        "footer_variant": "line",
+        "badge_shape": "rect",
+        "accent_rotation": "auto",
+    }
+    if re.search(r"\bdark\b", text):
+        style.update({"pattern_name": "dark-contrast", "surface": "tint", "header_variant": "solid"})
+    elif re.search(r"\bmodern|sleek|minimal|minimalist|clean\b", text):
+        style.update({"pattern_name": "modern-minimal", "surface": "light", "header_variant": "split", "card_variant": "soft"})
+    elif re.search(r"\bbusiness|corporate|professional|investor\b", text):
+        style.update({"pattern_name": "executive-grid", "header_variant": "solid", "card_variant": "outline"})
+    return style
+
+def _apply_design_to_existing_slides(slides: list, request: str = "", sub_intent: str = "") -> list:
+    style = _design_style_for_request(request, sub_intent)
+    updated = []
+    for idx, slide in enumerate(slides or [], start=1):
+        if not isinstance(slide, dict):
+            continue
+        s = copy.deepcopy(slide)
+        existing_style = s.get("style") if isinstance(s.get("style"), dict) else {}
+        s["style"] = {**existing_style, **style}
+        if _is_placeholder_slide_title(s.get("title", ""), idx):
+            s["title"] = _derive_meaningful_slide_title(s, idx)
+        s["_user_modified"] = True
+        updated.append(s)
+    return updated
 
 def _is_bad_expansion_title(title: str, existing_titles: Optional[set[str]] = None) -> bool:
     norm = _norm_text(title)
@@ -4600,7 +4844,14 @@ Example format: ["Topic 1", "Topic 2", "Topic 3", "Topic 4", "Topic 5", "Topic 6
 #  ACTION EXECUTORS
 # ------------------------------------------------------------------------------
 def commit_changes(updated_slides, success_msg):
-    frozen_slides = _dedupe_thank_you_slides(updated_slides)
+    normalized_slides = []
+    for idx, slide in enumerate(updated_slides or [], start=1):
+        if isinstance(slide, dict):
+            s = ensure_editor_id(slide)
+            if _is_placeholder_slide_title(s.get("title", ""), idx):
+                s["title"] = _derive_meaningful_slide_title(s, idx)
+            normalized_slides.append(s)
+    frozen_slides = _dedupe_thank_you_slides(normalized_slides)
     target_id = st.session_state.pop("action_target_ppt_id", None)
     current_id = target_id or st.session_state.get("current_ppt_id")
     if not current_id:
@@ -4690,9 +4941,17 @@ def _slide_signature(slide: dict) -> str:
     ]
     return _norm_text(" ".join(bits))
 
+def _slide_signature_overlap(a: dict, b: dict) -> float:
+    aw = set(_slide_signature(a).split())
+    bw = set(_slide_signature(b).split())
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / max(1, len(aw | bw))
+
 def regenerate_slide_variant(slides: list, slide_num: int) -> dict:
     old_slide = slides[slide_num - 1]
     nearby_titles = [_safe_str(s.get("title", ""), "") for s in slides if isinstance(s, dict)]
+    old_layout = _safe_str(old_slide.get("layout", "bullets"), "bullets")
     prompt = f"""
 Regenerate slide {slide_num} as a genuinely new version while keeping it relevant to the same deck.
 
@@ -4705,6 +4964,8 @@ Deck titles:
 Return ONLY one JSON slide object with title, subtitle, layout, icon, content, style.
 Rules:
 - Do not reuse the same bullet wording.
+- Do not reuse the old title unless it is the only accurate title.
+- Prefer a different layout than "{old_layout}" when the content still fits.
 - Keep the same broad purpose, but change the framing, title, and examples where useful.
 - Use 4-6 concise, plain-English bullets.
 - No markdown, no nested objects in content.
@@ -4724,14 +4985,30 @@ Rules:
         raise ValueError("Invalid regenerated slide JSON")
     data["_user_modified"] = True
     regenerated = normalize_slide(data)
-    if _slide_signature(regenerated) == _slide_signature(old_slide):
+    if _slide_signature(regenerated) == _slide_signature(old_slide) or _slide_signature_overlap(regenerated, old_slide) > 0.72:
         regenerated["title"] = f"Fresh Perspective: {_safe_str(old_slide.get('title', 'Slide'), 'Slide')}"
-        regenerated["content"] = [
-            f"Reframed focus: {_safe_str(old_slide.get('title', 'the topic'), 'the topic')}",
-            "Updated angle with clearer emphasis for the audience.",
-            "New supporting detail to avoid repeating the previous version.",
-            "Sharper takeaway that connects this slide to the deck narrative.",
-        ]
+        regenerated["layout"] = "two_column" if old_layout != "two_column" else "bullets"
+        if regenerated["layout"] == "two_column":
+            regenerated["left_title"] = "New Angle"
+            regenerated["right_title"] = "Audience Takeaway"
+            regenerated["left_points"] = [
+                f"Reframe the topic around {_safe_str(old_slide.get('title', 'the main idea'), 'the main idea')}",
+                "Use a different example or scenario to make the point feel fresh.",
+            ]
+            regenerated["right_points"] = [
+                "Highlight what the audience should notice first.",
+                "End with a clearer decision, implication, or takeaway.",
+            ]
+            regenerated["content"] = []
+        else:
+            regenerated["content"] = [
+                f"Reframed focus: {_safe_str(old_slide.get('title', 'the topic'), 'the topic')}",
+                "Updated angle with clearer emphasis for the audience.",
+                "New supporting detail to avoid repeating the previous version.",
+                "Sharper takeaway that connects this slide to the deck narrative.",
+            ]
+    if _is_placeholder_slide_title(regenerated.get("title", ""), slide_num):
+        regenerated["title"] = _derive_meaningful_slide_title(regenerated, slide_num)
     return regenerated
 
 def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
@@ -4804,7 +5081,7 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         _remember_action_context("explain_slide", slide_num, st.session_state.get("current_ppt_id"), f"Explained slide {slide_num}")
         return explanation, True
 
-    if intent in ("edit_slide", "transform_content", "add_slide", "move_slide", "swap_slides", "merge_slides", "delete_slide", "regenerate_slide", "presentation_mode", "preview_ppt", "download_ppt", "refine_ppt"):
+    if intent in ("edit_slide", "transform_content", "add_slide", "move_slide", "swap_slides", "merge_slides", "delete_slide", "regenerate_slide", "presentation_mode", "preview_ppt", "download_ppt", "refine_ppt", "design_change"):
         if not st.session_state.get("current_ppt_id"):
             return "No presentation is currently active. Please create or switch to a presentation first.", False
         if not current_outline:
@@ -4842,6 +5119,21 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         )
         _remember_action_context("presentation_mode", None, st.session_state.get("current_ppt_id"), "Generated presenter support")
         return reply, not reply.startswith("Presentation coaching failed:")
+
+    elif intent == "design_change":
+        request = slots.get("user_request") or slots.get("change_content") or slots.get("style_hint") or ""
+        source_slides = [_shorten_slide_structure(s) for s in slides] if re.search(
+            r"\b(use less text|less text|shorter|concise|minimal text)\b",
+            request,
+            re.IGNORECASE,
+        ) else slides
+        updated_slides = _apply_design_to_existing_slides(source_slides, request, slots.get("sub_intent") or "")
+        if not updated_slides:
+            return "No active deck found to restyle.", False
+        _remember_action_context("design_change", None, st.session_state.get("current_ppt_id"), "Updated deck design only")
+        commit_changes(updated_slides, "Updated the deck design while preserving the existing slide content and structure.")
+        _clear_transient_conversation_state()
+        return "Updated the deck design while preserving the existing slide content and structure.", True
 
     elif intent == "regenerate_slide":
         slide_num = slots.get("slide_number")
@@ -5411,29 +5703,20 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
         current_id = st.session_state.get("current_ppt_id")
         if not current_id or not _current_outline_payload():
             return "No presentation is currently active. Please open a PPT first.", False
-        item = get_ppt_by_id(current_id) or {}
-        topic = item.get("topic") or st.session_state.get("topic", "Presentation")
-        slide_count = len(slides) if slides else int(st.session_state.get("slide_count") or st.session_state.get("num_slides") or 6)
-        tone_raw = str(slots.get("tone") or st.session_state.get("tone", "Professional")).strip()
-        tone_map = {
-            "casual": "Creative",
-            "friendly": "Creative",
-            "conversational": "Creative",
-            "professional": "Professional",
-            "formal": "Professional",
-            "educational": "Educational",
-            "creative": "Creative",
-        }
-        tone = tone_map.get(tone_raw.lower(), tone_raw if tone_raw in ("Professional", "Creative", "Educational") else st.session_state.get("tone", "Professional"))
-        style_hint = (slots.get("style_hint") or "").strip()
-        sections = st.session_state.get("sections") or ""
-        if style_hint:
-            sections = f"{sections}. {style_hint}".strip(". ")
-        if tone == "Creative" and "casual" not in style_hint.lower():
-            sections = f"{sections}. Make the language a little more conversational.".strip(". ")
-        st.session_state.tone = tone if tone in ["Professional", "Creative", "Educational"] else st.session_state.tone
-        generate_outline_and_reply(topic, slide_count, st.session_state.tone, sections or None, theme_colors=extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(topic), ppt_id=current_id)
-        return "Refreshing the current presentation...", True
+        request = " ".join([
+            _safe_str(slots.get("style_hint", ""), ""),
+            _safe_str(slots.get("change_content", ""), ""),
+            _safe_str(slots.get("user_request", ""), ""),
+        ])
+        if re.search(r"\b(shorter|less text|concise|condense|simpler|remove fluff|key points only|important points only)\b", request, re.IGNORECASE):
+            updated_slides = [_shorten_slide_structure(s) for s in slides]
+            commit_changes(updated_slides, "Tightened the deck content while preserving the existing slide structure.")
+            _clear_transient_conversation_state()
+            return "Tightened the deck content while preserving the existing slide structure.", True
+        updated_slides = _apply_design_to_existing_slides(slides, request, slots.get("sub_intent") or "")
+        commit_changes(updated_slides, "Refined the deck styling while preserving existing slide content and structure.")
+        _clear_transient_conversation_state()
+        return "Refined the deck styling while preserving existing slide content and structure.", True
 
     elif intent == "greeting":
         return "👋 Hello! I'm your PPT assistant. You can ask me to create a new presentation, edit slides, add content, or switch between decks. What would you like to do?", True
@@ -5590,6 +5873,18 @@ Return ONLY valid JSON:
         raise ValueError("Invalid JSON from LLM")
 
 def draft_slide_from_request(user_text: str, slides: list):
+    if re.search(r"\b(comparison|compare|vs|versus|comparison\s+table)\b", user_text or "", re.IGNORECASE):
+        left, right = _extract_comparison_subjects(user_text, None)
+        return {
+            "title": f"{left} vs {right}",
+            "subtitle": "Comparison overview",
+            "layout": "table",
+            "icon": "▸",
+            "content": [],
+            "table_columns": ["Aspect", left, right],
+            "table_rows": _build_comparison_table_rows(left, right, user_text),
+            "style": {},
+        }
     titles = [str(s.get("title", "")).strip() for s in (slides or []) if isinstance(s, dict)]
     prompt = f"""
 Create a single new slide for a presentation.
@@ -5664,6 +5959,9 @@ def request_outline(topic: str, num_slides: int, tone: str, sections=None, theme
         record_usage("outline", usage)
     slides = [ensure_editor_id(s) for s in payload.get("slides", [])]
     slides = enforce_slide_count(slides, num_slides, topic, tone, theme_colors)
+    for idx, slide in enumerate(slides, start=1):
+        if isinstance(slide, dict) and _is_placeholder_slide_title(slide.get("title", ""), idx):
+            slide["title"] = _derive_meaningful_slide_title(slide, idx)
     payload["slides"] = slides
     return payload
 
@@ -5690,9 +5988,13 @@ def enforce_slide_count(slides, required_count, topic, tone, theme_colors=None):
             extra_slides = extra_slides[-missing:]
         if not extra_slides:
             break
-        slides.extend(extra_slides)
+        slides.extend([ensure_editor_id(s) for s in extra_slides])
         attempts += 1
-    return slides[:required_count]
+    trimmed = slides[:required_count]
+    for idx, slide in enumerate(trimmed, start=1):
+        if isinstance(slide, dict) and _is_placeholder_slide_title(slide.get("title", ""), idx):
+            slide["title"] = _derive_meaningful_slide_title(slide, idx)
+    return trimmed
 
 def generate_outline_and_reply(topic: str, count: int, tone: str, sections=None, theme_colors=None, ppt_id: Optional[str] = None):
     with st.spinner(f"✍️ Building {count}-slide deck on '{topic}'…"):
@@ -6426,7 +6728,11 @@ if prompt is not None:
             if target_intent == "bulk_resize":
                 target_count = int(slots.get("target_count") or slots.get("slide_count") or 0)
                 if target_count <= len(slides):
-                    result_msg = f"The current deck already has {len(slides)} slides. Please choose a larger number than {len(slides)} to expand."
+                    updated_slides, removed = _condense_existing_deck_slides(slides, target_count)
+                    if removed > 0 and len(updated_slides) == target_count:
+                        commit_changes(updated_slides, f"Condensed the deck to {len(updated_slides)} slides.")
+                        st.stop()
+                    result_msg = f"I could not condense this deck to {target_count} slides automatically."
                     success = False
                 else:
                     updated_slides, added = _expand_existing_deck_slides(slides, target_count)
@@ -6521,6 +6827,72 @@ if prompt is not None:
         add_message("assistant", question)
         st.rerun()
 
+    if _is_new_structured_slide_request(routing_prompt):
+        _clear_pending_turn_state()
+        slots = {
+            "slide_content": _structured_slide_content_from_request(routing_prompt),
+            "content": _structured_slide_content_from_request(routing_prompt),
+        }
+        position_candidate = _extract_add_slide_position(routing_prompt, slides)
+        if position_candidate is not None:
+            slots["position"] = position_candidate
+        missing_slots = []
+        if not slots.get("slide_content"):
+            missing_slots.append("slide_content")
+        if slots.get("position") is None:
+            missing_slots.append("position")
+        if not missing_slots:
+            result_msg, success = execute_action("add_slide", slots, slides)
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            if success:
+                st.rerun()
+        followup = _polish_next_question(routing_prompt, "add_slide", slots, missing_slots, None)
+        st.session_state.pending_intent = {
+            "intent": "add_slide",
+            "slots": slots,
+            "missing_slots": missing_slots,
+            "next_question": followup,
+            "action": "ask",
+        }
+        st.session_state.pending_action = st.session_state.pending_intent
+        with st.chat_message("assistant"):
+            st.markdown(followup)
+        add_message("assistant", followup)
+        st.rerun()
+
+    if direct_intent == "design_change":
+        _clear_pending_turn_state()
+        slots = {
+            "user_request": routing_prompt,
+            "change_content": routing_prompt,
+            "sub_intent": reasoned.get("sub_intent"),
+        }
+        result_msg, success = execute_action("design_change", slots, slides)
+        with st.chat_message("assistant"):
+            st.markdown(result_msg)
+        add_message("assistant", result_msg)
+        if success:
+            st.rerun()
+
+    structured_target = None
+    if direct_intent == "unknown" and _needs_layout_aware_update(routing_prompt, None):
+        structured_target = (
+            _extract_explicit_slide_number_from_text(routing_prompt)
+        )
+        if structured_target is not None:
+            _clear_pending_turn_state()
+            result_msg, success = execute_action(
+                "edit_slide",
+                {"slide_number": structured_target, "change_content": routing_prompt},
+                slides,
+            )
+            with st.chat_message("assistant"):
+                st.markdown(result_msg)
+            add_message("assistant", result_msg)
+            st.rerun()
+
     if direct_intent == "unknown":
         reply = reasoned.get("clarification_question") or "What would you like me to do with the presentation?"
         with st.chat_message("assistant"):
@@ -6600,12 +6972,20 @@ if prompt is not None:
                     st.markdown(reply)
                 add_message("assistant", reply)
                 st.rerun()
-            if target_count <= len(slides):
-                reply = f"The current deck already has {len(slides)} slides. Please choose a larger number than {len(slides)} to expand."
-                with st.chat_message("assistant"):
-                    st.markdown(reply)
-                add_message("assistant", reply)
-                st.rerun()
+            if target_count < len(slides):
+                updated_slides, removed = _condense_existing_deck_slides(slides, int(target_count))
+                if removed <= 0 or len(updated_slides) != int(target_count):
+                    reply = f"I could not condense this deck to {target_count} slides automatically."
+                    with st.chat_message("assistant"):
+                        st.markdown(reply)
+                    add_message("assistant", reply)
+                    st.rerun()
+                commit_changes(updated_slides, f"Condensed the deck to {len(updated_slides)} slides.")
+                st.stop()
+            if target_count == len(slides):
+                updated_slides = [_shorten_slide_structure(s) for s in slides]
+                commit_changes(updated_slides, f"Kept the deck at {len(updated_slides)} slides and tightened the slide content.")
+                st.stop()
             updated_slides, added = _expand_existing_deck_slides(slides, int(target_count))
             if added <= 0:
                 reply = "I could not expand this deck automatically. Try a slightly larger target or ask to expand specific slides."
@@ -6615,7 +6995,11 @@ if prompt is not None:
                 st.rerun()
             commit_changes(updated_slides, f"Expanded the deck to {len(updated_slides)} slides by splitting existing content.")
             st.stop()
-        reply = "I can handle deck-wide updates like resize. Please specify the target, for example: expand this PPT to 10 slides."
+        if sub_intent in {"shorten", "simplify"} or re.search(r"\b(shorten|condense|simplify|compress|less text|concise)\b", routing_prompt, re.IGNORECASE):
+            updated_slides = [_shorten_slide_structure(s) for s in slides]
+            commit_changes(updated_slides, "Tightened the deck content while preserving the slide count.")
+            st.stop()
+        reply = "I can handle deck-wide updates like resize. Please specify the target, for example: shorten this PPT to 5 slides."
         with st.chat_message("assistant"):
             st.markdown(reply)
         add_message("assistant", reply)
@@ -6915,7 +7299,7 @@ if prompt is not None:
             st.rerun()
 
     if direct_intent == "regenerate_slide":
-        slide_num = reasoned.get("slide_id") or _extract_explicit_slide_number_from_text(routing_prompt)
+        slide_num = reasoned.get("slide_id") or _extract_explicit_slide_number_from_text(routing_prompt) or _resolve_slide_reference_text(routing_prompt, slides)
         if slide_num is None:
             reply = "Which slide should I regenerate?"
             with st.chat_message("assistant"):
@@ -7594,25 +7978,13 @@ if prompt is not None:
         current_id = st.session_state.get("current_ppt_id")
         current_item = get_ppt_by_id(current_id) if current_id else None
         if current_item:
-            current_topic = current_item.get("topic") or st.session_state.get("topic", "Presentation")
-            current_count = len(current_item.get("outline_payload", {}).get("slides", []) or []) or int(st.session_state.get("slide_count") or st.session_state.get("num_slides") or 6)
-            tone_hint = refinement.get("tone")
-            if tone_hint and tone_hint in ("Professional", "Creative", "Educational"):
-                st.session_state.tone = tone_hint
-            style_hint = refinement.get("style_hint") or ""
-            sections = st.session_state.get("sections") or ""
-            if style_hint:
-                sections = f"{sections}. {style_hint}".strip(". ")
-            if tone_hint == "Creative" and "conversational" not in style_hint.lower():
-                sections = f"{sections}. Make the language conversational and easy to read.".strip(". ")
-            generate_outline_and_reply(
-                current_topic,
-                current_count,
-                st.session_state.tone,
-                sections or None,
-                theme_colors=extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(current_topic),
-                ppt_id=current_id,
-            )
+            style_hint = refinement.get("style_hint") or routing_prompt
+            if re.search(r"\b(shorter|less text|concise|condense|simpler|remove fluff|key points only|important points only)\b", routing_prompt, re.IGNORECASE):
+                updated_slides = [_shorten_slide_structure(s) for s in slides]
+                commit_changes(updated_slides, "Tightened the deck content while preserving the existing slide structure.")
+                st.stop()
+            updated_slides = _apply_design_to_existing_slides(slides, style_hint, refinement.get("tone") or "")
+            commit_changes(updated_slides, "Updated the deck styling while preserving existing slide content and structure.")
             st.stop()
 
     # 🔧 FIX 3: Override for "add point in slide X" – force edit_slide

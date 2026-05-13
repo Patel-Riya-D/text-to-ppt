@@ -431,6 +431,8 @@ def _norm_text(v):
 def _looks_like_prompt_title(title: str, topic: str) -> bool:
     tt = _norm_text(title)
     tp = _norm_text(topic)
+    if not tt or re.fullmatch(r"slide\s*\d+", tt) or tt in {"slide", "untitled", "untitled slide", "title", "new slide"}:
+        return True
     if not tt or not tp: return False
     if tt == tp: return True
     if tp in tt and len(tp) >= max(12, int(len(tt) * 0.6)): return True
@@ -467,7 +469,14 @@ def _fallback_slide_title(slide: dict, idx: int) -> str:
         first = re.split(r"[:.;-]", content[0], maxsplit=1)[0].strip()
         words = first.split()
         if 1 <= len(words) <= 6: return first
-    return f"Slide {idx}"
+        if len(words) > 6:
+            return " ".join(words[:6])
+    if layout == "table":
+        cols = _safe_list(slide.get("table_columns", []))
+        if len(cols) >= 3:
+            return f"{cols[1]} vs {cols[2]}"
+        return "Comparison Overview"
+    return "Key Takeaways"
 
 def _usage_dict(usage):
     if not usage: return None
