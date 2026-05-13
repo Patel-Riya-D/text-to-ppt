@@ -18,6 +18,18 @@ from backend.services.intelligence_layer import (
     _natural_success_message,
 )
 from backend.services.intent_classifier import classify_ppt_intent
+from backend.services.assistant_orchestrator import (
+    create_topic_followup as orchestrator_create_topic_followup,
+    extract_conversational_create_topic as orchestrator_extract_conversational_create_topic,
+    has_explicit_deterministic_command as orchestrator_has_explicit_deterministic_command,
+    is_contextual_followup_candidate as orchestrator_is_contextual_followup_candidate,
+    is_generic_presentation_context as orchestrator_is_generic_presentation_context,
+    is_implicit_create_request as orchestrator_is_implicit_create_request,
+    is_readonly_conversation_request as orchestrator_is_readonly_conversation_request,
+    pre_route_message,
+    resolve_contextual_intent as orchestrator_resolve_contextual_intent,
+    resolve_open_conversation as orchestrator_resolve_open_conversation,
+)
 from backend.services.ppt_service import generate_slide_content, merge_slides as merge_slide_payloads
 
 _client = AzureOpenAI(
@@ -306,6 +318,7 @@ def init_state():
         "last_build_error": None,
         "active_topic_domain": "",
         "pending_topic_switch": None,
+        "conversation_objects": {},
         "session_memory":  {"ppts": [], "current_ppt": None},
         "active_edit_context": None,
         "conversation_state": {
@@ -408,6 +421,253 @@ def _build_context_badge() -> str:
 
 def add_message(role, content):
     st.session_state.messages.append({"role": role, "content": content})
+
+def _conversation_objects() -> dict:
+    objects = st.session_state.get("conversation_objects")
+    if not isinstance(objects, dict):
+        objects = {}
+        st.session_state["conversation_objects"] = objects
+    return objects
+
+def _remember_conversation_object(key: str, value: dict) -> None:
+    if not key or not isinstance(value, dict):
+        return
+    objects = _conversation_objects()
+    objects[key] = copy.deepcopy(value)
+    st.session_state["conversation_objects"] = objects
+
+def _extract_numbered_suggestions(text: str) -> list[dict]:
+    suggestions = []
+    for line in str(text or "").splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        match = re.match(r"^(?:[-*]\s*)?(?:(\d+)[\.\)]\s+)?(.+)$", cleaned)
+        if not match:
+            continue
+        body = re.sub(r"^\*\*(.+?)\*\*:?\s*", r"\1: ", match.group(2).strip())
+        if len(body.split()) < 3:
+            continue
+        if not match.group(1) and not re.match(r"^[-*]\s+", cleaned):
+            continue
+        suggestions.append({
+            "index": int(match.group(1) or len(suggestions) + 1),
+            "type": "suggestion",
+            "content": body,
+        })
+    return suggestions[:8]
+
+def _remember_answer_objects(user_input: str, answer: str, target_slide: Optional[int] = None) -> None:
+    answer = _safe_str(answer, "")
+    if not answer:
+        return
+    suggestions = _extract_numbered_suggestions(answer)
+    if suggestions:
+        for item in suggestions:
+            item["slide_number"] = target_slide
+            item["source_user_input"] = user_input
+        _remember_conversation_object("last_suggestions", {"type": "suggestion_list", "items": suggestions})
+        _remember_conversation_object("last_suggestion", suggestions[-1])
+    _remember_conversation_object(
+        "last_generated_content",
+        {
+            "type": "assistant_answer",
+            "content": answer,
+            "slide_number": target_slide,
+            "source_user_input": user_input,
+        },
+    )
+
+def _ordinal_to_int(value: str) -> Optional[int]:
+    text = _safe_str(value, "").lower()
+    words = {
+        "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+        "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    }
+    if text in words:
+        return words[text]
+    match = re.match(r"(\d+)(?:st|nd|rd|th)?$", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+def _selected_suggestion_from_text(user_input: str) -> Optional[dict]:
+    text = _safe_str(user_input, "")
+    match = re.search(
+        r"\b((?:\d+)(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+suggestion\b",
+        text,
+        re.IGNORECASE,
+    )
+    idx = _ordinal_to_int(match.group(1)) if match else None
+    objects = _conversation_objects()
+    suggestions = (objects.get("last_suggestions") or {}).get("items") or []
+    if idx and 1 <= idx <= len(suggestions):
+        selected = copy.deepcopy(suggestions[idx - 1])
+        _remember_conversation_object("selected_recommendation", selected)
+        return selected
+    if re.search(r"\b(?:that|this|the|last)\s+suggestion\b", text, re.IGNORECASE):
+        suggestion = objects.get("last_suggestion")
+        return copy.deepcopy(suggestion) if isinstance(suggestion, dict) else None
+    return None
+
+def _resolve_referenced_content(user_input: str) -> Optional[dict]:
+    selected = _selected_suggestion_from_text(user_input)
+    if selected:
+        return selected
+    if not re.search(r"\b(?:this|that|it|above|previous|last|suggestion|recommendation)\b", user_input, re.IGNORECASE):
+        return None
+    objects = _conversation_objects()
+    keys = (
+        ("selected_recommendation", "last_suggestion", "last_generated_content")
+        if re.search(r"\b(?:suggestion|recommendation)\b", user_input, re.IGNORECASE)
+        else ("selected_recommendation", "last_generated_content", "last_suggestion")
+    )
+    for key in keys:
+        obj = objects.get(key)
+        if isinstance(obj, dict) and _safe_str(obj.get("content"), ""):
+            return copy.deepcopy(obj)
+    return None
+
+def _extract_reference_target_slide(user_input: str, referenced: Optional[dict] = None) -> Optional[int]:
+    slide_num = _extract_explicit_slide_number_from_text(user_input)
+    if slide_num is not None:
+        return slide_num
+    if re.search(r"\b(?:title|cover|first)\s+slide\b|\bslide\s+(?:title|cover)\b", user_input, re.IGNORECASE):
+        return 1
+    if referenced and referenced.get("slide_number"):
+        try:
+            return int(referenced.get("slide_number"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+def _extract_pending_slide_answer(user_input: str, slides: list) -> Optional[int | str]:
+    text = _safe_str(user_input, "")
+    if re.fullmatch(r"\s*(?:all|all slides?|every slide|each slide)\s*", text, re.IGNORECASE):
+        return "all"
+    slide_num = _extract_explicit_slide_number_from_text(text) or _resolve_slide_reference_text(text, slides)
+    if slide_num is not None:
+        return slide_num
+    ordinal = _ordinal_to_int(text.strip().lower())
+    if ordinal and 1 <= ordinal <= len(slides or []):
+        return ordinal
+    return None
+
+def _is_logo_insertion_request(user_input: str) -> bool:
+    text = _safe_str(user_input, "")
+    return bool(
+        re.search(r"\blogo\b", text, re.IGNORECASE)
+        and re.search(r"\b(?:insert|add|place|put|apply|use|include)\b", text, re.IGNORECASE)
+    )
+
+def _is_all_slides_target(user_input: str) -> bool:
+    return bool(re.search(r"\b(?:all slides?|every slide|each slide|across all|throughout|whole deck|entire deck|all)\b", user_input, re.IGNORECASE))
+
+def _handle_logo_insertion_request(user_input: str, slides: list) -> bool:
+    if not _is_logo_insertion_request(user_input):
+        return False
+    if not st.session_state.get("logo_bytes"):
+        reply = "Please upload the logo image first, then tell me where to place it."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    if not st.session_state.get("current_ppt_id") or not slides:
+        reply = "No presentation is currently active. Please create or switch to a presentation first."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    if _is_all_slides_target(user_input):
+        ppt_bytes = rebuild_ppt_from_outline()
+        if not ppt_bytes:
+            reply = f"I couldn't rebuild the PPT with the logo. {st.session_state.get('last_build_error') or ''}".strip()
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+        topic = st.session_state.get("topic", "Presentation")
+        label = f"Updated Preview — {topic} ({st.session_state.get('current_ppt_id')})"
+        add_message_with_preview(
+            role="assistant",
+            text="Inserted the uploaded logo across all slides.",
+            preview_slides=slides,
+            ppt_label=label,
+            ppt_bytes=ppt_bytes,
+            ppt_filename=st.session_state.get("ppt_filename", "presentation.pptx"),
+        )
+        st.rerun()
+    slide_num = _extract_explicit_slide_number_from_text(user_input) or _resolve_slide_reference_text(user_input, slides)
+    if slide_num is None:
+        reply = "Should I place the logo on slide 1 or across all slides?"
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    reply = "Logo placement is currently applied when the PPT is rebuilt. Say `insert this logo into all slides` to add it deck-wide."
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+    add_message("assistant", reply)
+    st.rerun()
+
+def _is_reference_execution_request(user_input: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:place|put|insert|add|apply|use|move|copy)\b.*\b(?:this|that|it|suggestion|recommendation|\d+(?:st|nd|rd|th)?\s+suggestion|first\s+suggestion|second\s+suggestion|third\s+suggestion|fourth\s+suggestion|fifth\s+suggestion)\b"
+            r"|\b(?:yes|yeah|yep|ok|okay|sure)\b.*\bapply\b.*\bsuggestion\b",
+            user_input,
+            re.IGNORECASE,
+        )
+    )
+
+def _handle_reference_execution_request(user_input: str, slides: list) -> bool:
+    if not _is_reference_execution_request(user_input):
+        return False
+    referenced = _resolve_referenced_content(user_input)
+    if not referenced:
+        reply = "I'm not sure what content you mean by \"this.\" Please paste the text or tell me which suggestion to use."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    content = _safe_str(referenced.get("content"), "")
+    if not slides:
+        reply = "No presentation is currently active. Please create or switch to a presentation first."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    slide_num = _extract_reference_target_slide(user_input, referenced)
+    if slide_num is None:
+        question = "Which slide should I apply that suggestion to?"
+        st.session_state.pending_intent = {
+            "intent": "edit_slide",
+            "slots": {"slide_number": None, "change_content": content},
+            "missing_slots": ["slide_number"],
+            "next_question": question,
+            "action": "ask",
+        }
+        st.session_state.pending_action = st.session_state.pending_intent
+        with st.chat_message("assistant"):
+            st.markdown(question)
+        add_message("assistant", question)
+        st.rerun()
+    if not (1 <= int(slide_num) <= len(slides or [])):
+        reply = f"Slide {slide_num} does not exist. The deck has {len(slides or [])} slide(s)."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+    instruction = content
+    if referenced.get("type") in {"suggestion", "assistant_answer"}:
+        instruction = f"Apply this recommendation: {content}"
+    result_msg, success = execute_action("edit_slide", {"slide_number": int(slide_num), "change_content": instruction}, slides)
+    with st.chat_message("assistant"):
+        st.markdown(result_msg)
+    add_message("assistant", result_msg)
+    if success:
+        st.rerun()
+    return True
 
 def add_message_with_preview(role: str, text: str, preview_slides: list = None,
                               ppt_label: str = "", ppt_bytes: bytes = None,
@@ -1920,6 +2180,51 @@ def _extract_create_ppt_topic(user_input: str) -> Optional[str]:
     topic = re.sub(r"\s+", " ", topic).strip()
     return topic or None
 
+def _is_generic_presentation_context(value: str) -> bool:
+    return orchestrator_is_generic_presentation_context(value)
+
+def _extract_conversational_create_topic(user_input: str) -> Optional[str]:
+    text = _safe_str(user_input, "")
+    if not text:
+        return None
+    explicit = _extract_create_ppt_topic(text)
+    pending = st.session_state.get("pending_new_ppt") or {}
+    return orchestrator_extract_conversational_create_topic(
+        text,
+        explicit_topic=explicit,
+        pending_need_topic=bool(pending.get("need_topic")),
+    )
+
+def _is_implicit_create_request(user_input: str) -> bool:
+    return orchestrator_is_implicit_create_request(user_input)
+
+def _create_topic_followup(user_input: str = "") -> str:
+    return orchestrator_create_topic_followup(user_input)
+
+def _ask_for_create_topic(user_input: str, question_override: Optional[str] = None) -> None:
+    pending = st.session_state.get("pending_new_ppt") or {}
+    pending.update({
+        "topic": "",
+        "sections": pending.get("sections") or _extract_create_sections_from_prompt(user_input),
+        "theme_colors": pending.get("theme_colors") or extract_theme_colors_from_messages(st.session_state.get("messages", [])),
+        "need_topic": True,
+    })
+    st.session_state.pending_new_ppt = pending
+    st.session_state.pending_intent = {
+        "intent": "create_ppt",
+        "slots": {"topic": None, "slide_count": None, "sections": pending.get("sections")},
+        "missing_slots": ["topic"],
+        "next_question": question_override or _create_topic_followup(user_input),
+        "action": "ask",
+    }
+    st.session_state.pending_action = st.session_state.pending_intent
+    _set_conv_state(pending_create=st.session_state.pending_new_ppt)
+    question = question_override or _create_topic_followup(user_input)
+    with st.chat_message("assistant"):
+        st.markdown(question)
+    add_message("assistant", question)
+    st.rerun()
+
 def _extract_create_sections_from_prompt(user_input: str) -> Optional[str]:
     text = (user_input or "").strip()
     if not text:
@@ -1949,7 +2254,8 @@ def _handle_create_request(prompt: str) -> bool:
     """
     topic = _extract_create_ppt_topic(prompt)
     if not topic:
-        return False
+        _ask_for_create_topic(prompt)
+        return True
     slide_count = _extract_slide_count_from_text(prompt)
     theme_colors = extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(topic)
     sections = _extract_create_sections_from_prompt(prompt)
@@ -2380,6 +2686,177 @@ def _reasoning_state_snapshot() -> dict:
         "last_intent": st.session_state.get("last_action_type") or conv.get("last_action_type"),
         "last_action": conv.get("last_action_text") or "",
     }
+
+def _recent_message_digest(limit: int = 8) -> list[dict]:
+    digest = []
+    for msg in (st.session_state.get("messages", []) or [])[-limit:]:
+        if not isinstance(msg, dict):
+            continue
+        content = _safe_str(msg.get("content", ""), "")
+        content = re.sub(r"\s+", " ", content).strip()
+        if len(content) > 450:
+            content = content[:450].rstrip() + "..."
+        digest.append({"role": msg.get("role", ""), "content": content})
+    return digest
+
+def build_assistant_state(slides: Optional[list] = None) -> dict:
+    """
+    Compact, LangGraph-ready conversation state.
+    This is intentionally small: enough for contextual routing without sending
+    the whole chat or full slide payloads to the model.
+    """
+    conv = _conv_state()
+    current_id = st.session_state.get("current_ppt_id") or conv.get("active_ppt_id")
+    item = get_ppt_by_id(current_id) if current_id else None
+    outline = (item or {}).get("outline_payload") or st.session_state.get("outline_payload") or {}
+    active_slides = slides if slides is not None else (outline.get("slides", []) if isinstance(outline, dict) else [])
+    active_slide = (
+        st.session_state.get("active_slide_index")
+        or st.session_state.get("last_slide_index")
+        or conv.get("active_slide_index")
+    )
+    try:
+        active_slide = int(active_slide) if active_slide is not None else None
+    except (TypeError, ValueError):
+        active_slide = None
+
+    slide_summary = summarize_slides_for_llm(active_slides) if active_slides else []
+    active_slide_summary = None
+    if active_slide and 1 <= active_slide <= len(slide_summary):
+        active_slide_summary = slide_summary[active_slide - 1]
+
+    return {
+        "active_ppt_id": current_id,
+        "active_topic": (item or {}).get("topic") or st.session_state.get("topic", "") or conv.get("last_topic", ""),
+        "active_slide_index": active_slide,
+        "active_slide": active_slide_summary,
+        "slide_count": len(active_slides or []),
+        "slides": slide_summary[:12],
+        "last_action_type": st.session_state.get("last_action_type") or conv.get("last_action_type"),
+        "last_action_text": conv.get("last_action_text", ""),
+        "pending_intent": st.session_state.get("pending_intent"),
+        "pending_action": st.session_state.get("pending_action"),
+        "conversation_objects": _conversation_objects(),
+        "recent_messages": _recent_message_digest(),
+    }
+
+def _has_explicit_deterministic_command(user_input: str) -> bool:
+    return orchestrator_has_explicit_deterministic_command(user_input)
+
+def _is_contextual_followup_candidate(user_input: str) -> bool:
+    return orchestrator_is_contextual_followup_candidate(user_input)
+
+def _fallback_contextual_intent(user_input: str, assistant_state: dict) -> Optional[dict]:
+    return orchestrator_resolve_contextual_intent(user_input, assistant_state)
+
+def resolve_contextual_intent(user_input: str, assistant_state: dict) -> Optional[dict]:
+    """
+    LLM contextual resolver for natural follow-ups. Returns a reasoned-style
+    dict or None when the deterministic router should keep control.
+    """
+    return orchestrator_resolve_contextual_intent(
+        user_input,
+        assistant_state,
+        llm_client=_client,
+        deployment=AZURE_DEPLOYMENT,
+    )
+
+def resolve_open_conversation(user_input: str, assistant_state: dict, *, pending_need_topic: bool = False):
+    """
+    Broad LLM router for natural chat that is not an explicit deck command.
+    It only returns safe pre-actions: ask, answer, or let deterministic code continue.
+    """
+    return orchestrator_resolve_open_conversation(
+        user_input,
+        assistant_state,
+        llm_client=_client,
+        deployment=AZURE_DEPLOYMENT,
+        explicit_topic=_extract_create_ppt_topic(user_input),
+        pending_need_topic=pending_need_topic,
+    )
+
+def _is_readonly_conversation_request(user_input: str) -> bool:
+    """
+    Read-only advice/help questions must not mutate the deck. This catches
+    natural presentation coaching requests before they hit edit/transform routes.
+    """
+    return orchestrator_is_readonly_conversation_request(user_input)
+
+def _readonly_target_slide(user_input: str, assistant_state: dict, slides: list) -> Optional[int]:
+    slide_num = _extract_explicit_slide_number_from_text(user_input)
+    if slide_num and _slide_exists(slide_num, slides):
+        return slide_num
+    active = assistant_state.get("active_slide_index")
+    try:
+        active = int(active) if active is not None else None
+    except (TypeError, ValueError):
+        active = None
+    if active and _slide_exists(active, slides) and re.search(r"\b(?:this|it|that|current|shown|active)\b", user_input, re.IGNORECASE):
+        return active
+    return None
+
+def _fallback_readonly_answer(user_input: str, assistant_state: dict, slides: list) -> str:
+    slide_num = _readonly_target_slide(user_input, assistant_state, slides)
+    if slide_num:
+        slide = slides[slide_num - 1] if 1 <= slide_num <= len(slides) and isinstance(slides[slide_num - 1], dict) else {}
+        title = _safe_str(slide.get("title", f"slide {slide_num}"), f"slide {slide_num}")
+        return (
+            f"Here are a few ways to improve slide {slide_num} ({title}):\n\n"
+            "- Make the main takeaway explicit in the title or subtitle.\n"
+            "- Reduce any long bullets to shorter, presentation-friendly phrases.\n"
+            "- Add one concrete example, metric, or visual cue to make the point easier to remember.\n"
+            "- Keep only the strongest 3-5 ideas so the slide is easier to present.\n\n"
+            "I can apply one of these if you want."
+        )
+    topic = _safe_str(assistant_state.get("active_topic", ""), "this presentation")
+    return (
+        f"For {topic}, I would improve the deck by tightening the flow, reducing repeated points, "
+        "adding concrete examples, and making each slide’s takeaway clearer. "
+        "Tell me a slide number if you want specific feedback."
+    )
+
+def generate_conversational_answer(user_input: str, assistant_state: dict, slides: list) -> str:
+    slide_num = _readonly_target_slide(user_input, assistant_state, slides)
+    selected_slide = None
+    if slide_num and 1 <= slide_num <= len(slides) and isinstance(slides[slide_num - 1], dict):
+        selected_slide = slides[slide_num - 1]
+    slide_context = _format_slide_view(
+        selected_slide,
+        slide_num,
+        _ppt_display_label(assistant_state.get("active_ppt_id")),
+    ) if selected_slide else ""
+    prompt = f"""
+You are a helpful PowerPoint coach inside a PPT assistant.
+
+User asked:
+{json.dumps(user_input)}
+
+Compact state:
+{json.dumps(assistant_state, ensure_ascii=True)}
+
+Selected slide context:
+{slide_context or "No single slide selected."}
+
+Rules:
+- Read-only answer only. Do not claim you edited, changed, regenerated, added, deleted, or updated anything.
+- Give practical, specific advice grounded in the selected slide/deck context.
+- If the user asks how to improve, give 3-5 concrete suggestions as a numbered list.
+- End by asking whether they want you to apply one suggestion only when appropriate.
+- Keep it concise and conversational.
+"""
+    try:
+        resp = _client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.35,
+            max_tokens=500,
+        )
+        answer = _safe_str(resp.choices[0].message.content, "")
+        if answer:
+            return answer
+    except Exception:
+        pass
+    return _fallback_readonly_answer(user_input, assistant_state, slides)
 
 def reasoning_layer(user_input: str, state: dict) -> dict:
     """
@@ -3376,6 +3853,13 @@ def _polish_next_question(user_input: str, intent: Optional[str], slots: dict, m
 
     if intent == "cancel":
         return "Okay, I cancelled that request."
+
+    if intent == "create_ppt":
+        if "topic" in (missing or []) or not slots.get("topic"):
+            return _create_topic_followup(user_input)
+        if "slide_count" in (missing or []) or not slots.get("slide_count"):
+            topic = _safe_str(slots.get("topic", ""), "the presentation")
+            return f"Great — how many slides should the presentation on {topic} have?"
 
     if intent in {"clear_slide", "blank_slide"}:
         if "slide_number" in (missing or []) or slide_num is None:
@@ -6387,6 +6871,108 @@ if prompt is not None:
         add_message("assistant", reply)
         st.rerun()
 
+    reference_outline = _current_outline_payload() or {}
+    reference_slides = reference_outline.get("slides", []) if isinstance(reference_outline, dict) else []
+    if _handle_logo_insertion_request(prompt, reference_slides):
+        st.stop()
+    if _handle_reference_execution_request(prompt, reference_slides):
+        st.stop()
+
+    open_pending_create = st.session_state.get("pending_new_ppt") or {}
+    skip_open_router = bool(
+        open_pending_create.get("topic")
+        and not open_pending_create.get("need_topic")
+        and _extract_slide_count_from_text(prompt)
+    )
+    if not skip_open_router:
+        open_outline = _current_outline_payload() or {}
+        open_slides = open_outline.get("slides", []) if isinstance(open_outline, dict) else []
+        open_state = build_assistant_state(open_slides)
+        open_decision = resolve_open_conversation(
+            prompt,
+            open_state,
+            pending_need_topic=bool(open_pending_create.get("need_topic") or (open_pending_create and not open_pending_create.get("topic"))),
+        )
+        if open_decision and open_decision.intent == "create_ppt" and open_decision.mode == "ask":
+            open_topic = _safe_str((open_decision.slots or {}).get("topic"), "")
+            open_slide_count = (open_decision.slots or {}).get("slide_count") or _extract_slide_count_from_text(prompt)
+            if not open_topic:
+                _ask_for_create_topic(prompt, question_override=open_decision.message)
+            else:
+                sections = _extract_create_sections_from_prompt(prompt)
+                theme_colors = extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(open_topic)
+                if open_slide_count:
+                    generate_outline_and_reply(open_topic, int(open_slide_count), st.session_state.tone, sections, theme_colors)
+                    st.stop()
+                st.session_state.pending_new_ppt = {
+                    "topic": open_topic,
+                    "sections": sections,
+                    "theme_colors": theme_colors,
+                    "need_topic": False,
+                }
+                question = open_decision.message or f"Great - how many slides should the presentation on {open_topic} have?"
+                st.session_state.pending_intent = {
+                    "intent": "create_ppt",
+                    "slots": {"topic": open_topic, "slide_count": None, "sections": sections},
+                    "missing_slots": ["slide_count"],
+                    "next_question": question,
+                    "action": "ask",
+                }
+                st.session_state.pending_action = st.session_state.pending_intent
+                _set_conv_state(pending_create=st.session_state.pending_new_ppt)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
+        if open_decision and open_decision.mode == "answer":
+            if open_decision.intent == "readonly_advice":
+                reply = generate_conversational_answer(prompt, open_state, open_slides)
+                _remember_answer_objects(prompt, reply, _readonly_target_slide(prompt, open_state, open_slides))
+            else:
+                reply = open_decision.message or generate_conversational_answer(prompt, open_state, open_slides)
+                _remember_answer_objects(prompt, reply, None)
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+
+    pre_route = pre_route_message(
+        prompt,
+        explicit_topic=_extract_create_ppt_topic(prompt),
+        pending_need_topic=bool((st.session_state.get("pending_new_ppt") or {}).get("need_topic")),
+    )
+    if pre_route and pre_route.intent == "create_ppt":
+        implicit_topic = pre_route.slots.get("topic")
+        if not implicit_topic:
+            _ask_for_create_topic(prompt)
+        else:
+            slide_count = _extract_slide_count_from_text(prompt)
+            sections = _extract_create_sections_from_prompt(prompt)
+            theme_colors = extract_theme_colors_from_messages(st.session_state.get("messages", [])) or extract_theme_colors(implicit_topic)
+            if slide_count:
+                generate_outline_and_reply(implicit_topic, slide_count, st.session_state.tone, sections, theme_colors)
+                st.stop()
+            st.session_state.pending_new_ppt = {
+                "topic": implicit_topic,
+                "sections": sections,
+                "theme_colors": theme_colors,
+                "need_topic": False,
+            }
+            st.session_state.pending_intent = {
+                "intent": "create_ppt",
+                "slots": {"topic": implicit_topic, "slide_count": None, "sections": sections},
+                "missing_slots": ["slide_count"],
+                "next_question": pre_route.message or f"Great - how many slides should the presentation on {implicit_topic} have?",
+                "action": "ask",
+            }
+            st.session_state.pending_action = st.session_state.pending_intent
+            _set_conv_state(pending_create=st.session_state.pending_new_ppt)
+            question = pre_route.message or f"Great - how many slides should the presentation on {implicit_topic} have?"
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+
     if (
         early_pending_state.get("intent") in {"confirm_topic_switch", "confirm_add_points_limit", "clear_slide"}
         and (_is_affirmative_command(prompt) or _is_negative_command(prompt))
@@ -6448,6 +7034,18 @@ if prompt is not None:
     pending_new_ppt = st.session_state.get("pending_new_ppt")
     if pending_new_ppt:
         pending_topic = pending_new_ppt.get("topic", "")
+        if pending_new_ppt.get("need_topic") or not pending_topic:
+            topic_candidate = _extract_conversational_create_topic(prompt)
+            if not topic_candidate:
+                question = _create_topic_followup(prompt)
+                with st.chat_message("assistant"):
+                    st.markdown(question)
+                add_message("assistant", question)
+                st.rerun()
+            pending_topic = topic_candidate
+            pending_new_ppt["topic"] = pending_topic
+            pending_new_ppt["need_topic"] = False
+            st.session_state.pending_new_ppt = pending_new_ppt
         slide_count = _extract_slide_count_from_text(prompt)
         if slide_count:
             all_messages = st.session_state.get("messages", [])
@@ -6532,6 +7130,14 @@ if prompt is not None:
     else:
         reasoning_state = _reasoning_state_snapshot()
         reasoned = reasoning_layer(routing_prompt, reasoning_state)
+        routing_prompt = _canonicalize_reasoned_prompt(routing_prompt, reasoned)
+
+    context_outline_payload = _current_outline_payload()
+    context_slides = context_outline_payload.get("slides", []) if context_outline_payload else []
+    assistant_state = build_assistant_state(context_slides)
+    contextual_reasoned = resolve_contextual_intent(prompt, assistant_state)
+    if contextual_reasoned and float(contextual_reasoned.get("confidence") or 0.0) >= 0.55:
+        reasoned = {**reasoned, **contextual_reasoned}
         routing_prompt = _canonicalize_reasoned_prompt(routing_prompt, reasoned)
 
     direct_intent = reasoned.get("intent")
@@ -6827,6 +7433,21 @@ if prompt is not None:
         add_message("assistant", question)
         st.rerun()
 
+    if _is_readonly_conversation_request(routing_prompt):
+        reply = generate_conversational_answer(routing_prompt, assistant_state, slides)
+        target_slide = _readonly_target_slide(routing_prompt, assistant_state, slides)
+        _remember_answer_objects(routing_prompt, reply, target_slide)
+        _remember_action_context(
+            "readonly_advice",
+            target_slide,
+            st.session_state.get("current_ppt_id"),
+            f"Answered read-only advice request: {routing_prompt}",
+        )
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        add_message("assistant", reply)
+        st.rerun()
+
     if _is_new_structured_slide_request(routing_prompt):
         _clear_pending_turn_state()
         slots = {
@@ -6860,6 +7481,14 @@ if prompt is not None:
         with st.chat_message("assistant"):
             st.markdown(followup)
         add_message("assistant", followup)
+        st.rerun()
+
+    if direct_intent in {"greeting", "smalltalk"}:
+        _clear_pending_turn_state()
+        result_msg, success = execute_action(direct_intent, {}, slides)
+        with st.chat_message("assistant"):
+            st.markdown(result_msg)
+        add_message("assistant", result_msg)
         st.rerun()
 
     if direct_intent == "design_change":
@@ -7004,6 +7633,21 @@ if prompt is not None:
             st.markdown(reply)
         add_message("assistant", reply)
         st.rerun()
+
+    if direct_intent == "refine_ppt":
+        _clear_pending_turn_state()
+        slots = {
+            "user_request": routing_prompt,
+            "change_content": reasoned.get("content") or routing_prompt,
+            "style_hint": reasoned.get("style_hint") or reasoned.get("content") or routing_prompt,
+            "sub_intent": reasoned.get("sub_intent"),
+        }
+        result_msg, success = execute_action("refine_ppt", slots, slides)
+        with st.chat_message("assistant"):
+            st.markdown(result_msg)
+        add_message("assistant", result_msg)
+        if success:
+            st.rerun()
 
     if direct_intent in {"ppt_info", "suggest_topic", "create_ppt"}:
         _clear_pending_turn_state()
@@ -7491,6 +8135,62 @@ if prompt is not None:
             st.rerun()
 
     pending_state = st.session_state.get("pending_action") or st.session_state.get("pending_intent") or {}
+
+    if pending_state.get("intent") == "edit_slide" and "slide_number" in (pending_state.get("missing_slots") or []) and (pending_state.get("slots") or {}).get("change_content"):
+        if re.search(r"\b(?:cancel|stop|never mind|nevermind)\b", routing_prompt, re.IGNORECASE):
+            _clear_pending_turn_state()
+            reply = "Okay, I cancelled that edit request."
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            add_message("assistant", reply)
+            st.rerun()
+        slots = dict(pending_state.get("slots", {}))
+        target_answer = _extract_pending_slide_answer(prompt, slides)
+        if target_answer == "all":
+            change_content = _safe_str(slots.get("change_content"), "")
+            if re.search(r"\blogo\b", change_content, re.IGNORECASE):
+                _handle_logo_insertion_request("insert logo into all slides", slides)
+            question = "Please choose one slide number for that suggestion, or ask me to apply a specific deck-wide change."
+            st.session_state.pending_intent = {
+                "intent": "edit_slide",
+                "slots": slots,
+                "missing_slots": ["slide_number"],
+                "next_question": question,
+                "action": "ask",
+            }
+            st.session_state.pending_action = st.session_state.pending_intent
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+        if target_answer is None:
+            question = pending_state.get("next_question") or "Which slide should I apply that suggestion to?"
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+        slots["slide_number"] = int(target_answer)
+        slots["change_content"] = _safe_str(slots.get("change_content"), "")
+        if not slots["change_content"]:
+            question = _polish_next_question(prompt, "edit_slide", slots, ["change_content"], None)
+            st.session_state.pending_intent = {
+                "intent": "edit_slide",
+                "slots": slots,
+                "missing_slots": ["change_content"],
+                "next_question": question,
+                "action": "ask",
+            }
+            st.session_state.pending_action = st.session_state.pending_intent
+            with st.chat_message("assistant"):
+                st.markdown(question)
+            add_message("assistant", question)
+            st.rerun()
+        _clear_pending_turn_state()
+        result_msg, success = execute_action("edit_slide", slots, slides)
+        with st.chat_message("assistant"):
+            st.markdown(result_msg)
+        add_message("assistant", result_msg)
+        st.rerun()
 
     if pending_state.get("intent") in ("move_slide", "swap_slides") and (pending_state.get("missing_slots") or []):
         if re.search(r"\b(?:cancel|stop|never mind|nevermind)\b", routing_prompt, re.IGNORECASE):

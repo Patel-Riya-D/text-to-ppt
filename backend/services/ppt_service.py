@@ -871,10 +871,13 @@ def render_title_cover(slide, spec, num, theme, profile, logo_path=None):
         ssize = max(15, 20 - max(0, len(subtitle)-60)//20)
         _tb(slide, subtitle, title_x+0.02, 4.15, title_w, 0.82, ssize,
             italic=True, color=sc, face=theme["bf"], shrink=True)
-    points = [p for p in _validate_and_clean_content(_safe_list(spec.get("content",[]))) if p][:5]
+    raw_points = [p for p in _validate_and_clean_content(_safe_list(spec.get("content",[]))) if p]
+    personal_re = re.compile(r"^\s*(?:presented\s+by|prepared\s+by|submitted\s+by|name|student\s+name|college|university|company|organization|date)\s*[:\-]", re.IGNORECASE)
+    personal_points = [p for p in raw_points if personal_re.search(str(p))]
+    points = [p for p in raw_points if p not in personal_points][:3]
     if points:
         accs   = _accents(theme, 3)
-        card_w = max(2.0, (title_w - 0.18*(len(points)-1)) / len(points))
+        card_w = max(2.0, min(3.0, (title_w - 0.18*(len(points)-1)) / len(points)))
         for i, pt in enumerate(points):
             cx   = title_x + i*(card_w+0.18)
             fill = _mix(theme["card"], accs[i], 0.88 if mode=="dark_full" else 0.82)
@@ -882,6 +885,12 @@ def render_title_cover(slide, spec, num, theme, profile, logo_path=None):
             _rect(slide, cx, 5.00, card_w, 0.10, accs[i])
             _tb(slide, pt, cx+0.12, 5.16, card_w-0.24, 0.76, 15,
                 bold=True, color=_contrast_text(fill), face=theme["bf"], shrink=True)
+    if personal_points:
+        meta_text = "   |   ".join(personal_points[:4])
+        meta_y = 6.16 if points else 5.18
+        _tb(slide, meta_text, title_x+0.02, meta_y, title_w, 0.42, 12,
+            color=sc, face=theme["bf"], shrink=True)
+    _add_logo(slide, theme)
 
 def render_section_index(slide, spec, num, theme, profile, logo_path=None):
     _slide_bg(slide, theme["bg"])
