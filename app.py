@@ -2178,6 +2178,10 @@ def _extract_create_ppt_topic(user_input: str) -> Optional[str]:
     topic = re.sub(r"[\.\!\?]+$", "", topic).strip()
     topic = topic.strip(' "\'“”‘’')
     topic = re.sub(r"\s+", " ", topic).strip()
+    topic = re.sub(r"\s+(?:for\s+me|please|pls)$", "", topic, flags=re.IGNORECASE).strip()
+    topic = re.sub(r"^(?:for\s+me|me|myself|please|pls)$", "", topic, flags=re.IGNORECASE).strip()
+    if orchestrator_is_generic_presentation_context(topic):
+        return None
     return topic or None
 
 def _is_generic_presentation_context(value: str) -> bool:

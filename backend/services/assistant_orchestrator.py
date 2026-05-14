@@ -82,6 +82,7 @@ def is_generic_presentation_context(value: str) -> bool:
         return True
     norm = re.sub(r"\bclg\b", "college", norm)
     generic_patterns = [
+        r"^(?:me|myself|for me|please|pls)\s*$",
         r"^(?:my|a|the)?\s*(?:college|school|class|seminar|project|assignment|presentation|ppt|deck)\s*$",
         r"^(?:my|a|the)?\s*(?:college|school|class)\s+(?:seminar|project|assignment|presentation)\s*$",
         r"^(?:my|a|the)?\s*(?:college|school|class)\s+(?:ppt|deck|slides?)\s*$",
@@ -90,6 +91,8 @@ def is_generic_presentation_context(value: str) -> bool:
         r"^(?:something|anything)\s+(?:to\s+)?(?:show|present)(?:\s+(?:in|for)\s+(?:college|school|class|seminar))?\s*$",
         r"^(?:something|anything)\s+for\s+(?:my\s+)?(?:college|school|class|seminar|presentation)\s*$",
         r"^(?:show|present)\s+(?:in|for)\s+(?:college|school|class|seminar)\s*$",
+        r"^(?:another|different|new|other|some other|any other)\s+topic(?:\s+for\s+me)?\s*$",
+        r"^(?:another|different|new|other|some other|any other)\s+(?:ppt|presentation|deck)(?:\s+for\s+me)?\s*$",
     ]
     return any(re.fullmatch(pattern, norm, re.IGNORECASE) for pattern in generic_patterns)
 
