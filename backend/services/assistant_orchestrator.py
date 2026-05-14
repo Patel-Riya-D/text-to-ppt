@@ -212,10 +212,39 @@ def has_explicit_deterministic_command(user_input: str) -> bool:
     ]
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in explicit_patterns)
 
+def is_create_deck_request(user_input: str) -> bool:
+    text = str(user_input or "")
+    if not text:
+        return False
+    return bool(
+        re.search(r"\b(?:create|make|generate|build|draft|prepare)\b", text, re.IGNORECASE)
+        and re.search(r"\b(?:ppt|presentation|deck|slides?)\b", text, re.IGNORECASE)
+    )
+
+def is_topic_suggestion_request(user_input: str) -> bool:
+    text = str(user_input or "")
+    return bool(
+        re.search(r"\b(?:suggest|recommend|ideas?|topics?|options?|choose from)\b", text, re.IGNORECASE)
+        and re.search(r"\b(?:topic|ppt|presentation|deck|slides?)\b", text, re.IGNORECASE)
+    )
+
+def should_skip_open_llm_router(user_input: str) -> bool:
+    """
+    Keep exact operational commands deterministic, but let create-deck language
+    go through the LLM router because topic/missing-field inference is natural
+    language heavy.
+    """
+    text = str(user_input or "")
+    if not text:
+        return True
+    if is_create_deck_request(text):
+        return False
+    return has_explicit_deterministic_command(text)
+
 
 def is_contextual_followup_candidate(user_input: str) -> bool:
     text = str(user_input or "").strip()
-    if not text or has_explicit_deterministic_command(text):
+    if not text or should_skip_open_llm_router(text):
         return False
     if len(text.split()) <= 8 and re.search(
         r"\b(this|that|it|one|looks good|good|boring|shorter|improve|modern|style|actually|instead|not that|wrong|yes|no|ok|okay)\b",
@@ -403,6 +432,30 @@ def fallback_open_conversation_decision(
             reason="read_only_conversation_fallback",
         )
 
+    if is_create_deck_request(text):
+        topic = extract_conversational_create_topic(
+            text,
+            explicit_topic=explicit_topic,
+            pending_need_topic=pending_need_topic,
+        )
+        if topic:
+            return AssistantDecision(
+                mode="ask",
+                intent="create_ppt",
+                slots={"topic": topic},
+                message=f"Great - how many slides should the presentation on {topic} have?",
+                confidence=0.78,
+                reason="create_deck_fallback_with_topic",
+            )
+        return AssistantDecision(
+            mode="ask",
+            intent="create_ppt",
+            slots={"topic": None},
+            message=create_topic_followup(text),
+            confidence=0.76,
+            reason="create_deck_fallback_missing_topic",
+        )
+
     if re.search(
         r"\b(?:present something|have to present|need slides|need something to show|show in college|"
         r"class presentation|college presentation|seminar tomorrow|presentation tomorrow)\b",
@@ -435,7 +488,7 @@ def resolve_open_conversation(
     it does not perform deck mutations.
     """
     text = safe_str(user_input)
-    if not text or has_explicit_deterministic_command(text):
+    if not text or should_skip_open_llm_router(text):
         return None
 
     fallback = fallback_open_conversation_decision(
@@ -470,11 +523,15 @@ Return ONLY valid JSON:
 }}
 
 Rules:
-- Use this router for natural conversation that may not match fixed commands.
+- Use this router as the primary decision maker for create-PPT requests and natural conversation.
 - If the user wants help creating slides/presentation/deck for class, college, seminar, tomorrow, or presenting something, infer intent=create_ppt.
-- Generic context like "college", "class", "seminar", "something to show", or "my presentation" is NOT a topic. Ask for the topic.
+- If the user says "another PPT", "new presentation", "make a deck for me", or similar while a deck exists, infer intent=create_ppt for a fresh deck.
+- Generic context like "college", "class", "seminar", "something to show", "my presentation", "another topic", or "for me" is NOT a topic. Ask for the topic.
+- Only extract a topic when the user gives a real subject, usually after words like "on", "about", or clear subject wording.
 - If pending_need_topic=true and the user gives a topic idea, extract that topic and ask for slide count.
 - If create_ppt has a topic but no slide_count, mode=ask and ask how many slides.
+- If create_ppt has no topic, ask exactly for the topic. Do NOT list topic suggestions unless the user explicitly asks for topic ideas.
+- For "can you create another PPT for me?" or "I want to create another PPT for me", message should be like "Of course! What topic should the presentation be about?"
 - If the user asks for feedback/advice like "Does this look okay?", "any suggestions?", or "is this correct?", mode=answer and intent=readonly_advice.
 - Do not choose execute for edits, deletes, additions, design changes, or rebuilds here.
 - Use mode=none when the message should continue through the deterministic app router.
@@ -494,6 +551,9 @@ Rules:
         if mode not in {"ask", "answer", "execute", "none"} or mode == "none" or confidence < 0.55:
             return fallback
         slots = parsed.get("slots") if isinstance(parsed.get("slots"), dict) else {}
+        if is_create_deck_request(text) and intent != "create_ppt" and not is_topic_suggestion_request(text):
+            intent = "create_ppt"
+            mode = "ask"
         topic = safe_str(slots.get("topic"))
         if topic and is_generic_presentation_context(topic):
             slots["topic"] = None
@@ -504,7 +564,8 @@ Rules:
                 slots["slide_count"] = slide_count
             if not topic:
                 mode = "ask"
-                parsed["message"] = parsed.get("message") or create_topic_followup(text)
+                slots["topic"] = None
+                parsed["message"] = create_topic_followup(text)
             elif not slide_count:
                 mode = "ask"
                 parsed["message"] = parsed.get("message") or f"Great - how many slides should the presentation on {topic} have?"
