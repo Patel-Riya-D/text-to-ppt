@@ -6205,7 +6205,7 @@ def execute_action(intent: str, slots: dict, slides: list) -> Tuple[str, bool]:
     elif intent == "greeting":
         return "👋 Hello! I'm your PPT assistant. You can ask me to create a new presentation, edit slides, add content, or switch between decks. What would you like to do?", True
     elif intent == "smalltalk":
-        return "Got it! I'm here when you're ready to work on your presentation. Just tell me what you'd like to do.", True
+        return "I'm here when you're ready to work on your presentation. Just tell me what you'd like to do.", True
     else:
         return "I'm not sure how to help with that. Could you rephrase?", False
 
@@ -6986,7 +6986,7 @@ if prompt is not None:
         reply = (
             "👋 Hello! I'm your PPT assistant. You can ask me to create a new presentation, edit slides, add content, or switch between decks. What would you like to do?"
             if re.search(r"\b(hi|hello|hey)\b", prompt, re.IGNORECASE)
-            else "Got it! I'm here when you're ready to work on your presentation."
+            else "I'm here when you're ready to work on your presentation."
         )
         with st.chat_message("assistant"):
             st.markdown(reply)
